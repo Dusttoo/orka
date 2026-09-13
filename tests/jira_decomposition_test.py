@@ -69,6 +69,55 @@ class JiraDecompositionTests(unittest.TestCase):
         self.assertEqual([item["id"] for item in slices], ["foundation", "cutover"])
         self.assertEqual(feature["max_auto_slices"], 4)
 
+    def test_structural_decomposition_does_not_require_threshold_score(self):
+        value = self.assessment()
+        value["complexity_score"] = 62
+        self.assertEqual(decomposition.validated_input(self.config(), value)[1], "PROJ-1")
+
+    def test_subtask_slices_are_created_as_siblings(self):
+        jira = object.__new__(decomposition.Jira)
+        jira.request = Mock(return_value={"fields": {
+            "issuetype": {"subtask": True}, "parent": {"key": "PROJ-9"}
+        }})
+        self.assertEqual(jira.decomposition_parent("PROJ-1", "sibling"), "PROJ-9")
+
+    def test_subtask_without_parent_fails_closed(self):
+        jira = object.__new__(decomposition.Jira)
+        jira.request = Mock(return_value={"fields": {"issuetype": {"subtask": True}}})
+        with self.assertRaisesRegex(decomposition.DecompositionError, "no authoritative parent"):
+            jira.decomposition_parent("PROJ-1", "sibling")
+
+    def test_existing_child_requires_exact_type_content_and_provenance(self):
+        slice_ = self.assessment()["slices"][0]
+        label = "orchestration-slice-proj-1-foundation"
+        expected = {
+            "key": "PROJ-2",
+            "fields": {
+                "parent": {"key": "PROJ-9"},
+                "issuetype": {"name": "Sub-task", "subtask": True},
+                "summary": "Foundation",
+                "description": decomposition.adf(slice_, "PROJ-1"),
+                "labels": [
+                    "orchestration-slice",
+                    label,
+                    decomposition.decomposition_provenance("PROJ-1", slice_),
+                ],
+            },
+        }
+        jira = object.__new__(decomposition.Jira)
+        jira.request = Mock(return_value={"issues": [expected]})
+        self.assertEqual(
+            jira.find_child(
+                "PROJ-9", label, issue_type="Sub-task", slice_=slice_, source="PROJ-1"
+            ),
+            "PROJ-2",
+        )
+        expected["fields"]["summary"] = "Unrelated work"
+        with self.assertRaisesRegex(decomposition.DecompositionError, "collides"):
+            jira.find_child(
+                "PROJ-9", label, issue_type="Sub-task", slice_=slice_, source="PROJ-1"
+            )
+
     def test_rejects_cycles(self):
         value = self.assessment()
         value["slices"][0]["depends_on"] = ["cutover"]
@@ -195,6 +244,7 @@ class JiraDecompositionTests(unittest.TestCase):
             assessment.write_text(json.dumps(self.assessment()))
             output = root / "output.json"
             jira = Mock()
+            jira.decomposition_parent.return_value = "PROJ-1"
             jira.find_child.return_value = None
             jira.create_child.side_effect = ["PROJ-2", "PROJ-3"]
             jira.ensure_dependency.return_value = True

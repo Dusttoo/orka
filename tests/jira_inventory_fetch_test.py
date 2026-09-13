@@ -269,6 +269,8 @@ class JiraInventoryFetchTest(unittest.TestCase):
                 "summary",
                 "status",
                 "priority",
+                "labels",
+                "issuetype",
                 "subtasks",
                 "parent",
                 "issuelinks",

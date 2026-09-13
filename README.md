@@ -26,7 +26,7 @@ small config file, and the actual engineering rules live in the target repo's
 own `CLAUDE.md` / `AGENTS.md`. The plugin itself carries no project knowledge,
 so the same harness ports across codebases.
 
-## What 1.0 adds
+## What Orka adds
 
 Orka 1.0 is designed to keep a long-running sprint moving without choosing
 between brittle stop-and-go automation and an unbounded agent that can spend or
@@ -35,7 +35,14 @@ loop indefinitely:
 - **Large-ticket decomposition.** An opt-in scoping pass scores ticket
   complexity before implementation. Oversized technical work can be split into
   two to ten independently testable Jira children with explicit dependencies,
-  while product and security decisions still stop for an operator.
+  while product and security decisions still stop for an operator. Existing
+  Jira subtasks become sibling slices because Jira does not support nesting them.
+- **Finish-first throughput.** Repair and recovery work takes precedence over
+  fresh tickets, and an unfinished-PR ceiling prevents lane concurrency from
+  turning into a growing review and CI backlog.
+- **Progress-aware worker lifetimes.** Output and verified milestones reset an
+  inactivity timer; a separate absolute lifetime still stops a runaway worker.
+  Productive continuations do not consume the crash/relaunch allowance.
 - **Progress-aware spend control.** Warning thresholds are informational;
   spending without a durable milestone triggers recovery or decomposition
   instead of silently buying more retries. Hard ticket, run, reviewer, and
@@ -204,8 +211,11 @@ Legacy key blocks:
 | `sprint_id` / `sprint_*` | configured Jira sprint, dependency/status mapping, and checkpoint location |
 | `sprint_decomposition` | optional pre-code complexity assessment and bounded Jira child creation |
 | `concurrency_max` | how many ticket workflows or verification chains run at once |
+| `max_unmerged_prs` | unfinished-PR work-in-progress ceiling; defaults to lane concurrency |
 | `max_heavy_processes` | separate host-local limit for builds, full tests, and browser suites |
 | `max_lane_relaunches` | ordinary launch-attempt ceiling before ticket-scoped authority is required |
+| `max_worker_continuations` | productive time-limit continuations allowed without spending crash relaunches |
+| `max_worker_idle_seconds` / `max_worker_lifetime_seconds` | inactivity and absolute worker bounds |
 | `max_usd_without_progress` | recovery/decomposition trigger when spend advances without a durable milestone |
 | `max_design_rounds` / `max_repair_cycles` | independent caps for pre-code design and evidenced post-code repairs |
 | `worktree_cleanup` | `manual` (safe default) or `auto` for clean, unlocked worktrees |

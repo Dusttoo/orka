@@ -123,9 +123,9 @@ it. Priority is refreshed Jira metadata: a resync re-ranks pending tickets and
 never disturbs a running or terminal record, because a reservation is durable
 and a rank change must not move work that already launched.
 
-The controller orders, and the host obeys. `reserve` still admits any unblocked
-pending ticket so a host can reconcile out of order after a restart; it is not
-an ordering authority. Hosts must launch the keys `plan.launch` returns.
+The controller orders, and the host obeys. `reserve` admits an unblocked pending
+ticket only while lane and unfinished-PR capacity remain. It is not an ordering
+authority. Hosts must launch the keys `plan.launch` returns.
 
 ## Autonomous scope, recovery, and progress
 
@@ -135,10 +135,14 @@ reservation. A fresh read-only `ticket-scoper` worker—not the long-lived
 captain—produces the schema-v1 `record-scope` result. It either releases a ready ticket,
 places an oversized ticket in `plan.decomposition`, or records a genuine
 `operator_decision`. A `ready` result at or above the configured
-`complexity_threshold` is rejected. The idempotent Jira decomposition adapter creates a bounded
-set of linked subtasks with deterministic labels; after authoritative Jira sync,
-`record-decomposition` binds the exact child inventory and leaves the parent as
-a tracking record. Children inherit that parent's prerequisites and wait until
+`complexity_threshold` is rejected. Once the scoper selects `decompose`, the
+adapter validates the slice structure rather than independently reapplying that
+score threshold. The idempotent Jira decomposition adapter creates a bounded
+set of linked subtasks with content-addressed provenance labels. Existing issues
+are reused only when their type, parent, source, summary, description, and exact
+slice provenance match; after authoritative Jira sync, `record-decomposition`
+revalidates the subtask type, content identity, and exact child inventory and
+leaves the parent as a tracking record. Children inherit that parent's prerequisites and wait until
 the decomposition binding is recorded. A downstream dependency on the parent
 is satisfied only when its exact bound child set and prerequisites complete;
 missing or changed children keep it blocked. The parent remains `decomposed`,
@@ -153,6 +157,9 @@ status. Active, blocked, and completed work is preserved. Per-child
 record the returned children, then continue independent work around those blockers.
 Untouched Jira-owned readiness follows subsequent authoritative syncs in both
 directions. Scoping decisions and started worker outcomes remain durable.
+When a source issue is itself a subtask, `jira_subtask_decomposition_mode:
+sibling` creates slices under its verified existing parent. The controller then
+requires fresh inventory to prove every sibling relationship before binding.
 
 Transition and issue-link response handling follow the
 [Jira transition API](https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issues/#api-rest-api-3-issue-issueidorkey-transitions-post)
@@ -166,7 +173,9 @@ blockers remain visible without stopping independent lanes. `plan.repair` and
 mechanically stopped execution unit. `plan.recovery_waiting` units still occupy
 lanes until exit. Ineligible work appears in `decision_queue` (also included in
 `summary`); it does not by itself keep `autonomous_work_remaining` true. Requeue
-preserves branch/PR identity for continuation on the existing work.
+preserves branch/PR identity for continuation on the existing work. Direct
+reservation is bound to the current controller launch plan, so clients cannot
+skip an actionable repair, recovery, continuation, or WIP limit.
 
 Temporary sprint reservation pressure is recomputed at each API admission; it
 does not latch a permanent pause on the requesting ticket. An actually exhausted
@@ -349,8 +358,12 @@ absolute nested commands that bypass the launcher/configuration, or arbitrary
 programs using another endpoint. These gateways enforce spending for cooperative
 clients; they are not an OS sandbox. Use the API runner for unsupported workflows.
 
-Every local supervisor applies `max_worker_seconds` (default 1800, maximum 3600)
-and checks settled spending since verified progress against
+Every local supervisor applies an inactivity timeout (`max_worker_idle_seconds`,
+default 1800, maximum 7200) and a total lifetime (`max_worker_lifetime_seconds`,
+default 14400, maximum 43200). Output growth and newly verified controller
+milestones reset inactivity, not total lifetime. The legacy `max_worker_seconds`
+setting remains supported and retains its original 3600-second hard maximum.
+The supervisor also checks settled spending since verified progress against
 `max_usd_without_progress`. It sends TERM, then KILL to the worker's process group
 when a guard trips, preserves its terminal record, and moves only the matching
 running attempt to recovery or the decision queue. A supervisor exception also
@@ -363,6 +376,13 @@ and evidence pair is idempotent. `design_passed` accepts the canonical review le
 PASS receipt bound to this ticket. Only verified events reset the spending baseline;
 other milestone reports remain informational until their receipt validators are
 implemented. No progress event grants a review or merge approval.
+
+A time-limited attempt that recorded a new verified milestone may be requeued as
+a continuation. Continuations have their own `max_worker_continuations` counter
+and do not spend the ordinary crash/relaunch allowance. A timeout with no new
+verified milestone remains an ordinary charged attempt. Planning is finish-first:
+actionable repair and recovery work pauses fresh launches, and `max_unmerged_prs`
+(default `concurrency_max`) bounds unfinished PR work in progress.
 
 
 `record-progress --milestone review_finding_closed --evidence

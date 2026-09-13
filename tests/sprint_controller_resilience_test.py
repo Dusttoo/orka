@@ -27,6 +27,7 @@ class ResilienceTests(unittest.TestCase):
                         pause_usd_per_ticket=20, warn_usd_per_ticket=10,
                         max_model_runs_per_ticket=12, max_reviewer_runs_per_ticket=6,
                         max_lane_relaunches=2, concurrency_max=1,
+                        max_worker_continuations=6, max_unmerged_prs=10,
                         auto_decompose_large_tickets=False, max_usd_without_progress=5, done={"done"},
                         ready={"ready"}, blocked={"blocked"})
         self.state = dict(schema_version=2, sprint={"id": "1"}, dependency_status={}, tickets={})
@@ -155,6 +156,150 @@ class ResilienceTests(unittest.TestCase):
         self.assertTrue(summary["finished"])
         self.assertEqual(len(summary["decision_queue"]), 1)
 
+    def test_finish_first_pauses_fresh_launch_for_recovery(self):
+        self.ticket("PROJ-1", "recoverable")
+        self.ticket("PROJ-2")
+        with patch.object(controller, "automatic_recovery_available", return_value=True):
+            plan = controller.plan_value(self.state, self.cfg)
+        self.assertEqual(plan["recovery"], ["PROJ-1"])
+        self.assertEqual(plan["launch"], [])
+        self.assertTrue(plan["work_in_progress"]["fresh_launch_paused"])
+
+    def test_unfinished_pr_limit_pauses_fresh_launch(self):
+        self.cfg["max_unmerged_prs"] = 1
+        self.ticket("PROJ-1", "recoverable", pr="https://example/pr/1", attempt_token="")
+        self.ticket("PROJ-2", pr="")
+        plan = controller.plan_value(self.state, self.cfg)
+        self.assertEqual(plan["launch"], [])
+        self.assertEqual(plan["work_in_progress"]["unfinished_prs"], ["PROJ-1"])
+
+    def test_operator_held_pr_does_not_globally_block_independent_work(self):
+        self.cfg["max_unmerged_prs"] = 1
+        self.ticket("PROJ-1", "user_action", pr="https://example/pr/1")
+        self.ticket("PROJ-2", pr="")
+        plan = controller.plan_value(self.state, self.cfg)
+        self.assertEqual(plan["launch"], ["PROJ-2"])
+        self.assertEqual(plan["work_in_progress"]["total_visible"], 1)
+        self.assertEqual(plan["work_in_progress"]["count"], 0)
+
+    def test_verified_progress_continuation_does_not_consume_relaunch(self):
+        ticket = self.ticket("PROJ-1", attempts=3, charged_attempts=3,
+                             continuations=1, next_launch_continuation=True)
+        self.assertIsNone(controller.attempt_limit_reason(ticket, self.cfg))
+        ticket["continuations"] = 6
+        self.assertIn("attempt ceiling", controller.attempt_limit_reason(ticket, self.cfg))
+
+    def test_exhausted_continuation_allowance_becomes_a_charged_attempt(self):
+        ticket = self.ticket(
+            "PROJ-1", attempts=7, charged_attempts=1, continuations=6,
+            next_launch_continuation=True,
+            scope_assessment={"verdict": "ready"},
+        )
+        path = controller.state_path(self.cfg["state_dir"], "1")
+        controller.save(path, self.state)
+        args = argparse.Namespace(
+            sprint="1", ticket="PROJ-1", run_ref="charged-after-cap", run_id="",
+            role="sprint-worker", worker_ref="",
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            controller.reserve(args, self.cfg)
+        resumed = controller.load(path)["tickets"]["PROJ-1"]
+        self.assertEqual(resumed["continuations"], 6)
+        self.assertEqual(resumed["charged_attempts"], 2)
+
+    def test_requeue_and_reserve_account_a_verified_timeout_as_continuation(self):
+        ticket = self.ticket(
+            "PROJ-1", "recoverable", attempts=3, charged_attempts=3,
+            progress=[{"verified": True, "attempt": 3, "milestone": "pr_opened"}],
+            last_terminal={"attempt": 3, "invocation_id": "invocation-3",
+                           "stop_reason": "max_worker_lifetime_seconds"},
+            worker_identity={"kind": "execution_unit", "containment": "test-supervisor",
+                             "invocation_id": "invocation-3"},
+        )
+        path = controller.state_path(self.cfg["state_dir"], "1")
+        controller.save(path, self.state)
+        requeue = argparse.Namespace(
+            sprint="1", ticket="PROJ-1", reason="continue verified work",
+            attempt_token="token", operator_capability="",
+        )
+        with patch.object(controller, "execution_unit_status", return_value="absent"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            controller.requeue(requeue, self.cfg)
+        resumed = controller.load(path)["tickets"]["PROJ-1"]
+        self.assertTrue(resumed["next_launch_continuation"])
+        reserve = argparse.Namespace(
+            sprint="1", ticket="PROJ-1", run_ref="continuation", run_id="",
+            role="sprint-worker", worker_ref="",
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            controller.reserve(reserve, self.cfg)
+        relaunched = controller.load(path)["tickets"]["PROJ-1"]
+        self.assertEqual((relaunched["attempts"], relaunched["charged_attempts"],
+                          relaunched["continuations"]), (4, 3, 1))
+        self.assertEqual(relaunched["last_terminal"], {})
+
+    def test_stale_terminal_cannot_credit_a_later_attempt(self):
+        self.ticket(
+            "PROJ-1", "recoverable", attempts=2, charged_attempts=2,
+            progress=[{"verified": True, "attempt": 2, "milestone": "tests_passed"}],
+            last_terminal={"attempt": 1, "invocation_id": "invocation-1",
+                           "stop_reason": "max_worker_lifetime_seconds"},
+            worker_identity={"kind": "execution_unit", "containment": "test-supervisor",
+                             "invocation_id": "invocation-2"},
+        )
+        path = controller.state_path(self.cfg["state_dir"], "1")
+        controller.save(path, self.state)
+        args = argparse.Namespace(
+            sprint="1", ticket="PROJ-1", reason="recover later crash",
+            attempt_token="token", operator_capability="",
+        )
+        with patch.object(controller, "execution_unit_status", return_value="absent"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            controller.requeue(args, self.cfg)
+        self.assertFalse(controller.load(path)["tickets"]["PROJ-1"]["next_launch_continuation"])
+
+    def test_wip_ceiling_allows_only_the_pending_continuation(self):
+        self.cfg["max_unmerged_prs"] = 1
+        self.ticket("PROJ-1", pr="https://example/pr/1", next_launch_continuation=True)
+        self.ticket("PROJ-2", pr="")
+        plan = controller.plan_value(self.state, self.cfg)
+        self.assertEqual(plan["launch"], ["PROJ-1"])
+
+    def test_direct_reserve_cannot_bypass_finish_first_plan(self):
+        self.ticket("PROJ-1", "needs_repair")
+        self.ticket("PROJ-2", scope_assessment={"verdict": "ready"})
+        path = controller.state_path(self.cfg["state_dir"], "1")
+        controller.save(path, self.state)
+        args = argparse.Namespace(
+            sprint="1", ticket="PROJ-2", run_ref="fresh", run_id="",
+            role="sprint-worker", worker_ref="",
+        )
+        with patch.object(controller, "automatic_recovery_available", return_value=True), \
+                self.assertRaisesRegex(controller.SprintError, "current launch plan"):
+            controller.reserve(args, self.cfg)
+
+    def test_sibling_decomposition_requires_fresh_parent_evidence(self):
+        config = self.cfg["shared_root"] / "config.yaml"
+        config.write_text("jira_subtask_decomposition_mode: sibling\n")
+        self.cfg["config"] = config
+        self.ticket("PROJ-1", "needs_decomposition", parent="PROJ-9", subtasks=[],
+                    scope_assessment={"slices": [{"id": "foundation"}, {"id": "cutover"}]})
+        foundation = {"id": "foundation", "summary": "Foundation"}
+        cutover = {"id": "cutover", "summary": "Cutover"}
+        self.state["tickets"]["PROJ-1"]["scope_assessment"]["slices"] = [foundation, cutover]
+        self.ticket("PROJ-2", parent="PROJ-9", summary="Foundation", issue_type="Sub-task",
+                    is_subtask=True, labels=["orchestration-slice-proj-1-foundation",
+                    controller.decomposition_provenance("PROJ-1", foundation)])
+        self.ticket("PROJ-3", parent="PROJ-9", summary="Cutover", issue_type="Sub-task",
+                    is_subtask=True, labels=["orchestration-slice-proj-1-cutover",
+                    controller.decomposition_provenance("PROJ-1", cutover)])
+        path = controller.state_path(self.cfg["state_dir"], "1")
+        controller.save(path, self.state)
+        args = argparse.Namespace(sprint="1", ticket="PROJ-1", children="PROJ-2,PROJ-3")
+        with contextlib.redirect_stdout(io.StringIO()):
+            controller.record_decomposition(args, self.cfg)
+        self.assertEqual(controller.load(path)["tickets"]["PROJ-1"]["state"], "decomposed")
+
     def test_exhausted_repair_is_a_decision_not_autonomous_work(self):
         self.ticket("PROJ-1", "needs_repair", attempts=3)
         with patch.object(controller, "authorized_relaunch_ceiling", return_value=None):
@@ -183,7 +328,7 @@ class ResilienceTests(unittest.TestCase):
         with patch.object(controller, "execution_unit_status", return_value="absent"):
             plan = controller.plan_value(self.state, self.cfg)
         self.assertEqual(plan["recovery"], ["PROJ-1"])
-        self.assertEqual(plan["launch"], ["PROJ-2"])
+        self.assertEqual(plan["launch"], [])
 
     def test_requeue_preserves_pr_and_branch(self):
         value = self.ticket("PROJ-1", "recoverable", worker_identity={"kind": "execution_unit", "containment": "test-supervisor"})
@@ -310,6 +455,40 @@ class ResilienceTests(unittest.TestCase):
                 fresh["tickets"]["PROJ-1"].update(state="pending", reason="", raw_status="Ready")
                 self.sync_fixture(fresh)
                 self.assertEqual(self.state["tickets"]["PROJ-1"]["state"], status)
+
+    def test_authoritative_ready_sync_releases_untouched_legacy_hold(self):
+        self.ticket(
+            "PROJ-1", "user_action", raw_status="To Do", reason="verify_jira_readiness",
+            attempt_token="", branch="", pr="", run_ref="",
+            history=[{"event": "legacy-imported"}],
+        )
+        controller.save(controller.state_path(self.cfg["state_dir"], "1"), self.state)
+        fresh = copy.deepcopy(self.state)
+        fresh["tickets"]["PROJ-1"].update(
+            state="pending", reason="", raw_status="Ready", history=[]
+        )
+        self.sync_fixture(fresh)
+        ticket = self.state["tickets"]["PROJ-1"]
+        self.assertEqual((ticket["state"], ticket["reason"]), ("pending", ""))
+        self.assertEqual(ticket["history"][-1]["event"], "legacy-readiness-reconciled")
+
+    def test_ready_sync_does_not_clear_an_unrelated_legacy_decision(self):
+        self.ticket(
+            "PROJ-1", "user_action", raw_status="To Do", reason="product decision required",
+            attempt_token="", branch="", pr="", run_ref="",
+            history=[{"event": "legacy-imported"}],
+        )
+        controller.save(controller.state_path(self.cfg["state_dir"], "1"), self.state)
+        fresh = copy.deepcopy(self.state)
+        fresh["tickets"]["PROJ-1"].update(
+            state="pending", reason="", raw_status="Ready", history=[]
+        )
+        self.sync_fixture(fresh)
+        ticket = self.state["tickets"]["PROJ-1"]
+        self.assertEqual(
+            (ticket["state"], ticket["reason"]),
+            ("user_action", "product decision required"),
+        )
 
     def excluded_ticket(self, **extra):
         return self.ticket("PROJ-1", "user_action", **{

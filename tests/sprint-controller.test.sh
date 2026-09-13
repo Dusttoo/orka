@@ -43,6 +43,7 @@ def fields(item):
   priority_names={1:"Highest",2:"High",3:"Medium",4:"Low",5:"Lowest"}
   return {"summary":item.get("summary",""),"description":item.get("description",""),"status":{"name":item.get("status","")},
     "priority":({"id":"opaque-"+str(priority),"name":priority_names[int(priority)]} if priority is not None else None),"sprint":sprint,
+    "labels":item.get("labels",[]),"issuetype":{"name":item.get("issue_type","Task"),"subtask":item.get("is_subtask",False)},
     "subtasks":[{"key":x} for x in item.get("subtasks",[])],"issuelinks":links,
     **({"parent":{"key":item["parent"]}} if item.get("parent") else {})}
 parent_issues=[{"key":key,"fields":fields(by_key[key])} for key in parents]
@@ -544,7 +545,7 @@ run_ok "structured scope result enters decomposition queue" "$CONTROLLER" record
 "$CONTROLLER" plan --sprint 50 > "$TMP/decomposition-plan.json"
 json_check "decomposition remains autonomous work" "$TMP/decomposition-plan.json" 'data["decomposition"] == ["PROJ-72"] and data["autonomous_work_remaining"] is True'
 cat > "$TMP/repo/design-limit-inventory.json" <<'JSON'
-{"project":"PROJ","sprint":{"id":"50","name":"phase counts"},"source_query":"q","subtask_source_query":"children","subtask_keys":["PROJ-73","PROJ-74"],"tickets":[{"key":"PROJ-72","status":"Ready","dependencies":[],"subtasks":["PROJ-73","PROJ-74"]},{"key":"PROJ-73","parent":"PROJ-72","status":"Ready","dependencies":[],"subtasks":[]},{"key":"PROJ-74","parent":"PROJ-72","status":"Ready","dependencies":["PROJ-73"],"subtasks":[]}]}
+{"project":"PROJ","sprint":{"id":"50","name":"phase counts"},"source_query":"q","subtask_source_query":"children","subtask_keys":["PROJ-73","PROJ-74"],"tickets":[{"key":"PROJ-72","status":"Ready","dependencies":[],"subtasks":["PROJ-73","PROJ-74"]},{"key":"PROJ-73","parent":"PROJ-72","summary":"Foundation","issue_type":"Sub-task","is_subtask":true,"labels":["orchestration-slice-proj-72-foundation","orka-slice-v1-3f0d17c45e5d705e1bc6639b2d2c12d61a1451193fdb0b8fdd76cffe200d71ef"],"status":"Ready","dependencies":[],"subtasks":[]},{"key":"PROJ-74","parent":"PROJ-72","summary":"Cutover","issue_type":"Sub-task","is_subtask":true,"labels":["orchestration-slice-proj-72-cutover","orka-slice-v1-8dd5ad4a5a6d04ed3e973eba104fa9f9c8027e1ca687695a0f67b62036d9df04"],"status":"Ready","dependencies":["PROJ-73"],"subtasks":[]}]}
 JSON
 jira_receipt "$TMP/repo/design-limit-inventory.json"
 run_ok "fresh Jira sync proves decomposition children" "$CONTROLLER" sync --inventory design-limit-inventory.json
