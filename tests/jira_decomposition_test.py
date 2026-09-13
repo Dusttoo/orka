@@ -237,6 +237,76 @@ class JiraDecompositionTests(unittest.TestCase):
         jira.ensure_ready("PROJ-2", config)
         self.assertEqual(jira.request.call_args_list[2].args[2]["transition"]["id"], "31")
 
+    def test_child_follows_configured_multistep_path_to_ready(self):
+        config = self.config()
+        config["sprint_ready_statuses"] = ["Ready"]
+        config["sprint_decomposition"]["jira_ready_transition_path"] = ["Scoping", "Ready"]
+        jira = self.ready_jira(
+            self.status("To Do"),
+            {"transitions": [{"id": "11", "name": "Start Scoping", "to": {"name": "Scoping"}, "fields": {}}]},
+            {}, self.status("Scoping", "indeterminate"),
+            {"transitions": [{"id": "22", "name": "Scoping Done", "to": {"name": "Ready"}, "fields": {}}]},
+            {}, self.status("Ready"),
+        )
+        result = jira.ensure_ready("PROJ-2", config)
+        self.assertEqual(result, {"key": "PROJ-2", "status": "Ready", "transitioned": True})
+        posts = [call.args for call in jira.request.call_args_list if call.args[0] == "POST"]
+        self.assertEqual([args[2]["transition"]["id"] for args in posts], ["11", "22"])
+
+    def test_child_resumes_from_configured_intermediate_status(self):
+        config = self.config()
+        config["sprint_ready_statuses"] = ["Ready"]
+        config["sprint_decomposition"]["jira_ready_transition_path"] = ["Scoping", "Ready"]
+        jira = self.ready_jira(
+            self.status("Scoping", "indeterminate"),
+            {"transitions": [{"id": "22", "to": {"name": "Ready"}, "fields": {}}]},
+            {}, self.status("Ready"),
+        )
+        self.assertTrue(jira.ensure_ready("PROJ-2", config)["transitioned"])
+        self.assertEqual(jira.request.call_args_list[2].args[2]["transition"]["id"], "22")
+
+    def test_multistep_timeout_reconciles_before_next_step(self):
+        config = self.config()
+        config["sprint_ready_statuses"] = ["Ready"]
+        config["sprint_decomposition"]["jira_ready_transition_path"] = ["Scoping", "Ready"]
+        jira = self.ready_jira(
+            self.status("To Do"),
+            {"transitions": [{"id": "11", "to": {"name": "Scoping"}, "fields": {}}]},
+            decomposition.DecompositionError("timeout"), self.status("Scoping", "indeterminate"),
+            {"transitions": [{"id": "22", "to": {"name": "Ready"}, "fields": {}}]},
+            {}, self.status("Ready"),
+        )
+        self.assertTrue(jira.ensure_ready("PROJ-2", config)["transitioned"])
+        self.assertEqual(sum(call.args[0] == "POST" for call in jira.request.call_args_list), 2)
+
+    def test_multistep_path_rejects_required_intermediate_fields(self):
+        config = self.config()
+        config["sprint_ready_statuses"] = ["Ready"]
+        config["sprint_decomposition"]["jira_ready_transition_path"] = ["Scoping", "Ready"]
+        jira = self.ready_jira(self.status("To Do"), {"transitions": [{
+            "id": "11", "to": {"name": "Scoping"},
+            "fields": {"customfield_1": {"required": True, "hasDefaultValue": False}},
+        }]})
+        with self.assertRaisesRegex(decomposition.DecompositionError, "no transition to Scoping"):
+            jira.ensure_ready("PROJ-2", config)
+        self.assertEqual(sum(call.args[0] == "POST" for call in jira.request.call_args_list), 0)
+
+    def test_multistep_path_must_end_ready_and_cannot_repeat(self):
+        for path, message in ((["Scoping"], "must end"), (["Scoping", "Scoping", "Ready"], "must not repeat")):
+            with self.subTest(path=path):
+                config = self.config()
+                config["sprint_ready_statuses"] = ["Ready"]
+                config["sprint_decomposition"]["jira_ready_transition_path"] = path
+                with self.assertRaisesRegex(decomposition.DecompositionError, message):
+                    decomposition.validated_input(config, self.assessment())
+
+    def test_multistep_path_cannot_make_an_intermediate_status_launchable(self):
+        config = self.config()
+        config["sprint_ready_statuses"] = ["Scoping", "Ready"]
+        config["sprint_decomposition"]["jira_ready_transition_path"] = ["Scoping", "Ready"]
+        with self.assertRaisesRegex(decomposition.DecompositionError, "only the final"):
+            decomposition.validated_input(config, self.assessment())
+
     def test_one_readiness_blocker_preserves_created_children_and_other_progress(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

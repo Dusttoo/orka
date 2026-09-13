@@ -361,6 +361,13 @@ sprint_decomposition:
   max_auto_slices: 6
   jira_child_issue_type: Sub-task
   jira_subtask_decomposition_mode: sibling
+  # Optional ordered destination statuses when newly created children cannot
+  # transition directly to a configured sprint_ready_status. Every step must
+  # be available without missing required fields; the last item must be one of
+  # the configured sprint_ready_statuses.
+  # jira_ready_transition_path:
+  #   - Scoping
+  #   - Ready
 # The independent local supervisor stops a lane that spends this much without
 # verified progress. Repeated evidence does not reset this spending baseline.
 # Other tickets continue within their own budgets.
