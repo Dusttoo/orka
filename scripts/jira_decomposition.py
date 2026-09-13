@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from slice_delivery import validate_delivery, validate_owner
+from slice_delivery import decomposition_provenance, validate_delivery, validate_owner
 
 import argparse
 import base64
@@ -108,17 +108,77 @@ class Jira:
         except (URLError, TimeoutError, OSError) as exc:
             raise DecompositionError(f"Jira {method} {path} outcome is uncertain: {exc}") from exc
 
-    def find_child(self, parent: str, label: str) -> str | None:
+    def find_child(
+        self,
+        parent: str,
+        label: str,
+        *,
+        issue_type: str,
+        slice_: dict[str, Any],
+        source: str,
+    ) -> str | None:
         jql = f'parent = {parent} AND labels = "{label}"'
-        query = urlencode({"jql": jql, "fields": "key", "maxResults": 2})
+        query = urlencode({
+            "jql": jql,
+            "fields": "key,parent,issuetype,summary,description,labels",
+            "maxResults": 2,
+        })
         result = self.request("GET", "rest/api/3/search/jql?" + query)
         issues = result.get("issues", [])
         if not isinstance(issues, list):
             raise DecompositionError("Jira child lookup returned an invalid issue list")
-        keys = [str(issue.get("key") or "").upper() for issue in issues]
-        if len(keys) > 1:
+        if len(issues) > 1:
             raise DecompositionError(f"multiple Jira children carry idempotency label {label}")
-        return keys[0] if keys else None
+        if not issues:
+            return None
+        issue = issues[0]
+        key = str(issue.get("key") or "").upper()
+        fields = issue.get("fields") or {}
+        actual_type = fields.get("issuetype") or {}
+        expected_labels = {
+            "orchestration-slice",
+            label,
+            decomposition_provenance(source, slice_),
+        }
+        valid = (
+            re.fullmatch(r"[A-Z][A-Z0-9_]*-[0-9]+", key)
+            and str((fields.get("parent") or {}).get("key") or "").upper() == parent
+            and actual_type.get("subtask") is True
+            and str(actual_type.get("name") or "").casefold() == issue_type.casefold()
+            and str(fields.get("summary") or "").strip() == str(slice_["summary"]).strip()
+            and fields.get("description") == adf(slice_, source)
+            and expected_labels <= set(fields.get("labels") or [])
+        )
+        if not valid:
+            raise DecompositionError(
+                f"Jira issue {key or '<unknown>'} collides with {label} but does not match its exact Orka slice identity"
+            )
+        return key
+
+    def decomposition_parent(self, source: str, mode: str) -> str:
+        """Return the Jira parent that can legally own generated slices."""
+        if mode not in {"sibling", "child"}:
+            raise DecompositionError(
+                "jira_subtask_decomposition_mode must be sibling or child"
+            )
+        result = self.request(
+            "GET", f"rest/api/3/issue/{source}?fields=issuetype,parent"
+        )
+        fields = result.get("fields") or {}
+        issue_type = fields.get("issuetype") or {}
+        is_subtask = issue_type.get("subtask") is True
+        if not is_subtask:
+            return source
+        if mode == "child":
+            raise DecompositionError(
+                f"source {source} is already a Jira subtask; nested subtasks are unsupported"
+            )
+        parent = str((fields.get("parent") or {}).get("key") or "").upper()
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]*-[0-9]+", parent):
+            raise DecompositionError(
+                f"source subtask {source} has no authoritative parent"
+            )
+        return parent
 
     def create_child(
         self,
@@ -128,6 +188,7 @@ class Jira:
         issue_type: str,
         slice_: dict[str, Any],
         label: str,
+        source: str | None = None,
     ) -> str:
         body = {
             "fields": {
@@ -135,8 +196,12 @@ class Jira:
                 "parent": {"key": parent},
                 "issuetype": {"name": issue_type},
                 "summary": str(slice_["summary"]).strip(),
-                "description": adf(slice_, parent),
-                "labels": ["orchestration-slice", label],
+                "description": adf(slice_, source or parent),
+                "labels": [
+                    "orchestration-slice",
+                    label,
+                    decomposition_provenance(source or parent, slice_),
+                ],
             }
         }
         try:
@@ -144,7 +209,13 @@ class Jira:
         except DecompositionError as exc:
             # POST may have been accepted before a transport failure. Re-query
             # the deterministic label before deciding whether a retry is safe.
-            recovered = self.find_child(parent, label)
+            recovered = self.find_child(
+                parent,
+                label,
+                issue_type=issue_type,
+                slice_=slice_,
+                source=source or parent,
+            )
             if recovered:
                 return recovered
             raise exc
@@ -274,14 +345,11 @@ def validated_input(config: dict[str, Any], assessment: dict[str, Any]) -> tuple
         raise DecompositionError("assessment ticket and configured Jira project are required")
     slices = assessment.get("slices")
     maximum = min(int(feature.get("max_auto_slices", 6)), 10)
-    threshold = int(feature.get("complexity_threshold", 70))
     if not isinstance(slices, list) or not 2 <= len(slices) <= maximum:
         raise DecompositionError(f"assessment must contain 2 through {maximum} slices")
     score = assessment.get("complexity_score")
-    if isinstance(score, bool) or not isinstance(score, int) or score < threshold:
-        raise DecompositionError(
-            f"assessment complexity must reach configured threshold {threshold}"
-        )
+    if isinstance(score, bool) or not isinstance(score, int) or not 0 <= score <= 100:
+        raise DecompositionError("assessment complexity must be from 0 through 100")
     identifiers: set[str] = set()
     for item in slices:
         if not isinstance(item, dict):
@@ -359,15 +427,26 @@ def main() -> int:
         base_url = str(config.get("jira_base_url") or "")
         jira = Jira(base_url)
         issue_type = str(feature.get("jira_child_issue_type") or "Sub-task")
+        placement_parent = jira.decomposition_parent(
+            parent, str(feature.get("jira_subtask_decomposition_mode") or "sibling")
+        )
+        output["placement_parent"] = placement_parent
         keys: dict[str, str] = {}
         for item in slices:
             label = labels[item["id"]]
-            keys[item["id"]] = jira.find_child(parent, label) or jira.create_child(
+            keys[item["id"]] = jira.find_child(
+                placement_parent,
+                label,
+                issue_type=issue_type,
+                slice_=item,
+                source=parent,
+            ) or jira.create_child(
                 project=project,
-                parent=parent,
+                parent=placement_parent,
                 issue_type=issue_type,
                 slice_=item,
                 label=label,
+                source=parent,
             )
         links = config.get("sprint_dependency_links") or [{"type": "Blocks", "blocked_side": "inward"}]
         link = links[0]

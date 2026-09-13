@@ -100,6 +100,8 @@ def required_fields(
                 "summary",
                 "status",
                 "priority",
+                "labels",
+                "issuetype",
                 "subtasks",
                 "parent",
                 "issuelinks",
@@ -535,6 +537,11 @@ def build_inventory(
             "summary": str(data.get("summary") or "").strip(),
             "status": status_name(issue),
             "priority": priority_rank(issue, priority_order),
+            "labels": sorted(
+                str(label) for label in (data.get("labels") or []) if str(label)
+            ),
+            "issue_type": str((data.get("issuetype") or {}).get("name") or "").strip(),
+            "is_subtask": (data.get("issuetype") or {}).get("subtask") is True,
             "dependencies": dependencies[key],
             "subtasks": sorted(
                 child for child, parent in child_parents.items() if parent == key

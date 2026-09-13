@@ -9,7 +9,7 @@ and exact summaries.
 
 from __future__ import annotations
 
-from slice_delivery import validate_delivery, validate_owner
+from slice_delivery import decomposition_provenance, validate_delivery, validate_owner
 
 import argparse
 import contextlib
@@ -208,10 +208,39 @@ def settings(args: argparse.Namespace) -> dict[str, Any]:
         raise SprintError("sprint checkpoint directory escapes the repository")
     try:
         max_lane_relaunches = int(config_scalar(config, "max_lane_relaunches", "2"))
+        max_worker_continuations = int(
+            config_scalar(config, "max_worker_continuations", "6")
+        )
+        max_unmerged_prs = int(
+            config_scalar(config, "max_unmerged_prs", str(concurrency))
+        )
+        legacy_worker_seconds = config_scalar_any_depth(
+            config, "max_worker_seconds", ""
+        ).strip()
+        max_worker_idle_seconds = int(
+            legacy_worker_seconds
+            or config_scalar(config, "max_worker_idle_seconds", "1800")
+        )
+        max_worker_lifetime_seconds = int(
+            legacy_worker_seconds
+            or config_scalar(config, "max_worker_lifetime_seconds", "14400")
+        )
     except ValueError as exc:
-        raise SprintError("max_lane_relaunches must be an integer") from exc
-    if max_lane_relaunches < 0:
-        raise SprintError("max_lane_relaunches must be at least 0")
+        raise SprintError("lane, continuation, and work-in-progress limits must be integers") from exc
+    if max_lane_relaunches < 0 or max_worker_continuations < 0:
+        raise SprintError("lane relaunch and continuation limits must be at least 0")
+    if max_unmerged_prs < 1 or max_unmerged_prs > 20:
+        raise SprintError("max_unmerged_prs must be from 1 through 20")
+    if legacy_worker_seconds:
+        if not 1 <= max_worker_idle_seconds <= 3600:
+            raise SprintError("legacy max_worker_seconds must be from 1 through 3600")
+    elif (
+        not 60 <= max_worker_idle_seconds <= 7200
+        or not max_worker_idle_seconds <= max_worker_lifetime_seconds <= 43200
+    ):
+        raise SprintError(
+            "worker idle seconds must be 60..7200 and lifetime must be idle..43200"
+        )
     try:
         warning_budget = min(
             float(config_scalar_any_depth(config, "warn_usd_per_ticket", "10")) or 10,
@@ -259,6 +288,11 @@ def settings(args: argparse.Namespace) -> dict[str, Any]:
         "state_dir": state_dir,
         "shared_root": shared_root,
         "max_lane_relaunches": max_lane_relaunches,
+        "max_worker_continuations": max_worker_continuations,
+        "max_unmerged_prs": max_unmerged_prs,
+        "max_worker_idle_seconds": max_worker_idle_seconds,
+        "max_worker_lifetime_seconds": max_worker_lifetime_seconds,
+        "legacy_worker_timeout": bool(legacy_worker_seconds),
         "warn_usd_per_ticket": warning_budget,
         "pause_usd_per_ticket": pause_budget,
         "max_model_runs_per_ticket": max_model_runs,
@@ -723,6 +757,11 @@ def normalized_inventory(raw: dict[str, Any], cfg: dict[str, Any]) -> dict[str, 
             if normalized not in subtasks:
                 subtasks.append(normalized)
         raw_status = str(item.get("status", "")).strip()
+        raw_labels = item.get("labels", [])
+        if not isinstance(raw_labels, list) or any(
+            not isinstance(label, str) or not label.strip() for label in raw_labels
+        ):
+            raise SprintError(f"ticket {key} labels must be an array of strings")
         state, reason = initial_state(raw_status, cfg)
         tickets[key] = {
             "key": key,
@@ -731,6 +770,14 @@ def normalized_inventory(raw: dict[str, Any], cfg: dict[str, Any]) -> dict[str, 
             "url": str(item.get("url", "")).strip(),
             "raw_status": raw_status,
             "priority": normalize_priority(item.get("priority"), key),
+            "labels": sorted(set(raw_labels)),
+            "issue_type": str(item.get("issue_type", "")).strip(),
+            "is_subtask": item.get("is_subtask") is True,
+            "parent": (
+                normalize_key((item.get("parent") or {}).get("key"))
+                if isinstance(item.get("parent"), dict)
+                else normalize_key(item.get("parent")) if item.get("parent") else ""
+            ),
             "dependencies": sorted(dependencies),
             "subtasks": sorted(subtasks),
             "state": state,
@@ -739,6 +786,8 @@ def normalized_inventory(raw: dict[str, Any], cfg: dict[str, Any]) -> dict[str, 
             "branch": "",
             "pr": "",
             "attempts": 0,
+            "continuations": 0,
+            "next_launch_continuation": False,
             "attempt_token": "",
             "worker_identity": "",
             "attach_capability": "",
@@ -1025,11 +1074,20 @@ def attempt_limit_reason(
 ) -> str | None:
     """Return a launch blocker when this ticket has used every authorized attempt."""
     attempts = int(ticket.get("attempts") or 0)
+    continuations = int(ticket.get("continuations") or 0)
+    charged_attempts = max(
+        int(ticket.get("charged_attempts", attempts) or 0),
+        attempts - continuations,
+    )
+    if ticket.get("next_launch_continuation") and continuations < int(
+        cfg.get("max_worker_continuations", 6)
+    ):
+        return None
     restart = authorized_restart_grant(cfg["shared_root"], str(ticket["key"]))
     base_ceiling = cfg["max_lane_relaunches"] + 1 + startup_credits(ticket, cfg)
     if restart:
         base_ceiling = max(base_ceiling, restart["allowances"]["attempts"])
-    if attempts < base_ceiling:
+    if charged_attempts < base_ceiling:
         return None
     try:
         grant_ceiling = authorized_relaunch_ceiling(
@@ -1038,7 +1096,7 @@ def attempt_limit_reason(
     except AuthorityError as exc:
         raise SprintError(str(exc)) from exc
     effective_ceiling = max(base_ceiling, grant_ceiling or 0)
-    if attempts < effective_ceiling:
+    if charged_attempts < effective_ceiling:
         return None
     grant_detail = (
         f"; active ticket ceiling={grant_ceiling}"
@@ -1046,7 +1104,7 @@ def attempt_limit_reason(
         else ""
     )
     return (
-        f"attempt ceiling exhausted after {attempts} attempts "
+        f"attempt ceiling exhausted after {charged_attempts} charged attempts "
         f"(max_lane_relaunches={cfg['max_lane_relaunches']}{grant_detail}); "
         "root-issued ticket relaunch authority is required"
     )
@@ -1238,6 +1296,7 @@ def sync(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             for key, fresh in incoming["tickets"].items():
                 previous = current["tickets"].get(key)
                 if previous:
+                    authoritative_ready = fresh["state"] == "pending"
                     # Only Jira-owned, never-started readiness follows Jira.
                     # A temporary inventory exclusion can clear when the
                     # authenticated fetch includes the untouched ticket again.
@@ -1256,6 +1315,33 @@ def sync(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
                             "ci_progress", "test_progress",
                         ))
                     )
+                    no_execution_evidence = not any(previous.get(field) for field in (
+                        "attempts", "attempt_token", "attempt_capability", "run_ref",
+                        "branch", "pr", "worker_identity", "attach_capability",
+                        "attached_at", "launch_evidence", "scope_assessment",
+                        "decomposition_children", "progress", "verified_commits",
+                        "ci_progress", "test_progress", "subtasks",
+                    )) and not any(
+                        event.get("event") in {
+                            "reserved", "batch-reserved", "worker-launched", "finished",
+                            "progress", "scope-recorded", "decomposition-recorded",
+                        }
+                        for event in previous.get("history", [])
+                    )
+                    reconcile_legacy_readiness = bool(
+                        authoritative_ready
+                        and previous["state"] in {"blocked", "user_action"}
+                        and re.fullmatch(
+                            r"(?i)(verify[_ -]?jira[_ -]?readiness|jira readiness(?: verification)? required)",
+                            str(previous.get("reason") or "").strip(),
+                        )
+                        and no_execution_evidence
+                        and previous.get("history")
+                        and not any(
+                            event.get("event") == "removed-from-query"
+                            for event in previous.get("history", [])
+                        )
+                    )
                     refresh_readiness = (
                         not previous.get("attempts")
                         and previous["state"] in {"pending", "blocked", "user_action"}
@@ -1270,6 +1356,9 @@ def sync(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
                         "branch",
                         "pr",
                         "attempts",
+                        "charged_attempts",
+                        "continuations",
+                        "next_launch_continuation",
                         "attempt_token",
                         "history",
                         "attempt_capability",
@@ -1292,7 +1381,15 @@ def sync(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
                             continue
                         if field in previous:
                             fresh[field] = previous[field]
-                    if refresh_readiness and returned_to_query:
+                    if reconcile_legacy_readiness:
+                        fresh["state"] = "pending"
+                        fresh["reason"] = ""
+                        fresh["history"].append({
+                            "at": now(),
+                            "event": "legacy-readiness-reconciled",
+                            "status": fresh["raw_status"],
+                        })
+                    elif refresh_readiness and returned_to_query:
                         fresh["history"].append({"at": now(), "event": "returned-to-query", "status": fresh["raw_status"]})
                     elif refresh_readiness and fresh["raw_status"] != previous.get("raw_status"):
                         fresh["history"].append({"at": now(), "event": "jira-status-refreshed", "status": fresh["raw_status"]})
@@ -1538,13 +1635,65 @@ def record_decomposition(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         if not ticket or ticket["state"] != "needs_decomposition":
             current = ticket["state"] if ticket else "missing"
             raise SprintError(f"ticket {key} cannot record decomposition from state {current}")
-        if requested != sorted(ticket.get("subtasks", [])):
-            raise SprintError(
-                "created child keys must exactly match the fresh authoritative Jira subtask inventory"
-            )
         missing = sorted(set(requested) - set(state["tickets"]))
         if missing:
             raise SprintError("decomposition children are absent from inventory: " + ", ".join(missing))
+        exact_children = requested == sorted(ticket.get("subtasks", []))
+        mode = config_scalar_any_depth(
+            cfg["config"], "jira_subtask_decomposition_mode", "sibling"
+        )
+        assessment_slices = (ticket.get("scope_assessment") or {}).get("slices", [])
+        slice_by_label = {
+            f"orchestration-slice-{key.casefold()}-{slice_.get('id', '')}": slice_
+            for slice_ in assessment_slices
+            if isinstance(slice_, dict)
+        }
+        expected_labels = set(slice_by_label)
+        observed_labels = {
+            label
+            for child in requested
+            for label in state["tickets"][child].get("labels", [])
+            if label in expected_labels
+        }
+        labels_match = bool(
+            len(requested) == len(assessment_slices)
+            and len(expected_labels) == len(assessment_slices)
+            and observed_labels == expected_labels
+            and all(
+                len(set(state["tickets"][child].get("labels", [])) & expected_labels) == 1
+                for child in requested
+            )
+        )
+        expected_issue_type = str(
+            config_scalar_any_depth(cfg["config"], "jira_child_issue_type", "Sub-task")
+        )
+        identity_match = labels_match and all(
+            state["tickets"][child].get("is_subtask") is True
+            and str(state["tickets"][child].get("issue_type") or "").casefold()
+            == expected_issue_type.casefold()
+            and any(
+                state["tickets"][child].get("summary", "").strip()
+                == str(slice_by_label[label].get("summary") or "").strip()
+                and decomposition_provenance(key, slice_by_label[label])
+                in state["tickets"][child].get("labels", [])
+                for label in set(state["tickets"][child].get("labels", [])) & expected_labels
+            )
+            for child in requested
+        )
+        source_parent = ticket.get("parent") or ""
+        sibling_children = bool(
+            mode == "sibling"
+            and source_parent
+            and identity_match
+            and all(
+                state["tickets"][child].get("parent") == source_parent
+                for child in requested
+            )
+        )
+        if not (exact_children and identity_match) and not sibling_children:
+            raise SprintError(
+                "created keys must be authoritative children, or verified sibling slices of a Jira subtask"
+            )
         ticket["state"] = "decomposed"
         ticket["reason"] = "tracking parent decomposed into " + ", ".join(requested)
         ticket["decomposition_children"] = requested
@@ -1675,6 +1824,7 @@ def record_progress(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         spent = usage_snapshots(cfg).get(key, {}).get("spent_usd", 0.0)
         event = {"verified": verified, "fingerprint": fingerprint,
             "at": now(),
+            "attempt": int(ticket.get("attempts") or 0),
             "milestone": args.milestone,
             "evidence": args.evidence.strip(),
             "spent_usd": spent,
@@ -1891,7 +2041,39 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
     # A terminal report can precede process exit. Do not reuse its lane while
     # the previous execution unit is still alive, even when admission is paused.
     occupied = len(running) + len(recovery_waiting)
-    launch = ready[:max(0, cfg["concurrency_max"] - occupied)]
+    unfinished_prs = sorted(
+        ticket["key"]
+        for ticket in ordered
+        if ticket.get("pr")
+        and ticket["state"] not in {"completed", "decomposed"}
+    )
+    active_unfinished_prs = sorted(
+        ticket["key"]
+        for ticket in ordered
+        if ticket.get("pr")
+        and (
+            ticket["state"] in {"running", "needs_repair", "recoverable"}
+            or (
+                ticket["state"] == "pending"
+                and ticket.get("next_launch_continuation")
+            )
+        )
+    )
+    available = max(0, cfg["concurrency_max"] - occupied)
+    finish_first = bool(repair or recovery)
+    wip_limited = len(active_unfinished_prs) >= int(
+        cfg.get("max_unmerged_prs", cfg["concurrency_max"])
+    )
+    continuation_ready = [
+        key for key in ready if state["tickets"][key].get("next_launch_continuation")
+    ]
+    fresh_ready = [key for key in ready if key not in continuation_ready]
+    if finish_first:
+        launch = []
+    else:
+        launch = continuation_ready[:available]
+        if not wip_limited and len(launch) < available:
+            launch.extend(fresh_ready[: available - len(launch)])
     stalled = []
     for key in running:
         ticket = state["tickets"][key]
@@ -1916,6 +2098,19 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
     return {
         "sprint": state["sprint"],
         "concurrency_max": cfg["concurrency_max"],
+        "work_in_progress": {
+            "unfinished_prs": unfinished_prs,
+            "active_unfinished_prs": active_unfinished_prs,
+            "count": len(active_unfinished_prs),
+            "total_visible": len(unfinished_prs),
+            "limit": int(cfg.get("max_unmerged_prs", cfg["concurrency_max"])),
+            "fresh_launch_paused": finish_first or wip_limited,
+            "reason": (
+                "finish existing repair or recovery work first"
+                if finish_first
+                else "unfinished PR limit reached" if wip_limited else ""
+            ),
+        },
         "running": running,
         "needs_reconcile": sorted(running + recovery_waiting),
         "launch": [] if runtime_hold else launch,
@@ -2608,17 +2803,46 @@ def reserve(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             raise SprintError(
                 f"concurrency_max={cfg['concurrency_max']} is already reached"
             )
+        if not ticket.get("next_launch_continuation"):
+            unfinished_prs = [
+                value["key"]
+                for value in state["tickets"].values()
+                if value.get("pr")
+                and value["state"] in {"running", "needs_repair", "recoverable"}
+            ]
+            if len(unfinished_prs) >= int(
+                cfg.get("max_unmerged_prs", cfg["concurrency_max"])
+            ):
+                raise SprintError(
+                    "unfinished PR limit is already reached; finish repair/recovery work first"
+                )
         limit_reason = attempt_limit_reason(ticket, cfg)
         if limit_reason:
             raise SprintError(f"ticket {key} is blocked: {limit_reason}")
         if reason := spending_admission_reason(ticket, cfg, usage_snapshots(cfg).get(key, {})):
             raise SprintError(f"ticket {key} is blocked: {reason}")
+        current_plan = plan_value(state, cfg)
+        if key not in current_plan["launch"]:
+            raise SprintError(
+                f"ticket {key} is not in the controller's current launch plan; "
+                "finish repair, recovery, continuation, or WIP work first"
+            )
         if cfg.get("runtime_admission"):
             ticket["reserved_route"] = llm_route_from_config(cfg["config"], "sprint-worker")
         ticket["state"] = "running"
         ticket["reason"] = ""
         ticket["run_ref"] = args.run_ref
+        requested_continuation = bool(ticket.pop("next_launch_continuation", False))
+        continuation = requested_continuation and int(ticket.get("continuations") or 0) < int(
+            cfg.get("max_worker_continuations", 6)
+        )
         ticket["attempts"] += 1
+        if continuation:
+            ticket["continuations"] = int(ticket.get("continuations") or 0) + 1
+        else:
+            ticket["charged_attempts"] = int(
+                ticket.get("charged_attempts", ticket["attempts"] - 1) or 0
+            ) + 1
         ticket["attempt_token"] = "attempt_" + uuid.uuid4().hex
         capability_run_id = args.run_id or args.run_ref
         capability = {
@@ -2640,7 +2864,15 @@ def reserve(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         ticket["attach_capability"] = "attachcap_" + uuid.uuid4().hex
         ticket["attached_at"] = ""
         ticket["launch_evidence"] = {}
-        event = {"at": now(), "event": "reserved", "run_ref": args.run_ref}
+        # Terminal evidence belongs to the attempt that produced it. A later
+        # crash must never inherit an earlier timeout's continuation credit.
+        ticket["last_terminal"] = {}
+        event = {
+            "at": now(),
+            "event": "reserved",
+            "run_ref": args.run_ref,
+            "continuation": continuation,
+        }
         ticket["history"].append(event)
         save(path, state)
     emit(
@@ -2757,8 +2989,26 @@ def supervise_local(args: argparse.Namespace, _cfg: dict[str, Any]) -> None:
     # namespace directly, so absence means the existing metered desktop path.
     subscription_route = bool(getattr(args, "subscription_route", False))
     started = time.monotonic()
+    last_activity = started
+    last_output_size = output_path.stat().st_size if output_path.exists() else 0
+    last_progress_count = 0
     checkpoint = state_path(_cfg["state_dir"], args.sprint)
-    max_seconds = min(3600, max(1, int(config_scalar_any_depth(_cfg["config"], "max_worker_seconds", "1800"))))
+    legacy_timeout = bool(_cfg.get("legacy_worker_timeout"))
+    if "legacy_worker_timeout" not in _cfg:
+        legacy_timeout = bool(
+            config_scalar_any_depth(_cfg["config"], "max_worker_seconds", "").strip()
+        )
+    if legacy_timeout:
+        max_idle_seconds = max_lifetime_seconds = int(
+            _cfg.get("max_worker_idle_seconds")
+            or config_scalar_any_depth(_cfg["config"], "max_worker_seconds", "1800")
+        )
+        idle_reason = lifetime_reason = "max_worker_seconds"
+    else:
+        max_idle_seconds = int(_cfg.get("max_worker_idle_seconds", 1800))
+        max_lifetime_seconds = int(_cfg.get("max_worker_lifetime_seconds", 14400))
+        idle_reason = "max_worker_idle_seconds"
+        lifetime_reason = "max_worker_lifetime_seconds"
 
     def forward(signum: int, _frame: Any) -> None:
         if child is not None and child.poll() is None:
@@ -2815,17 +3065,32 @@ def supervise_local(args: argparse.Namespace, _cfg: dict[str, Any]) -> None:
                 {"phase": "launched", "identity": identity, "worker_pid": child.pid},
             )
             while child.poll() is None:
+                try:
+                    output_size = output_path.stat().st_size
+                except OSError:
+                    output_size = last_output_size
+                if output_size > last_output_size:
+                    last_output_size = output_size
+                    last_activity = time.monotonic()
                 if gateway and gateway.stopped.is_set():
                     stop_reason = gateway.reason
                 elif checkpoint.is_file():
                     snapshot = load(checkpoint)
                     lane = snapshot.get("tickets", {}).get(args.ticket, {})
                     if lane_invocation_matches(lane, args.invocation_id):
+                        progress_count = sum(
+                            1 for item in lane.get("progress", []) if item.get("verified")
+                        )
+                        if progress_count > last_progress_count:
+                            last_progress_count = progress_count
+                            last_activity = time.monotonic()
                         spend = usage_snapshots(_cfg).get(args.ticket, {})
                         if progress_spending(lane, _cfg, spend.get("spent_usd", 0)) >= _cfg["max_usd_without_progress"]:
                             stop_reason = "max_usd_without_progress"
-                if time.monotonic() - started >= max_seconds:
-                    stop_reason = "max_worker_seconds"
+                if time.monotonic() - started >= max_lifetime_seconds:
+                    stop_reason = lifetime_reason
+                elif time.monotonic() - last_activity >= max_idle_seconds:
+                    stop_reason = idle_reason
                 if stop_reason:
                     os.killpg(child.pid, signal.SIGTERM)
                     try:
@@ -2837,6 +3102,9 @@ def supervise_local(args: argparse.Namespace, _cfg: dict[str, Any]) -> None:
                         os.killpg(child.pid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
+                    except PermissionError:
+                        if child.poll() is None:
+                            raise
                     break
                 time.sleep(0.1)
             returncode = child.wait()
@@ -2870,7 +3138,11 @@ def supervise_local(args: argparse.Namespace, _cfg: dict[str, Any]) -> None:
                     child.wait(timeout=2)
                 except subprocess.TimeoutExpired:
                     pass
-                os.killpg(child.pid, signal.SIGKILL)
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except PermissionError:
+                    if child.poll() is None:
+                        raise
             except ProcessLookupError:
                 pass
         if gateway:
@@ -2902,12 +3174,14 @@ def supervise_local(args: argparse.Namespace, _cfg: dict[str, Any]) -> None:
             lane = state.get("tickets", {}).get(args.ticket, {})
             if (lane_invocation_matches(lane, args.invocation_id)
                     and lane.get("state") == "running"):
+                terminal["attempt"] = int(lane.get("attempts") or 0)
                 # Shared admission pressure can disappear when another lane's
                 # reservation is released. Keep it in automatic recovery; the
                 # ledger rechecks capacity before any subsequent paid request.
                 shared_pressure = stop_reason.startswith("max_usd_per_sprint would be exceeded:")
                 lane["state"] = "operator_decision" if not shared_pressure and ("budget" in stop_reason or "usd" in stop_reason) else "recoverable"
                 lane["reason"] = stop_reason
+                lane["last_terminal"] = terminal
                 lane.setdefault("history", []).append({"at": now(), "event": "supervisor-stopped", "state": lane["state"], "reason": stop_reason})
                 save(checkpoint, state)
 
@@ -3216,6 +3490,26 @@ def requeue(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         receipt = current_startup_failure(ticket, cfg)
         if receipt and receipt not in ticket.get("startup_retry_receipts", []):
             ticket.setdefault("startup_retry_receipts", []).append(receipt)
+        last_attempt = int(ticket.get("attempts") or 0)
+        made_progress = any(
+            item.get("verified") and int(item.get("attempt") or 0) == last_attempt
+            for item in ticket.get("progress", [])
+        )
+        terminal = ticket.get("last_terminal") or {}
+        identity = ticket.get("worker_identity") or {}
+        terminal_matches_attempt = bool(
+            int(terminal.get("attempt") or 0) == last_attempt
+            and terminal.get("invocation_id")
+            and terminal.get("invocation_id") == identity.get("invocation_id")
+        )
+        stop_reason = str(terminal.get("stop_reason") or "") if terminal_matches_attempt else ""
+        ticket["next_launch_continuation"] = bool(
+            made_progress and stop_reason in {
+                "max_worker_idle_seconds",
+                "max_worker_lifetime_seconds",
+                "max_worker_seconds",
+            }
+        )
         # Preserve the resumable work identity across execution attempts.
         ticket["attempt_token"] = ""
         ticket["attempt_capability"] = {}
@@ -3224,7 +3518,12 @@ def requeue(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         ticket["attached_at"] = ""
         ticket["launch_evidence"] = {}
         ticket["history"].append(
-            {"at": now(), "event": "requeued", "reason": args.reason.strip()}
+            {
+                "at": now(),
+                "event": "requeued",
+                "reason": args.reason.strip(),
+                "continuation_eligible": ticket["next_launch_continuation"],
+            }
         )
         save(path, state)
     emit({"ticket": key, "state": "pending"})

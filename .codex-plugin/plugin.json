@@ -1,6 +1,6 @@
 {
   "name": "orka",
-  "version": "1.3.3",
+  "version": "1.4.0",
   "description": "Orka is a multi-agent engineering harness for Codex and Claude Code: resilient Jira sprint scheduling, ticket decomposition, isolated implementation, bounded reviews, and merge-on-green.",
   "author": {
     "name": "Dusty Mumphrey",

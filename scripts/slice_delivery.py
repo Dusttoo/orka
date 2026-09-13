@@ -1,4 +1,25 @@
-"""Shared required delivery fields for decomposition and Jira publication."""
+"""Shared required delivery fields and identities for decomposition."""
+
+import hashlib
+import json
+
+
+def decomposition_provenance(source, item):
+    """Bind an Orka slice label to its exact source and reviewed content."""
+    fields = {
+        "source": str(source).upper(),
+        "id": item.get("id"),
+        "summary": item.get("summary"),
+        "behavior": item.get("behavior"),
+        "migration_owner": item.get("migration_owner"),
+        "test_plan": item.get("test_plan"),
+        "acceptance_criteria": item.get("acceptance_criteria"),
+        "depends_on": item.get("depends_on", []),
+    }
+    digest = hashlib.sha256(
+        json.dumps(fields, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return "orka-slice-v1-" + digest
 def validate_delivery(item, error):
     owner = item.get("migration_owner")
     tests = item.get("test_plan")

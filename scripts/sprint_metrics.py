@@ -18,6 +18,25 @@ def summarize(state, spend, as_of=None):
     attempted = [t for t in tickets.values() if t.get("attempts", 0) > 0]
     completed = [t for t in attempted if t.get("state") == "completed"]
     total = sum(float(spend.get(key, {}).get("spent_usd", 0)) for key in tickets)
+    pr_opened = [ticket for ticket in attempted if ticket.get("pr")]
+    ci_progressed = [
+        ticket for ticket in attempted
+        if ticket.get("ci_progress") or any(
+            event.get("milestone") == "ci_advanced"
+            for event in ticket.get("progress", [])
+        )
+    ]
+    unfinished_prs = [
+        ticket for ticket in pr_opened
+        if ticket.get("state") not in {"completed", "decomposed"}
+    ]
+    timeout_stops = sum(
+        1
+        for ticket in tickets.values()
+        for event in ticket.get("history", [])
+        if event.get("event") == "supervisor-stopped"
+        and str(event.get("reason") or "").startswith("max_worker_")
+    )
     durations, decisions = {}, 0
     for key, ticket in tickets.items():
         previous, previous_at = None, None
@@ -50,6 +69,19 @@ def summarize(state, spend, as_of=None):
         state_seconds_by_ticket=durations,
         observed_blocked_seconds=sum(sum(seconds for status, seconds in values.items() if status in BLOCKED)
                                      for values in durations.values() if values),
+        pipeline={
+            "attempted": len(attempted),
+            "pr_opened": len(pr_opened),
+            "ci_progress_recorded": len(ci_progressed),
+            "merged_or_completed": len(completed),
+            "unfinished_prs": len(unfinished_prs),
+            "worker_timeout_stops": timeout_stops,
+        },
+        spend_coverage={
+            "api_ledger_usd": round(total, 6),
+            "desktop_subscription_included": False,
+            "note": "Desktop/subscription model usage is not priced in the API usage ledger.",
+        },
         as_of=as_of.isoformat(), verified_merged_tickets=None, spend_per_verified_merge_usd=None,
         coverage="Durations and decision entries cover recorded state transitions only; missing history is unknown.")
 

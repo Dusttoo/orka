@@ -32,6 +32,10 @@ The controller atomically writes under `sprint_checkpoint_dir` (default
 `.orchestration/.sprint-state`) and reads these top-level config keys:
 
 - `concurrency_max`
+- `max_unmerged_prs` (default: `concurrency_max`)
+- `max_worker_idle_seconds` (default `1800`, hard maximum `7200`)
+- `max_worker_lifetime_seconds` (default `14400`, hard maximum `43200`)
+- `max_worker_continuations` (default `6`)
 - `max_heavy_processes`
 - `sprint_checkpoint_dir`
 - `sprint_ready_statuses`
@@ -42,6 +46,7 @@ The controller atomically writes under `sprint_checkpoint_dir` (default
 - `sprint_decomposition.auto_decompose_large_tickets` (default `false`)
 - `sprint_decomposition.complexity_threshold` (default `70`)
 - `sprint_decomposition.max_auto_slices` (default `6`, hard maximum `10`)
+- `sprint_decomposition.jira_subtask_decomposition_mode` (default `sibling`)
 - `max_usd_without_progress` (default `$5`, hard maximum `$10`)
 
 The host reads `ticket.kind`, `ticket.project`, `sprint_id`, `jira_base_url`,
@@ -170,7 +175,9 @@ repository config. Caller environment and CLI values cannot replace that policy.
 5. **Reserve, then launch.** Launch only keys returned in `plan.launch`, which
    is already ordered by `(priority, key)`; never reorder or reprioritize it
    locally. Before each launch, generate a unique provisional run reference and
-   call `reserve`. This atomic operation enforces `concurrency_max` and
+   Prefer actionable repairs and recoveries before fresh tickets. Do not open a
+   new implementation lane while the controller reports its unfinished-PR
+   limit reached. Then call `reserve`. This atomic operation enforces `concurrency_max` and
    prerequisite completion:
 
    ```text

@@ -38,5 +38,18 @@ class SprintMetricsTests(unittest.TestCase):
             pr['head']['ref'] = 'other'
             self.assertEqual(len(metrics.verify_merges(Path('.'), state, result)['merge_verification_errors']), 2)
 
+    def test_pipeline_and_spend_coverage_expose_throughput_loss(self):
+        state = dict(tickets={
+            'A': dict(attempts=1, state='needs_repair', pr='1', ci_progress={'tree': 2}, history=[
+                dict(event='supervisor-stopped', reason='max_worker_idle_seconds')]),
+            'B': dict(attempts=1, state='completed', pr='2', history=[]),
+        })
+        result = metrics.summarize(state, {'A': {'spent_usd': 1}})
+        self.assertEqual(result['pipeline'], {
+            'attempted': 2, 'pr_opened': 2, 'ci_progress_recorded': 1,
+            'merged_or_completed': 1, 'unfinished_prs': 1, 'worker_timeout_stops': 1,
+        })
+        self.assertFalse(result['spend_coverage']['desktop_subscription_included'])
+
 
 if __name__ == '__main__': unittest.main()

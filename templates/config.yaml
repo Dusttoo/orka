@@ -188,6 +188,11 @@ production_branch: ""           # fill for schema v1, e.g. the protected release
 # grant one ticket a higher absolute attempt ceiling without changing this
 # repository-wide default.
 max_lane_relaunches: 2
+# Productive time-limit continuations are tracked separately from failed
+# relaunches and require a verified milestone in the attempt being resumed.
+max_worker_continuations: 6
+max_worker_idle_seconds: 1800
+max_worker_lifetime_seconds: 14400
 
 # --- Merge strategy per target -------------------------------------------- both
 merge_to_integration: merge     # merge | squash. `merge` preserves per-PR history
@@ -355,6 +360,7 @@ sprint_decomposition:
   complexity_threshold: 70
   max_auto_slices: 6
   jira_child_issue_type: Sub-task
+  jira_subtask_decomposition_mode: sibling
 # The independent local supervisor stops a lane that spends this much without
 # verified progress. Repeated evidence does not reset this spending baseline.
 # Other tickets continue within their own budgets.
@@ -370,6 +376,8 @@ sprint_status_heartbeat_minutes: 30
 # Max concurrent per-ticket sprint workflows and heavy verification chains. Drop
 # to 1 under CI contention or when agents would collide on a shared test branch.
 concurrency_max: 2
+# Finish repair/recovery work first and pause fresh launches at this PR count.
+max_unmerged_prs: 2
 # Host-local heavy commands (builds, full test suites, browser suites) use this
 # smaller admission limit even when more model lanes are active.
 max_heavy_processes: 2
