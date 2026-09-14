@@ -149,6 +149,24 @@ CHECK
   mv "$PREFLIGHT_REPO/minimum.yaml" "$PREFLIGHT_REPO/.orchestration/config.yaml"
 }
 check "captain rejects a runtime below the repository minimum" check_minimum_version_rejected
+check_minimum_version_parser() {
+  python3 - "$ROOT/scripts/captain-preflight.py" <<'PY'
+import importlib.util,sys
+spec=importlib.util.spec_from_file_location("captain_preflight", sys.argv[1])
+module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+assert module.release_version("1.5.2") == (1, 5, 2)
+assert module.release_version("1.5.2+codex.20260914") == (1, 5, 2)
+assert module.release_version("1.6.0") > module.release_version("1.5.2")
+try:
+    module.release_version("1.5")
+except ValueError:
+    pass
+else:
+    raise AssertionError("malformed release was accepted")
+PY
+}
+check "minimum version comparison accepts equal, newer, and cachebuster releases" \
+  check_minimum_version_parser
 check_runtime_verified_subscription() {
   PATH="$FAKE_BIN:$PATH" python3 "$ROOT/scripts/captain-preflight.py" \
     --plugin-root "$ROOT" --repo "$PREFLIGHT_REPO" --host claude \

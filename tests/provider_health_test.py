@@ -99,14 +99,44 @@ class HealthTests(unittest.TestCase):
         route = dict(provider="openai", model="", execution="desktop", effort="")
         expected = self.root / "authorized-worktree"
         command = bind_native_working_directory(
-            ["codex", "exec", "--cd", "/wrong", "--cd=/also-wrong", "prompt"],
+            [
+                "codex",
+                "exec",
+                "--cd",
+                "/wrong",
+                "--cd=/also-wrong",
+                "-C",
+                "/short-wrong",
+                "-Cattached-wrong",
+                "prompt",
+            ],
             route,
             expected,
         )
         self.assertEqual(command.count("--cd"), 1)
         self.assertEqual(command[command.index("--cd") + 1], str(expected.resolve()))
         self.assertNotIn("/wrong", command)
+        self.assertNotIn("/short-wrong", command)
         self.assertFalse(any(arg.startswith("--cd=") for arg in command))
+        self.assertFalse(any(arg == "-C" or arg.startswith("-C") for arg in command))
+
+    def test_codex_worktree_override_is_rejected(self):
+        route = dict(provider="openai", model="", execution="desktop", effort="")
+        for command in (
+            ["codex", "exec", "--worktree", "prompt"],
+            ["codex", "exec", "--worktree=branch", "prompt"],
+        ):
+            with self.assertRaisesRegex(HealthError, "not controller-authorized"):
+                bind_native_working_directory(command, route, self.root)
+
+    def test_codex_options_after_sentinel_are_prompt_text(self):
+        route = dict(provider="openai", model="", execution="desktop", effort="")
+        command = bind_native_working_directory(
+            ["codex", "exec", "--", "-C", "/prompt-text", "--worktree"],
+            route,
+            self.root,
+        )
+        self.assertEqual(command[-4:], ["--", "-C", "/prompt-text", "--worktree"])
 
     def test_codex_working_directory_rejects_missing_value(self):
         route = dict(provider="openai", model="", execution="desktop", effort="")
@@ -399,6 +429,18 @@ class AdmissionTests(unittest.TestCase):
     def test_supervisor_rejects_worker_cwd_from_another_repository(self):
         other = self.root / "other"
         subprocess.run(["git", "init", "-q", str(other)], check=True)
+        self.ticket.update(
+            state="running",
+            launch_evidence={
+                "invocation_id": "wrong-worktree",
+                "ticket": "T-1",
+                "sprint": "1",
+                "repository": str(self.root),
+                "worker_cwd": str(other),
+                "recovery_binding": None,
+            },
+        )
+        self.c.save(self.path, self.state)
         args = self.N(
             command=["/bin/sh", "-c", "exit 0"],
             ready=str(self.root / "wrong-ready.json"),
@@ -412,8 +454,80 @@ class AdmissionTests(unittest.TestCase):
             subscription_route=False,
             worker_cwd=str(other),
         )
-        with self.assertRaisesRegex(self.c.SprintError, "different git repository"):
+        with self.assertRaisesRegex(self.c.SprintError, "controller-authenticated checkout"):
             self.c.supervise_local(args, self.cfg)
+
+    def test_supervisor_rejects_same_repository_wrong_worktree(self):
+        self.ticket.update(
+            state="running",
+            launch_evidence={
+                "invocation_id": "wrong-same-repo",
+                "ticket": "T-1",
+                "sprint": "1",
+                "repository": str(self.root),
+                "worker_cwd": str(self.root),
+                "recovery_binding": None,
+            },
+        )
+        self.c.save(self.path, self.state)
+        args = self.N(
+            command=["/bin/sh", "-c", "exit 0"],
+            ready=str(self.root / "same-ready.json"),
+            ack=str(self.root / "same-ack"),
+            tombstone=str(self.root / "same-terminal.json"),
+            output=str(self.root / "same-output.log"),
+            invocation_id="wrong-same-repo",
+            ticket="T-1",
+            sprint="1",
+            stdin_file=None,
+            subscription_route=False,
+            worker_cwd=str(self.root / "subdirectory"),
+        )
+        with self.assertRaisesRegex(self.c.SprintError, "persisted launch evidence"):
+            self.c.supervise_local(args, self.cfg)
+
+    def test_supervisor_revalidates_recovery_binding_immediately_before_spawn(self):
+        binding = {"kind": "preserved_pr", "worktree": str(self.root)}
+        self.ticket.update(
+            state="running",
+            recovery_binding=binding,
+            launch_evidence={
+                "invocation_id": "binding-drift",
+                "ticket": "T-1",
+                "sprint": "1",
+                "repository": str(self.root),
+                "worker_cwd": str(self.root),
+                "recovery_binding": binding,
+            },
+        )
+        self.c.save(self.path, self.state)
+        ack = self.root / "binding-ack"
+        ack.touch()
+        marker = self.root / "worker-ran"
+        args = self.N(
+            command=["/bin/sh", "-c", f"touch {marker}"],
+            ready=str(self.root / "binding-ready.json"),
+            ack=str(ack),
+            tombstone=str(self.root / "binding-terminal.json"),
+            output=str(self.root / "binding-output.log"),
+            invocation_id="binding-drift",
+            ticket="T-1",
+            sprint="1",
+            stdin_file=None,
+            subscription_route=False,
+            worker_cwd=str(self.root),
+        )
+        with patch.object(
+            self.c,
+            "verify_recovery_binding",
+            side_effect=[binding, self.c.SprintError("binding changed")],
+        ) as verify:
+            self.c.supervise_local(args, self.cfg)
+        self.assertEqual(verify.call_count, 2)
+        self.assertFalse(marker.exists())
+        terminal = self.c.read_json(Path(args.tombstone), label="terminal")
+        self.assertFalse(terminal["spawned"])
+        self.assertIn("binding changed", terminal["error"])
 
     def test_subscription_route_drift_writes_terminal_without_spawning(self):
         config = Path(self.cfg["config"])

@@ -140,7 +140,10 @@ def bind_native_working_directory(command, route, working_directory):
     index = 0
     while index < len(command):
         argument = command[index]
-        if argument == "--cd":
+        if argument == "--":
+            cleaned.extend(command[index:])
+            break
+        if argument in {"--cd", "-C"}:
             if index + 1 >= len(command) or command[index + 1] == "--":
                 raise HealthError("native Codex --cd requires a value")
             index += 2
@@ -150,6 +153,13 @@ def bind_native_working_directory(command, route, working_directory):
                 raise HealthError("native Codex --cd requires a value")
             index += 1
             continue
+        if argument.startswith("-C") and argument != "-C":
+            if not argument[2:].lstrip("="):
+                raise HealthError("native Codex -C requires a value")
+            index += 1
+            continue
+        if argument == "--worktree" or argument.startswith("--worktree="):
+            raise HealthError("native Codex --worktree is not controller-authorized")
         cleaned.append(argument)
         index += 1
     if len(cleaned) < 2 or Path(cleaned[0]).name != "codex" or cleaned[1] != "exec":

@@ -3830,6 +3830,59 @@ def signal_process_group(child: subprocess.Popen[Any], signum: int) -> None:
             raise
 
 
+def authenticate_supervisor_context(
+    args: argparse.Namespace, cfg: dict[str, Any], worker_cwd: Path
+) -> None:
+    checkpoint = state_path(cfg["state_dir"], str(args.sprint))
+    # Checkpoint writes are atomic. Do not take the controller lock here: the
+    # launching controller deliberately retains it until this supervisor has
+    # acknowledged and spawned, which itself fences concurrent mutation.
+    state = load(checkpoint)
+    ticket = state.get("tickets", {}).get(normalize_key(args.ticket))
+    if not isinstance(ticket, dict) or ticket.get("state") != "running":
+        raise SprintError("supervisor ticket is not an active controller lane")
+    evidence = ticket.get("launch_evidence")
+    if not isinstance(evidence, dict):
+        raise SprintError("supervisor has no persisted controller launch evidence")
+    if (
+        evidence.get("invocation_id") != args.invocation_id
+        or evidence.get("ticket") != normalize_key(args.ticket)
+        or str(evidence.get("sprint")) != str(args.sprint)
+        or Path(str(evidence.get("repository") or "")).resolve()
+        != Path(cfg["shared_root"]).resolve()
+        or Path(str(evidence.get("worker_cwd") or "")).resolve() != worker_cwd
+    ):
+        raise SprintError("supervisor context differs from persisted launch evidence")
+    recovery_binding = ticket.get("recovery_binding") or None
+    if evidence.get("recovery_binding") != recovery_binding:
+        raise SprintError("recovery binding changed after launch intent was persisted")
+    verified_binding = verify_recovery_binding(cfg, ticket)
+    expected_cwd = Path(cfg["shared_root"]).resolve()
+    if isinstance(verified_binding, dict):
+        expected_cwd = Path(str(verified_binding["worktree"])).resolve()
+    if worker_cwd != expected_cwd:
+        raise SprintError("worker cwd is not the controller-authenticated checkout")
+    try:
+        shared_common_dir = subprocess.run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            cwd=cfg["shared_root"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        worker_common_dir = subprocess.run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            cwd=worker_cwd,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise SprintError("worker cwd must be a checkout of the managed repository") from exc
+    if Path(shared_common_dir).resolve() != Path(worker_common_dir).resolve():
+        raise SprintError("worker cwd belongs to a different git repository")
+
+
 def supervise_local(args: argparse.Namespace, _cfg: dict[str, Any]) -> None:
     """Internal shim: establish identity before spawn and retain a tombstone."""
     command = list(args.command)
@@ -3845,25 +3898,7 @@ def supervise_local(args: argparse.Namespace, _cfg: dict[str, Any]) -> None:
     # controller-owned argument is required. The fallback exists solely for
     # older in-process test fixtures.
     if explicit_worker_cwd:
-        try:
-            shared_common_dir = subprocess.run(
-                ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
-                cwd=_cfg["shared_root"],
-                check=True,
-                capture_output=True,
-                text=True,
-            ).stdout.strip()
-            worker_common_dir = subprocess.run(
-                ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
-                cwd=worker_cwd,
-                check=True,
-                capture_output=True,
-                text=True,
-            ).stdout.strip()
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise SprintError("worker cwd must be a checkout of the managed repository") from exc
-        if Path(shared_common_dir).resolve() != Path(worker_common_dir).resolve():
-            raise SprintError("worker cwd belongs to a different git repository")
+        authenticate_supervisor_context(args, _cfg, worker_cwd)
     ready_path, ack_path = Path(args.ready), Path(args.ack)
     tombstone_path, output_path = Path(args.tombstone), Path(args.output)
     identity = process_identity(str(os.getpid()))
@@ -3981,6 +4016,8 @@ def supervise_local(args: argparse.Namespace, _cfg: dict[str, Any]) -> None:
             command = launch_arguments([executable, *command[1:]], endpoint)
         if args.stdin_file:
             input_handle = Path(args.stdin_file).open("rb")
+        if explicit_worker_cwd:
+            authenticate_supervisor_context(args, _cfg, worker_cwd)
         with output_path.open("ab") as output_handle:
             child = subprocess.Popen(
                 command,
@@ -4219,6 +4256,8 @@ def launch_local(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             "token": "launch_" + uuid.uuid4().hex,
             "status": "launching",
             "repository": str(cfg["shared_root"]),
+            "worker_cwd": str(worker_cwd),
+            "recovery_binding": recovery_binding,
             "sprint": str(args.sprint),
             "ticket": key,
             "attempt": ticket["attempts"],
