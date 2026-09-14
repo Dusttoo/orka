@@ -69,7 +69,8 @@ PY
     --artifact "$artifact" --output "$inventory"
 }
 
-mkdir -p "$TMP/repo/.git" "$TMP/repo/.orchestration"
+mkdir -p "$TMP/repo/.orchestration"
+git init -q "$TMP/repo"
 cat > "$TMP/operator-authority-helper" <<'SH'
 #!/usr/bin/env bash
 set -eu

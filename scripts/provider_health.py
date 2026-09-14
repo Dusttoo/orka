@@ -126,6 +126,38 @@ def subscription_launch_command(command, route):
     return command
 
 
+def bind_native_working_directory(command, route, working_directory):
+    """Bind native Codex execution to the controller-authorized checkout.
+
+    A caller-supplied ``--cd`` is routing input, not authority. Strip every
+    spelling of it and inject the resolved controller-owned directory.
+    """
+    command = list(command)
+    if route.get("execution") != "desktop" or route.get("provider") != "openai":
+        return command
+    bound = str(Path(working_directory).expanduser().resolve())
+    cleaned = []
+    index = 0
+    while index < len(command):
+        argument = command[index]
+        if argument == "--cd":
+            if index + 1 >= len(command) or command[index + 1] == "--":
+                raise HealthError("native Codex --cd requires a value")
+            index += 2
+            continue
+        if argument.startswith("--cd="):
+            if not argument.split("=", 1)[1]:
+                raise HealthError("native Codex --cd requires a value")
+            index += 1
+            continue
+        cleaned.append(argument)
+        index += 1
+    if len(cleaned) < 2 or Path(cleaned[0]).name != "codex" or cleaned[1] != "exec":
+        raise HealthError("working-directory binding requires direct codex exec")
+    cleaned[2:2] = ["--cd", bound]
+    return cleaned
+
+
 class ProviderHealth:
     def __init__(self, root):
         from runtime_state import shared_repository_root

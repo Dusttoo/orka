@@ -1,6 +1,7 @@
 """Shared failures block admission across tickets, without granting ticket capacity."""
 
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -9,6 +10,7 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from provider_health import (
+    bind_native_working_directory,
     ProviderHealth,
     HealthError,
     probe,
@@ -92,6 +94,24 @@ class HealthTests(unittest.TestCase):
                 validate_native_command(
                     ["codex", "exec", "--model", "gpt-test", "prompt"], route
                 )
+
+    def test_codex_working_directory_is_controller_bound(self):
+        route = dict(provider="openai", model="", execution="desktop", effort="")
+        expected = self.root / "authorized-worktree"
+        command = bind_native_working_directory(
+            ["codex", "exec", "--cd", "/wrong", "--cd=/also-wrong", "prompt"],
+            route,
+            expected,
+        )
+        self.assertEqual(command.count("--cd"), 1)
+        self.assertEqual(command[command.index("--cd") + 1], str(expected.resolve()))
+        self.assertNotIn("/wrong", command)
+        self.assertFalse(any(arg.startswith("--cd=") for arg in command))
+
+    def test_codex_working_directory_rejects_missing_value(self):
+        route = dict(provider="openai", model="", execution="desktop", effort="")
+        with self.assertRaisesRegex(HealthError, "requires a value"):
+            bind_native_working_directory(["codex", "exec", "--cd"], route, self.root)
 
     def test_model_less_desktop_probe_never_contacts_provider(self):
         config = self.root / "config.yaml"
@@ -375,6 +395,25 @@ class AdmissionTests(unittest.TestCase):
             self.c.supervise_local(args, self.cfg)
         self.assertEqual(output.read_text(), "subscription-clean")
         self.assertEqual(self.c.read_json(ready, label="ready")["phase"], "terminal")
+
+    def test_supervisor_rejects_worker_cwd_from_another_repository(self):
+        other = self.root / "other"
+        subprocess.run(["git", "init", "-q", str(other)], check=True)
+        args = self.N(
+            command=["/bin/sh", "-c", "exit 0"],
+            ready=str(self.root / "wrong-ready.json"),
+            ack=str(self.root / "wrong-ack"),
+            tombstone=str(self.root / "wrong-terminal.json"),
+            output=str(self.root / "wrong-output.log"),
+            invocation_id="wrong-worktree",
+            ticket="T-1",
+            sprint="1",
+            stdin_file=None,
+            subscription_route=False,
+            worker_cwd=str(other),
+        )
+        with self.assertRaisesRegex(self.c.SprintError, "different git repository"):
+            self.c.supervise_local(args, self.cfg)
 
     def test_subscription_route_drift_writes_terminal_without_spawning(self):
         config = Path(self.cfg["config"])

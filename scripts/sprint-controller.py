@@ -47,6 +47,7 @@ from api_agent import (
     load_orchestration_env,
 )
 from provider_health import (
+    bind_native_working_directory,
     ProviderHealth,
     HealthError,
     desktop_subscription_status,
@@ -2536,7 +2537,7 @@ def observe_preserved_pr(
 
 def verify_recovery_binding(
     cfg: dict[str, Any], ticket: dict[str, Any]
-) -> None:
+) -> dict[str, Any] | None:
     binding = ticket.get("recovery_binding") or {}
     if not binding:
         return
@@ -2563,6 +2564,7 @@ def verify_recovery_binding(
     if not worktree_is_quiescent(worktree):
         raise SprintError("preserved PR recovery worktree is no longer quiescent")
     verify_worktree_receipt(worktree, receipt)
+    return binding
 
 
 def reconcile_preserved_pr(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
@@ -3835,6 +3837,33 @@ def supervise_local(args: argparse.Namespace, _cfg: dict[str, Any]) -> None:
         command.pop(0)
     if not command:
         raise SprintError("supervisor requires a worker command")
+    explicit_worker_cwd = hasattr(args, "worker_cwd")
+    worker_cwd = Path(
+        getattr(args, "worker_cwd", _cfg["shared_root"])
+    ).expanduser().resolve()
+    # Production invocations can only arrive through the parser, where this
+    # controller-owned argument is required. The fallback exists solely for
+    # older in-process test fixtures.
+    if explicit_worker_cwd:
+        try:
+            shared_common_dir = subprocess.run(
+                ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                cwd=_cfg["shared_root"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            worker_common_dir = subprocess.run(
+                ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                cwd=worker_cwd,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise SprintError("worker cwd must be a checkout of the managed repository") from exc
+        if Path(shared_common_dir).resolve() != Path(worker_common_dir).resolve():
+            raise SprintError("worker cwd belongs to a different git repository")
     ready_path, ack_path = Path(args.ready), Path(args.ack)
     tombstone_path, output_path = Path(args.tombstone), Path(args.output)
     identity = process_identity(str(os.getpid()))
@@ -3955,6 +3984,7 @@ def supervise_local(args: argparse.Namespace, _cfg: dict[str, Any]) -> None:
         with output_path.open("ab") as output_handle:
             child = subprocess.Popen(
                 command,
+                cwd=worker_cwd,
                 stdin=input_handle,
                 stdout=output_handle,
                 stderr=subprocess.STDOUT,
@@ -4149,12 +4179,15 @@ def launch_local(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
     if input_path is not None and not input_path.is_file():
         raise SprintError("worker input must be an existing repository file")
     route = None
+    worker_cwd = Path(cfg["shared_root"]).resolve()
     with locked(path):
         state = load(path)
         ticket = state["tickets"].get(key)
         if not ticket or ticket["state"] != "running":
             raise SprintError(f"ticket {key} is not running")
-        verify_recovery_binding(cfg, ticket)
+        recovery_binding = verify_recovery_binding(cfg, ticket)
+        if isinstance(recovery_binding, dict) and recovery_binding.get("kind") == "preserved_pr":
+            worker_cwd = Path(str(recovery_binding["worktree"])).resolve()
         expected = str(ticket.get("attach_capability") or "")
         if (
             not expected
@@ -4176,6 +4209,7 @@ def launch_local(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
                     "provider admission held: " + json.dumps(hold, sort_keys=True)
                 )
             command = validate_native_command(command, route)
+            command = bind_native_working_directory(command, route, worker_cwd)
         invocation_id = uuid.uuid4().hex
         runtime_prefix = cfg["state_dir"] / f"execution-{invocation_id}"
         ready_path = runtime_prefix.with_suffix(".ready.json")
@@ -4226,6 +4260,8 @@ def launch_local(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             str(tombstone_path),
             "--output",
             str(output_path),
+            "--worker-cwd",
+            str(worker_cwd),
         ]
         if input_path is not None:
             supervisor.extend(["--stdin-file", str(input_path)])
@@ -5120,6 +5156,7 @@ def parser() -> argparse.ArgumentParser:
     supervisor_parser.add_argument("--ack", required=True)
     supervisor_parser.add_argument("--tombstone", required=True)
     supervisor_parser.add_argument("--output", required=True)
+    supervisor_parser.add_argument("--worker-cwd", required=True)
     supervisor_parser.add_argument("--stdin-file")
     supervisor_parser.add_argument("--subscription-route", action="store_true")
     supervisor_parser.add_argument("command", nargs=argparse.REMAINDER)

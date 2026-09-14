@@ -672,6 +672,9 @@ Run `captain-preflight.py --plugin-root <installation> --repo <repository>
 --host codex|claude --verify-runtime`. `installation_status: ready` only proves
 files/config exist. `execution_ready: true` requires bounded installed-client
 checks and authenticated token-count probes for explicit-model routes.
+Repositories may set `minimum_orka_version` to a stable release such as `1.5.2`;
+preflight then fails closed before provider checks when the active plugin is
+older. Local cachebuster suffixes do not change release ordering.
 Model-less desktop subscription routes instead verify that the selected client
 is installed and executable without contacting a provider endpoint. Codex must
 also report that it is logged in through ChatGPT. Model-less Claude routes are
@@ -679,6 +682,13 @@ unsupported because Claude Code lacks reliable subscription-auth evidence.
 Probe credentials use the same environment precedence as the runtime; an invalid
 process-environment key will still override a corrected repository `.env`.
 Never print credential values. No credential is changed by these commands.
+
+Native Codex launches are also bound to a controller-selected checkout. For a
+preserved-PR recovery, the controller replaces every caller-provided `--cd`
+with the authenticated recovery worktree and passes the same path separately to
+the supervisor. The supervisor proves that checkout shares the managed
+repository's Git common directory and starts the child there. An unrelated or
+unverifiable checkout fails before the worker process starts.
 
 `health-check --role sprint-worker` probes the configured route without a ticket
 reservation. Native OpenAI/Anthropic clients first run against a loopback mock;
