@@ -40,6 +40,18 @@ loop indefinitely:
 - **Finish-first throughput.** Repair and recovery work takes precedence over
   fresh tickets, and an unfinished-PR ceiling prevents lane concurrency from
   turning into a growing review and CI backlog.
+- **Verified PR recovery.** Repositories may opt into automatic recovery of a
+  clean, quiescent worktree whose open PR, branch, head, and tree all match
+  authenticated GitHub and checkpoint evidence. Existing PRs drain before new
+  implementation work without resetting review or attempt history.
+- **Reusable product decisions.** Approved, repository-owned decisions can be
+  keyed once and supplied to later scoping passes. Orka re-scopes affected
+  tickets under that policy instead of asking the same operator question for
+  every related slice.
+- **Complete decomposition contracts.** Repositories may require named product,
+  migration, security, compatibility, or ownership contracts on every generated
+  slice. Jira dependencies are created, re-read, and verified before the
+  controller makes a child launchable.
 - **Progress-aware worker lifetimes.** Output and verified milestones reset an
   inactivity timer; a separate absolute lifetime still stops a runaway worker.
   Productive continuations do not consume the crash/relaunch allowance.
@@ -210,8 +222,12 @@ Legacy key blocks:
 | `security_required_when` | diff triggers that make the security gate mandatory |
 | `sprint_id` / `sprint_*` | configured Jira sprint, dependency/status mapping, and checkpoint location |
 | `sprint_decomposition` | optional pre-code complexity assessment, bounded Jira child creation, and an approved multi-step path to a launchable Jira status |
+| `sprint_decomposition.required_slice_contracts` | repository-selected contract fields every generated slice must carry before Jira creation |
+| `sprint_decisions` | approved reusable decision registry supplied to future ticket-scoping passes |
 | `concurrency_max` | how many ticket workflows or verification chains run at once |
 | `max_unmerged_prs` | unfinished-PR work-in-progress ceiling; defaults to lane concurrency |
+| `pr_drain_first` | place existing PR continuations ahead of fresh tickets (default `true`) |
+| `preserved_pr_auto_recovery` | opt into mechanically verified clean/quiescent PR recovery (default `false`) |
 | `max_heavy_processes` | separate host-local limit for builds, full tests, and browser suites |
 | `max_lane_relaunches` | ordinary launch-attempt ceiling before ticket-scoped authority is required |
 | `max_worker_continuations` | productive time-limit continuations allowed without spending crash relaunches |

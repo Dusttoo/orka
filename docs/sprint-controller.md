@@ -149,6 +149,25 @@ missing or changed children keep it blocked. The parent remains `decomposed`,
 and summary reports its derived `dependency_complete` value rather than inventing
 a parent PR or marking unimplemented work merged.
 
+Repositories may declare
+`sprint_decomposition.required_slice_contracts` as a bounded list of contract
+names. Every slice must then carry a nonempty `contracts` value for each name
+before Jira mutation. Contract values are included in the provenance digest and
+Jira description. This lets a repository require decisions such as failure
+behavior, migration ownership, compatibility, or trust boundaries without
+embedding any project's policy in Orka. The adapter creates configured slice
+dependencies idempotently and immediately re-reads Jira; `record-decomposition`
+also requires the next authenticated sprint inventory to contain every expected
+edge before binding or releasing children.
+
+An `operator_decision` assessment may include a stable `decision_key` and
+question. A repository can answer recurring questions once in its reviewed
+top-level `sprint_decisions` map using `status: approved`, a bounded `answer`,
+and `rationale`. That registry is supplied to fresh scopers. When an affected
+ticket is synchronized or assessed, the controller records that the decision
+was applied and requires a fresh scope pass under the approved policy rather
+than treating the old assessment as a design pass.
+
 The Jira adapter transitions untouched children in Jira's new status category
 to a configured ready status, in configured preference order. When Jira does
 not expose a direct transition, a repository may declare a bounded
@@ -194,6 +213,17 @@ compares actual settled spend—not pessimistic reservations—since the last
 milestone against `max_usd_without_progress`. Crossing that threshold never
 weakens a gate or grants budget; it tells the captain to stop the execution unit
 and recover or decompose its preserved work.
+
+`pr_drain_first` defaults to true. After repairs and mechanically eligible
+continuations, pending work already bound to a PR is ordered ahead of untouched
+tickets. With `preserved_pr_auto_recovery: true`, `plan.pr_reconciliation`
+contains preserved open-PR work only when the ticket has no open usage
+reservation, GitHub proves the exact repository/PR/branch/head/tree identity,
+one clean worktree matches that branch beneath the configured worktree root,
+and Linux process inspection proves the worktree quiescent. The host runs
+`reconcile-preserved-pr` for that ticket, which records a new recovery binding
+and returns it to bounded repair/continuation. Missing or ambiguous evidence
+remains an operator decision; Orka does not fabricate execution authority.
 
 ## Rejected fragile designs
 
