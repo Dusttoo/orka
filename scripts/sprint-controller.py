@@ -2491,6 +2491,38 @@ def worktree_is_quiescent(path: Path) -> bool:
     return True
 
 
+def worktree_revision(path: Path) -> dict[str, str]:
+    """Return the exact commit and tree currently checked out by a worktree."""
+    values = {}
+    for name, revision in (("head", "HEAD"), ("tree", "HEAD^{tree}")):
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "--verify", revision],
+                cwd=path,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise SprintError("cannot verify preserved PR worktree revision") from exc
+        value = result.stdout.strip()
+        if not re.fullmatch(r"[0-9a-f]{40,64}", value):
+            raise SprintError("preserved PR worktree returned an invalid revision")
+        values[name] = value
+    return values
+
+
+def verify_worktree_receipt(path: Path, receipt: dict[str, Any]) -> None:
+    revision = worktree_revision(path)
+    if revision["head"] != receipt.get("head") or revision["tree"] != receipt.get(
+        "tree"
+    ):
+        raise SprintError(
+            "preserved PR worktree revision differs from the authenticated PR head/tree"
+        )
+
+
 def reconcile_preserved_pr(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
     """Convert a mechanically verified stopped PR into a bounded repair continuation."""
     path = state_path(cfg["state_dir"], str(args.sprint))
@@ -2520,6 +2552,7 @@ def reconcile_preserved_pr(args: argparse.Namespace, cfg: dict[str, Any]) -> Non
         raise SprintError(
             "preserved PR worktree is dirty, active, or cannot be proven quiescent"
         )
+    verify_worktree_receipt(worktree, observation["receipt"])
     identity = snapshot.get("worker_identity")
     if (
         isinstance(identity, dict)
@@ -2532,6 +2565,16 @@ def reconcile_preserved_pr(args: argparse.Namespace, cfg: dict[str, Any]) -> Non
         ticket = state["tickets"].get(key)
         if ticket != snapshot:
             raise SprintError("ticket changed during preserved PR verification; retry")
+        spend = usage_snapshots(cfg).get(key, {})
+        if spend.get("reserved_usd", 0):
+            raise SprintError(
+                "preserved PR gained an open usage reservation during verification"
+            )
+        if not worktree_is_quiescent(worktree):
+            raise SprintError(
+                "preserved PR worktree changed or became active during verification"
+            )
+        verify_worktree_receipt(worktree, observation["receipt"])
         ticket["state"] = "pending"
         ticket["reason"] = (
             "preserved PR and clean quiescent worktree verified for bounded repair"
@@ -3902,7 +3945,11 @@ def supervise_local(args: argparse.Namespace, _cfg: dict[str, Any]) -> None:
         # Also collect children that outlived a normally exiting parent.
         if child is not None:
             try:
-                os.killpg(child.pid, signal.SIGTERM)
+                try:
+                    os.killpg(child.pid, signal.SIGTERM)
+                except PermissionError:
+                    if child.poll() is None:
+                        raise
                 try:
                     child.wait(timeout=2)
                 except subprocess.TimeoutExpired:
