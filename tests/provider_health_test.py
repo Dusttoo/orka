@@ -1,5 +1,7 @@
 """Shared failures block admission across tickets, without granting ticket capacity."""
 
+import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -429,93 +431,161 @@ class AdmissionTests(unittest.TestCase):
     def test_supervisor_rejects_worker_cwd_from_another_repository(self):
         other = self.root / "other"
         subprocess.run(["git", "init", "-q", str(other)], check=True)
+        command = ["/bin/sh", "-c", "exit 0"]
+        ready = self.root / "wrong-ready.json"
+        ack = self.root / "wrong-ack"
+        tombstone = self.root / "wrong-terminal.json"
+        output = self.root / "wrong-output.log"
+        capability = "supervisor-wrong-worktree"
         self.ticket.update(
             state="running",
             launch_evidence={
+                "status": "launching",
                 "invocation_id": "wrong-worktree",
                 "ticket": "T-1",
                 "sprint": "1",
                 "repository": str(self.root),
                 "worker_cwd": str(other),
                 "recovery_binding": None,
+                "ready_path": str(ready),
+                "ack_path": str(ack),
+                "tombstone_path": str(tombstone),
+                "output_path": str(output),
+                "input_path": "",
+                "command_sha256": hashlib.sha256(
+                    json.dumps(command, separators=(",", ":")).encode()
+                ).hexdigest(),
+                "subscription_route": False,
+                "supervisor_capability_sha256": hashlib.sha256(
+                    capability.encode()
+                ).hexdigest(),
+                "supervisor_claim_path": str(
+                    ready.parent / "execution-wrong-worktree.claim.json"
+                ),
             },
         )
         self.c.save(self.path, self.state)
         args = self.N(
-            command=["/bin/sh", "-c", "exit 0"],
-            ready=str(self.root / "wrong-ready.json"),
-            ack=str(self.root / "wrong-ack"),
-            tombstone=str(self.root / "wrong-terminal.json"),
-            output=str(self.root / "wrong-output.log"),
+            command=command,
+            ready=str(ready),
+            ack=str(ack),
+            tombstone=str(tombstone),
+            output=str(output),
             invocation_id="wrong-worktree",
             ticket="T-1",
             sprint="1",
             stdin_file=None,
             subscription_route=False,
             worker_cwd=str(other),
+            supervisor_capability=capability,
         )
         with self.assertRaisesRegex(self.c.SprintError, "controller-authenticated checkout"):
             self.c.supervise_local(args, self.cfg)
 
     def test_supervisor_rejects_same_repository_wrong_worktree(self):
+        command = ["/bin/sh", "-c", "exit 0"]
+        ready = self.root / "same-ready.json"
+        ack = self.root / "same-ack"
+        tombstone = self.root / "same-terminal.json"
+        output = self.root / "same-output.log"
+        capability = "supervisor-wrong-same-repo"
         self.ticket.update(
             state="running",
             launch_evidence={
+                "status": "launching",
                 "invocation_id": "wrong-same-repo",
                 "ticket": "T-1",
                 "sprint": "1",
                 "repository": str(self.root),
                 "worker_cwd": str(self.root),
                 "recovery_binding": None,
+                "ready_path": str(ready),
+                "ack_path": str(ack),
+                "tombstone_path": str(tombstone),
+                "output_path": str(output),
+                "input_path": "",
+                "command_sha256": hashlib.sha256(
+                    json.dumps(command, separators=(",", ":")).encode()
+                ).hexdigest(),
+                "subscription_route": False,
+                "supervisor_capability_sha256": hashlib.sha256(
+                    capability.encode()
+                ).hexdigest(),
+                "supervisor_claim_path": str(
+                    ready.parent / "execution-wrong-same-repo.claim.json"
+                ),
             },
         )
         self.c.save(self.path, self.state)
         args = self.N(
-            command=["/bin/sh", "-c", "exit 0"],
-            ready=str(self.root / "same-ready.json"),
-            ack=str(self.root / "same-ack"),
-            tombstone=str(self.root / "same-terminal.json"),
-            output=str(self.root / "same-output.log"),
+            command=command,
+            ready=str(ready),
+            ack=str(ack),
+            tombstone=str(tombstone),
+            output=str(output),
             invocation_id="wrong-same-repo",
             ticket="T-1",
             sprint="1",
             stdin_file=None,
             subscription_route=False,
             worker_cwd=str(self.root / "subdirectory"),
+            supervisor_capability=capability,
         )
         with self.assertRaisesRegex(self.c.SprintError, "persisted launch evidence"):
             self.c.supervise_local(args, self.cfg)
 
     def test_supervisor_revalidates_recovery_binding_immediately_before_spawn(self):
         binding = {"kind": "preserved_pr", "worktree": str(self.root)}
+        marker = self.root / "worker-ran"
+        command = ["/bin/sh", "-c", f"touch {marker}"]
+        ready = self.root / "binding-ready.json"
+        ack = self.root / "binding-ack"
+        tombstone = self.root / "binding-terminal.json"
+        output = self.root / "binding-output.log"
+        capability = "supervisor-binding-drift"
         self.ticket.update(
             state="running",
             recovery_binding=binding,
             launch_evidence={
+                "status": "launching",
                 "invocation_id": "binding-drift",
                 "ticket": "T-1",
                 "sprint": "1",
                 "repository": str(self.root),
                 "worker_cwd": str(self.root),
                 "recovery_binding": binding,
+                "ready_path": str(ready),
+                "ack_path": str(ack),
+                "tombstone_path": str(tombstone),
+                "output_path": str(output),
+                "input_path": "",
+                "command_sha256": hashlib.sha256(
+                    json.dumps(command, separators=(",", ":")).encode()
+                ).hexdigest(),
+                "subscription_route": False,
+                "supervisor_capability_sha256": hashlib.sha256(
+                    capability.encode()
+                ).hexdigest(),
+                "supervisor_claim_path": str(
+                    ready.parent / "execution-binding-drift.claim.json"
+                ),
             },
         )
         self.c.save(self.path, self.state)
-        ack = self.root / "binding-ack"
         ack.touch()
-        marker = self.root / "worker-ran"
         args = self.N(
-            command=["/bin/sh", "-c", f"touch {marker}"],
-            ready=str(self.root / "binding-ready.json"),
+            command=command,
+            ready=str(ready),
             ack=str(ack),
-            tombstone=str(self.root / "binding-terminal.json"),
-            output=str(self.root / "binding-output.log"),
+            tombstone=str(tombstone),
+            output=str(output),
             invocation_id="binding-drift",
             ticket="T-1",
             sprint="1",
             stdin_file=None,
             subscription_route=False,
             worker_cwd=str(self.root),
+            supervisor_capability=capability,
         )
         with patch.object(
             self.c,
@@ -528,6 +598,98 @@ class AdmissionTests(unittest.TestCase):
         terminal = self.c.read_json(Path(args.tombstone), label="terminal")
         self.assertFalse(terminal["spawned"])
         self.assertIn("binding changed", terminal["error"])
+        with patch.object(self.c, "verify_recovery_binding", return_value=binding):
+            with self.assertRaisesRegex(self.c.SprintError, "already claimed"):
+                self.c.supervise_local(args, self.cfg)
+
+    def test_supervisor_replay_cannot_change_command_or_artifact_paths(self):
+        command = ["/bin/sh", "-c", "exit 0"]
+        ready = self.root / "replay-ready.json"
+        capability = "supervisor-replay"
+        evidence = {
+            "status": "launching",
+            "invocation_id": "replay",
+            "ticket": "T-1",
+            "sprint": "1",
+            "repository": str(self.root),
+            "worker_cwd": str(self.root),
+            "recovery_binding": None,
+            "ready_path": str(ready),
+            "ack_path": str(self.root / "replay-ack"),
+            "tombstone_path": str(self.root / "replay-terminal.json"),
+            "output_path": str(self.root / "replay-output.log"),
+            "input_path": "",
+            "command_sha256": hashlib.sha256(
+                json.dumps(command, separators=(",", ":")).encode()
+            ).hexdigest(),
+            "subscription_route": False,
+            "supervisor_capability_sha256": hashlib.sha256(
+                capability.encode()
+            ).hexdigest(),
+            "supervisor_claim_path": str(
+                ready.parent / "execution-replay.claim.json"
+            ),
+        }
+        self.ticket.update(state="running", launch_evidence=evidence)
+        self.c.save(self.path, self.state)
+        args = self.N(
+            command=["/bin/sh", "-c", "touch escaped"],
+            ready=str(ready),
+            ack=str(self.root / "attacker-ack"),
+            tombstone=evidence["tombstone_path"],
+            output=evidence["output_path"],
+            invocation_id="replay",
+            ticket="T-1",
+            sprint="1",
+            stdin_file=None,
+            subscription_route=False,
+            worker_cwd=str(self.root),
+            supervisor_capability=capability,
+        )
+        with self.assertRaisesRegex(self.c.SprintError, "persisted launch evidence"):
+            self.c.supervise_local(args, self.cfg)
+
+    def test_launch_keeps_recovery_binding_until_spawn_is_proved(self):
+        self.cfg["runtime_admission"] = False
+        self.reserve()
+        state = self.c.load(self.path)
+        ticket = state["tickets"]["T-1"]
+        binding = {"kind": "preserved_pr", "worktree": str(self.root)}
+        ticket["recovery_binding"] = binding
+        self.c.save(self.path, state)
+        args = self.N(
+            sprint="1",
+            ticket="T-1",
+            command=["/bin/sh", "-c", "exit 0"],
+            output=str(self.root / "launch-output.log"),
+            stdin_file=None,
+            attach_capability=ticket["attach_capability"],
+        )
+        supervisor = Mock(pid=12345)
+        supervisor.terminate = Mock()
+        observations = []
+
+        def runtime_record(path, _process, label):
+            snapshot = json.loads(self.path.read_text())
+            observations.append((label, snapshot["tickets"]["T-1"]["recovery_binding"]))
+            if label == "supervisor readiness":
+                return {"identity": {"pid": 12345, "start_identity": "test"}}
+            self.assertTrue(Path(snapshot["tickets"]["T-1"]["launch_evidence"]["ack_path"]).exists())
+            return {"phase": "launched", "worker_pid": 23456}
+
+        with patch.object(self.c, "verify_recovery_binding", return_value=binding), patch.object(
+            self.c, "linux_systemd_scope_available", return_value=False
+        ), patch.object(self.c.subprocess, "run", return_value=Mock(stdout="a" * 40)), patch.object(
+            self.c.subprocess, "Popen", return_value=supervisor
+        ), patch.object(
+            self.c, "wait_for_runtime_record", side_effect=runtime_record
+        ), patch("sys.stdout"):
+            self.c.launch_local(args, self.cfg)
+        self.assertEqual(observations, [
+            ("supervisor readiness", binding),
+            ("worker launch", binding),
+        ])
+        self.assertEqual(self.c.load(self.path)["tickets"]["T-1"]["recovery_binding"], {})
 
     def test_subscription_route_drift_writes_terminal_without_spawning(self):
         config = Path(self.cfg["config"])
