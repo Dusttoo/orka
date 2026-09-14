@@ -209,7 +209,7 @@ Legacy key blocks:
 | `gates` | which review roles run (`code-review`, `security-review`) |
 | `security_required_when` | diff triggers that make the security gate mandatory |
 | `sprint_id` / `sprint_*` | configured Jira sprint, dependency/status mapping, and checkpoint location |
-| `sprint_decomposition` | optional pre-code complexity assessment and bounded Jira child creation |
+| `sprint_decomposition` | optional pre-code complexity assessment, bounded Jira child creation, and an approved multi-step path to a launchable Jira status |
 | `concurrency_max` | how many ticket workflows or verification chains run at once |
 | `max_unmerged_prs` | unfinished-PR work-in-progress ceiling; defaults to lane concurrency |
 | `max_heavy_processes` | separate host-local limit for builds, full tests, and browser suites |

@@ -37,6 +37,47 @@ def status_names(config: dict[str, Any], key: str, default: list[str]) -> list[s
     return [value.strip().casefold() for value in values]
 
 
+def ready_transition_path(
+    config: dict[str, Any],
+    *,
+    ready: list[str],
+    done: list[str],
+    blocked: list[str],
+) -> list[str]:
+    """Return a bounded, explicitly approved Jira status path."""
+    feature = config.get("sprint_decomposition") or {}
+    if not isinstance(feature, dict):
+        raise DecompositionError("sprint_decomposition must be a map")
+    values = feature.get("jira_ready_transition_path")
+    if values is None:
+        return []
+    if (
+        not isinstance(values, list)
+        or not 1 <= len(values) <= 5
+        or any(not isinstance(value, str) or not value.strip() for value in values)
+    ):
+        raise DecompositionError(
+            "jira_ready_transition_path must contain 1 through 5 status names"
+        )
+    path = [value.strip() for value in values]
+    normalized = [value.casefold() for value in path]
+    if len(set(normalized)) != len(normalized):
+        raise DecompositionError("jira_ready_transition_path must not repeat a status")
+    if normalized[-1] not in ready:
+        raise DecompositionError(
+            "jira_ready_transition_path must end in a configured sprint_ready_status"
+        )
+    if any(value in ready for value in normalized[:-1]):
+        raise DecompositionError(
+            "only the final jira_ready_transition_path status may be launchable"
+        )
+    if any(value in done or value in blocked for value in normalized):
+        raise DecompositionError(
+            "jira_ready_transition_path must not include done or blocked statuses"
+        )
+    return path
+
+
 def auth_headers() -> dict[str, str]:
     token = os.environ.get("JIRA_API_TOKEN", "")
     if not token:
@@ -270,6 +311,10 @@ class Jira:
         ready = status_names(config, "sprint_ready_statuses", ["Ready", "To Do", "Open", "Selected for Development"])
         done = status_names(config, "sprint_done_statuses", ["Done", "Closed", "Resolved"])
         blocked = status_names(config, "sprint_blocked_statuses", ["Blocked"])
+        configured_path = ready_transition_path(
+            config, ready=ready, done=done, blocked=blocked
+        )
+        normalized_path = [value.casefold() for value in configured_path]
 
         def status() -> dict[str, Any]:
             value = (self.request("GET", f"rest/api/3/issue/{key}?fields=status").get("fields") or {}).get("status")
@@ -281,8 +326,73 @@ class Jira:
         name = current["name"].casefold()
         if name in ready or name in done:
             return {"key": key, "status": current["name"], "transitioned": False}
-        if name in blocked or (current.get("statusCategory") or {}).get("key") != "new":
+        permitted_intermediate = name in normalized_path[:-1]
+        if name in blocked or (
+            (current.get("statusCategory") or {}).get("key") != "new"
+            and not permitted_intermediate
+        ):
             raise DecompositionError(f"child {key} is {current['name']}; preserving its existing workflow state")
+
+        if configured_path:
+            start = normalized_path.index(name) + 1 if name in normalized_path else 0
+            targets = configured_path[start:]
+            transitioned = False
+            observed = current
+            for target_name in targets:
+                target = target_name.casefold()
+                result = self.request(
+                    "GET",
+                    f"rest/api/3/issue/{key}/transitions?expand=transitions.fields",
+                )
+                transitions = result.get("transitions")
+                if not isinstance(transitions, list):
+                    raise DecompositionError(f"child {key} has no verified transition list")
+                candidates = []
+                for transition in transitions:
+                    if not isinstance(transition, dict) or not isinstance(transition.get("to"), dict):
+                        raise DecompositionError(f"child {key} has malformed transition metadata")
+                    if str((transition.get("to") or {}).get("name") or "").casefold() != target:
+                        continue
+                    fields = transition.get("fields", {})
+                    if not isinstance(fields, dict) or any(
+                        not isinstance(field, dict) for field in fields.values()
+                    ):
+                        raise DecompositionError(f"child {key} has malformed transition field metadata")
+                    if any(
+                        field.get("required") and field.get("hasDefaultValue") is not True
+                        for field in fields.values()
+                    ):
+                        continue
+                    identifier = str(transition.get("id") or "")
+                    if re.fullmatch(r"[0-9]+", identifier):
+                        candidates.append(identifier)
+                if not candidates:
+                    raise DecompositionError(
+                        f"child {key} has no transition to {target_name} without missing required fields"
+                    )
+                identifier = min(candidates, key=int)
+                try:
+                    self.request(
+                        "POST",
+                        f"rest/api/3/issue/{key}/transitions",
+                        {"transition": {"id": identifier}},
+                    )
+                    observed = status()
+                except DecompositionError:
+                    # Reconcile an uncertain POST before deciding whether the
+                    # exact configured step may continue.
+                    observed = status()
+                    if observed["name"].casefold() != target:
+                        raise
+                if observed["name"].casefold() != target:
+                    raise DecompositionError(
+                        f"child {key} did not reach configured path status {target_name}"
+                    )
+                transitioned = True
+            if observed["name"].casefold() not in ready:
+                raise DecompositionError(f"child {key} did not reach a configured ready status")
+            return {"key": key, "status": observed["name"], "transitioned": transitioned}
+
         result = self.request("GET", f"rest/api/3/issue/{key}/transitions?expand=transitions.fields")
         transitions = result.get("transitions")
         if not isinstance(transitions, list):
@@ -324,12 +434,10 @@ def validated_input(config: dict[str, Any], assessment: dict[str, Any]) -> tuple
         raise DecompositionError("sprint_decomposition must be a map")
     if feature.get("auto_decompose_large_tickets") is not True:
         raise DecompositionError("automatic decomposition is not enabled by repository policy")
-    for key, default in (
-        ("sprint_ready_statuses", ["Ready", "To Do", "Open", "Selected for Development"]),
-        ("sprint_done_statuses", ["Done", "Closed", "Resolved"]),
-        ("sprint_blocked_statuses", ["Blocked"]),
-    ):
-        status_names(config, key, default)
+    ready = status_names(config, "sprint_ready_statuses", ["Ready", "To Do", "Open", "Selected for Development"])
+    done = status_names(config, "sprint_done_statuses", ["Done", "Closed", "Resolved"])
+    blocked = status_names(config, "sprint_blocked_statuses", ["Blocked"])
+    ready_transition_path(config, ready=ready, done=done, blocked=blocked)
     if assessment.get("schema_version") != 1 or assessment.get("verdict") != "decompose":
         raise DecompositionError("assessment must be a schema-v1 decompose verdict")
     ticket_policy = config.get("ticket") or {}

@@ -150,9 +150,13 @@ and summary reports its derived `dependency_complete` value rather than inventin
 a parent PR or marking unimplemented work merged.
 
 The Jira adapter transitions untouched children in Jira's new status category
-to a configured ready status, in configured preference order. It requires an
-available transition without missing required fields and verifies the resulting
-status. Active, blocked, and completed work is preserved. Per-child
+to a configured ready status, in configured preference order. When Jira does
+not expose a direct transition, a repository may declare a bounded
+`sprint_decomposition.jira_ready_transition_path` of one through five destination
+statuses. Only the final status may be launchable. The adapter follows each
+exact step, requires a transition without missing required fields, re-reads Jira
+after every POST, and safely resumes from an already reached intermediate state.
+Active, blocked, and completed work is preserved. Per-child
 `readiness_blockers` do not discard successful creation/linking results; sync and
 record the returned children, then continue independent work around those blockers.
 Untouched Jira-owned readiness follows subsequent authoritative syncs in both
