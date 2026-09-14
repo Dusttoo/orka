@@ -7,10 +7,12 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import signal
+import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -308,6 +310,7 @@ class ResilienceTests(unittest.TestCase):
             "PROJ-1",
             "recoverable",
             attempts=2,
+            worker_identity="",
             verified_commits={"a" * 40: "b" * 40},
         )
         plan = controller.plan_value(self.state, self.cfg)
@@ -324,6 +327,7 @@ class ResilienceTests(unittest.TestCase):
             "PROJ-1",
             "recoverable",
             attempts=2,
+            worker_identity="",
             verified_commits={"a" * 40: "b" * 40},
         )
         path = controller.state_path(self.cfg["state_dir"], "1")
@@ -368,6 +372,7 @@ class ResilienceTests(unittest.TestCase):
             "PROJ-1",
             "recoverable",
             attempts=2,
+            worker_identity="",
             verified_commits={"a" * 40: "b" * 40},
         )
         path = controller.state_path(self.cfg["state_dir"], "1")
@@ -408,6 +413,7 @@ class ResilienceTests(unittest.TestCase):
             "PROJ-1",
             "recoverable",
             attempts=2,
+            worker_identity="",
             verified_commits={"a" * 40: "b" * 40},
         )
         path = controller.state_path(self.cfg["state_dir"], "1")
@@ -431,12 +437,12 @@ class ResilienceTests(unittest.TestCase):
                 return_value={"head": "a" * 40, "tree": "b" * 40},
             ),
             patch.object(
-                controller,
-                "usage_snapshots",
-                side_effect=[{}, {"PROJ-1": {"reserved_usd": 1.0}}],
+                controller.UsageLedger,
+                "fence_recovery",
+                side_effect=RuntimeError("open usage reservation"),
             ),
             self.assertRaisesRegex(
-                controller.SprintError, "gained an open usage reservation"
+                controller.SprintError, "open usage reservation"
             ),
         ):
             controller.reconcile_preserved_pr(
@@ -445,6 +451,86 @@ class ResilienceTests(unittest.TestCase):
         self.assertEqual(
             controller.load(path)["tickets"]["PROJ-1"]["state"], "recoverable"
         )
+
+    def test_reconcile_preserved_pr_rejects_remote_head_move(self):
+        self.cfg.update(preserved_pr_auto_recovery=True)
+        config = self.cfg["shared_root"] / "config.yaml"
+        config.write_text("worktree_base: .worktrees\n")
+        self.cfg["config"] = config
+        self.ticket(
+            "PROJ-1",
+            "recoverable",
+            attempts=2,
+            worker_identity="",
+            verified_commits={"a" * 40: "b" * 40},
+        )
+        path = controller.state_path(self.cfg["state_dir"], "1")
+        controller.save(path, self.state)
+        first = {"receipt": {"branch": "feature", "url": "https://example/pr/123", "head": "a" * 40, "tree": "b" * 40}}
+        moved = {"receipt": {**first["receipt"], "head": "c" * 40, "tree": "d" * 40}}
+        worktree = self.cfg["shared_root"] / ".worktrees/PROJ-1"
+        with (
+            patch("github_progress.observe", side_effect=[first, moved]),
+            patch.object(controller, "branch_worktree", return_value=worktree),
+            patch.object(controller, "worktree_is_quiescent", return_value=True),
+            patch.object(controller, "worktree_revision", return_value={"head": "a" * 40, "tree": "b" * 40}),
+            self.assertRaisesRegex(controller.SprintError, "changed during authentication"),
+        ):
+            controller.reconcile_preserved_pr(argparse.Namespace(sprint="1", ticket="PROJ-1"), self.cfg)
+        self.assertEqual(controller.load(path)["tickets"]["PROJ-1"]["state"], "recoverable")
+
+    def test_reconcile_preserved_pr_requires_execution_unit_proven_absent(self):
+        self.cfg.update(preserved_pr_auto_recovery=True)
+        config = self.cfg["shared_root"] / "config.yaml"
+        config.write_text("worktree_base: .worktrees\n")
+        self.cfg["config"] = config
+        self.ticket(
+            "PROJ-1", "recoverable", attempts=2,
+            worker_identity={"kind": "execution_unit", "pid": "123"},
+            verified_commits={"a" * 40: "b" * 40},
+        )
+        path = controller.state_path(self.cfg["state_dir"], "1")
+        controller.save(path, self.state)
+        receipt = {"receipt": {"branch": "feature", "url": "https://example/pr/123", "head": "a" * 40, "tree": "b" * 40}}
+        with (
+            patch("github_progress.observe", return_value=receipt),
+            patch.object(controller, "branch_worktree", return_value=self.cfg["shared_root"] / ".worktrees/PROJ-1"),
+            patch.object(controller, "worktree_is_quiescent", return_value=True),
+            patch.object(controller, "worktree_revision", return_value={"head": "a" * 40, "tree": "b" * 40}),
+            patch.object(controller, "execution_unit_status", return_value="unknown"),
+            self.assertRaisesRegex(controller.SprintError, "not proven absent"),
+        ):
+            controller.reconcile_preserved_pr(argparse.Namespace(sprint="1", ticket="PROJ-1"), self.cfg)
+
+    def test_worktree_revision_reads_real_git_head_and_tree(self):
+        worktree = self.cfg["shared_root"] / "real-worktree"
+        worktree.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=worktree, check=True)
+        (worktree / "file.txt").write_text("verified\n")
+        subprocess.run(["git", "add", "file.txt"], cwd=worktree, check=True)
+        subprocess.run(
+            ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "test"],
+            cwd=worktree,
+            check=True,
+        )
+        revision = controller.worktree_revision(worktree)
+        self.assertEqual(
+            revision["head"],
+            subprocess.run(["git", "rev-parse", "HEAD"], cwd=worktree, check=True, capture_output=True, text=True).stdout.strip(),
+        )
+        self.assertEqual(
+            revision["tree"],
+            subprocess.run(["git", "rev-parse", "HEAD^{tree}"], cwd=worktree, check=True, capture_output=True, text=True).stdout.strip(),
+        )
+
+    def test_signal_process_group_suppresses_permission_only_after_exit(self):
+        child = Mock(pid=123)
+        with patch.object(controller.os, "killpg", side_effect=PermissionError):
+            child.poll.return_value = 0
+            controller.signal_process_group(child, signal.SIGTERM)
+            child.poll.return_value = None
+            with self.assertRaises(PermissionError):
+                controller.signal_process_group(child, signal.SIGTERM)
 
     def test_verified_progress_continuation_does_not_consume_relaunch(self):
         ticket = self.ticket(

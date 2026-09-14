@@ -5,17 +5,20 @@ from __future__ import annotations
 
 import fcntl
 import json
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 
 
 class AttemptCapabilityError(RuntimeError):
     pass
 
 
-def validate(
+@contextmanager
+def locked_validation(
     *, state_dir: Path, token: str, repository: str, sprint: str,
     ticket: str, role: str, run_id: str, worker: str, route: dict | None = None,
-) -> None:
+) -> Iterator[None]:
     matches: list[tuple[Path, dict]] = []
     for path in state_dir.glob("*.json"):
         if path.name.startswith("batch-"):
@@ -50,3 +53,22 @@ def validate(
             from provider_health import route_identity
             if route_identity(route) != route_identity(item["reserved_route"]):
                 raise AttemptCapabilityError("worker route differs from its reserved attempt")
+        yield
+
+
+def validate(
+    *, state_dir: Path, token: str, repository: str, sprint: str,
+    ticket: str, role: str, run_id: str, worker: str, route: dict | None = None,
+) -> None:
+    with locked_validation(
+        state_dir=state_dir,
+        token=token,
+        repository=repository,
+        sprint=sprint,
+        ticket=ticket,
+        role=role,
+        run_id=run_id,
+        worker=worker,
+        route=route,
+    ):
+        pass

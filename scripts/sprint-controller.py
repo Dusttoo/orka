@@ -2523,6 +2523,44 @@ def verify_worktree_receipt(path: Path, receipt: dict[str, Any]) -> None:
         )
 
 
+def observe_preserved_pr(
+    cfg: dict[str, Any], ticket: dict[str, Any]
+) -> dict[str, Any]:
+    from github_progress import ProgressError, observe
+
+    try:
+        return observe(cfg["shared_root"], ticket, "pr_opened", str(ticket["pr"]))
+    except ProgressError as exc:
+        raise SprintError(str(exc)) from exc
+
+
+def verify_recovery_binding(
+    cfg: dict[str, Any], ticket: dict[str, Any]
+) -> None:
+    binding = ticket.get("recovery_binding") or {}
+    if not binding:
+        return
+    observation = observe_preserved_pr(cfg, ticket)
+    receipt = observation["receipt"]
+    for field in ("branch", "url", "head", "tree"):
+        binding_field = "pr" if field == "url" else field
+        if receipt.get(field) != binding.get(binding_field):
+            raise SprintError(
+                "preserved PR changed after recovery authentication; reconcile again"
+            )
+    configured_base = config_scalar(
+        cfg["config"], "worktree_base", ".claude/worktrees"
+    )
+    worktree = branch_worktree(
+        cfg["shared_root"], str(binding["branch"]), configured_base
+    )
+    if str(worktree) != binding.get("worktree"):
+        raise SprintError("preserved PR recovery worktree binding changed")
+    if not worktree_is_quiescent(worktree):
+        raise SprintError("preserved PR recovery worktree is no longer quiescent")
+    verify_worktree_receipt(worktree, receipt)
+
+
 def reconcile_preserved_pr(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
     """Convert a mechanically verified stopped PR into a bounded repair continuation."""
     path = state_path(cfg["state_dir"], str(args.sprint))
@@ -2536,14 +2574,7 @@ def reconcile_preserved_pr(args: argparse.Namespace, cfg: dict[str, Any]) -> Non
                 f"ticket {key} is not eligible for preserved PR reconciliation"
             )
         snapshot = json.loads(json.dumps(ticket))
-    from github_progress import ProgressError, observe
-
-    try:
-        observation = observe(
-            cfg["shared_root"], snapshot, "pr_opened", str(snapshot["pr"])
-        )
-    except ProgressError as exc:
-        raise SprintError(str(exc)) from exc
+    observation = observe_preserved_pr(cfg, snapshot)
     configured_base = config_scalar(cfg["config"], "worktree_base", ".claude/worktrees")
     worktree = branch_worktree(
         cfg["shared_root"], str(snapshot["branch"]), configured_base
@@ -2554,27 +2585,29 @@ def reconcile_preserved_pr(args: argparse.Namespace, cfg: dict[str, Any]) -> Non
         )
     verify_worktree_receipt(worktree, observation["receipt"])
     identity = snapshot.get("worker_identity")
-    if (
-        isinstance(identity, dict)
-        and identity.get("kind") == "execution_unit"
-        and execution_unit_status(identity) == "live"
-    ):
-        raise SprintError("preserved PR execution unit is still live")
+    if identity:
+        if not isinstance(identity, dict) or identity.get("kind") != "execution_unit":
+            raise SprintError("preserved PR execution identity cannot be verified")
+        if execution_unit_status(identity) != "absent":
+            raise SprintError("preserved PR execution unit is not proven absent")
     with locked(path):
         state = load(path)
         ticket = state["tickets"].get(key)
         if ticket != snapshot:
             raise SprintError("ticket changed during preserved PR verification; retry")
-        spend = usage_snapshots(cfg).get(key, {})
-        if spend.get("reserved_usd", 0):
-            raise SprintError(
-                "preserved PR gained an open usage reservation during verification"
-            )
+        refreshed = observe_preserved_pr(cfg, ticket)
+        if refreshed["receipt"] != observation["receipt"]:
+            raise SprintError("preserved PR changed during authentication; retry")
         if not worktree_is_quiescent(worktree):
             raise SprintError(
                 "preserved PR worktree changed or became active during verification"
             )
         verify_worktree_receipt(worktree, observation["receipt"])
+        recovery_id = "recovery_" + uuid.uuid4().hex
+        try:
+            UsageLedger(cfg["shared_root"]).fence_recovery(key, recovery_id)
+        except Exception as exc:
+            raise SprintError(str(exc)) from exc
         ticket["state"] = "pending"
         ticket["reason"] = (
             "preserved PR and clean quiescent worktree verified for bounded repair"
@@ -2588,6 +2621,7 @@ def reconcile_preserved_pr(args: argparse.Namespace, cfg: dict[str, Any]) -> Non
         ticket["attached_at"] = ""
         ticket["launch_evidence"] = {}
         ticket["recovery_binding"] = {
+            "recovery_id": recovery_id,
             "at": now(),
             "attempt": int(ticket.get("attempts") or 0),
             "invocation_id": str(
@@ -3554,6 +3588,7 @@ def reserve(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             raise SprintError(
                 f"ticket {key} cannot be reserved from state {ticket['state']}"
             )
+        verify_recovery_binding(cfg, ticket)
         if (
             cfg.get("runtime_admission")
             and (ticket.get("scope_assessment") or {}).get("verdict") != "ready"
@@ -3653,6 +3688,17 @@ def reserve(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         }
         ticket["history"].append(event)
         save(path, state)
+        recovery_id = str((ticket.get("recovery_binding") or {}).get("recovery_id") or "")
+        if recovery_id:
+            try:
+                UsageLedger(cfg["shared_root"]).release_recovery_fence(
+                    key, recovery_id
+                )
+            except Exception as exc:
+                raise SprintError(
+                    "ticket was reserved but its recovery fence could not be released; "
+                    "reconcile the running lane before launch: " + str(exc)
+                ) from exc
     emit(
         {
             "ticket": key,
@@ -3734,6 +3780,17 @@ def lane_invocation_matches(ticket, invocation):
     )
 
 
+def signal_process_group(child: subprocess.Popen[Any], signum: int) -> None:
+    """Signal a worker group; suppress EPERM only after proven termination."""
+    try:
+        os.killpg(child.pid, signum)
+    except ProcessLookupError:
+        return
+    except PermissionError:
+        if child.poll() is None:
+            raise
+
+
 def supervise_local(args: argparse.Namespace, _cfg: dict[str, Any]) -> None:
     """Internal shim: establish identity before spawn and retain a tombstone."""
     command = list(args.command)
@@ -3790,7 +3847,7 @@ def supervise_local(args: argparse.Namespace, _cfg: dict[str, Any]) -> None:
 
     def forward(signum: int, _frame: Any) -> None:
         if child is not None and child.poll() is None:
-            os.killpg(child.pid, signum)
+            signal_process_group(child, signum)
 
     signal.signal(signal.SIGTERM, forward)
     signal.signal(signal.SIGINT, forward)
@@ -3904,19 +3961,13 @@ def supervise_local(args: argparse.Namespace, _cfg: dict[str, Any]) -> None:
                 elif time.monotonic() - last_activity >= max_idle_seconds:
                     stop_reason = idle_reason
                 if stop_reason:
-                    os.killpg(child.pid, signal.SIGTERM)
+                    signal_process_group(child, signal.SIGTERM)
                     try:
                         child.wait(timeout=2)
                     except subprocess.TimeoutExpired:
                         pass
                     # Descendants can outlive their parent or ignore TERM.
-                    try:
-                        os.killpg(child.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    except PermissionError:
-                        if child.poll() is None:
-                            raise
+                    signal_process_group(child, signal.SIGKILL)
                     break
                 time.sleep(0.1)
             returncode = child.wait()
@@ -3944,23 +3995,12 @@ def supervise_local(args: argparse.Namespace, _cfg: dict[str, Any]) -> None:
         # A supervisor exception must never leave an unmonitored paid worker.
         # Also collect children that outlived a normally exiting parent.
         if child is not None:
+            signal_process_group(child, signal.SIGTERM)
             try:
-                try:
-                    os.killpg(child.pid, signal.SIGTERM)
-                except PermissionError:
-                    if child.poll() is None:
-                        raise
-                try:
-                    child.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    pass
-                try:
-                    os.killpg(child.pid, signal.SIGKILL)
-                except PermissionError:
-                    if child.poll() is None:
-                        raise
-            except ProcessLookupError:
+                child.wait(timeout=2)
+            except subprocess.TimeoutExpired:
                 pass
+            signal_process_group(child, signal.SIGKILL)
         if gateway:
             gateway.close()
         if args.stdin_file and input_handle is not subprocess.DEVNULL:
@@ -4077,6 +4117,7 @@ def launch_local(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         ticket = state["tickets"].get(key)
         if not ticket or ticket["state"] != "running":
             raise SprintError(f"ticket {key} is not running")
+        verify_recovery_binding(cfg, ticket)
         expected = str(ticket.get("attach_capability") or "")
         if (
             not expected
@@ -4214,6 +4255,11 @@ def launch_local(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             raise SprintError("systemd launch did not enter its assigned cgroup scope")
         evidence.update({"status": "launched", "identity": identity})
         ticket["launch_evidence"] = evidence
+        # The binding is a one-launch authentication receipt. Once the
+        # controller-owned execution unit exists, normal progress and crash
+        # recovery must be allowed to advance the worktree beyond the old PR
+        # head without reusing this receipt.
+        ticket["recovery_binding"] = {}
         ticket["history"].append(
             {"at": now(), "event": "worker-launched", "worker_identity": identity}
         )
