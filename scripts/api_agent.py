@@ -686,8 +686,26 @@ class UsageLedger:
             os.chmod(self.lock_path, 0o600)
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             events = self._events()
-            active = self._active_recovery_fence(events, ticket)
-            if not active or active.get("recovery_id") != recovery_id:
+            latest = next(
+                (
+                    event
+                    for event in reversed(events)
+                    if self._matches(event, "ticket", ticket)
+                    and event.get("kind") in {"recovery_fence", "recovery_unfence"}
+                ),
+                None,
+            )
+            if (
+                latest
+                and latest.get("kind") == "recovery_unfence"
+                and latest.get("recovery_id") == recovery_id
+            ):
+                return
+            if (
+                not latest
+                or latest.get("kind") != "recovery_fence"
+                or latest.get("recovery_id") != recovery_id
+            ):
                 raise BudgetError(
                     f"ticket {ticket} recovery fence is missing or superseded"
                 )

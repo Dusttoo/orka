@@ -193,6 +193,7 @@ class NativeGatewayTests(unittest.TestCase):
                 role="implementer",
             )
         ledger.release_recovery_fence("T-1", "recovery-test")
+        ledger.release_recovery_fence("T-1", "recovery-test")
         reservation = ledger.reserve(
             projected=Decimal(".01"),
             limits=self.gateway.limits,

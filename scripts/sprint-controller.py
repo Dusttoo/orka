@@ -2538,7 +2538,11 @@ def verify_recovery_binding(
     cfg: dict[str, Any], ticket: dict[str, Any]
 ) -> None:
     binding = ticket.get("recovery_binding") or {}
-    if not binding or binding.get("kind") != "preserved_pr":
+    if not binding:
+        return
+    if binding.get("kind") != "preserved_pr":
+        if binding.get("recovery_id") or binding.get("worktree"):
+            raise SprintError("preserved PR recovery binding has an invalid kind")
         return
     observation = observe_preserved_pr(cfg, ticket)
     receipt = observation["receipt"]
@@ -2604,6 +2608,11 @@ def reconcile_preserved_pr(args: argparse.Namespace, cfg: dict[str, Any]) -> Non
                 "preserved PR worktree changed or became active during verification"
             )
         verify_worktree_receipt(worktree, observation["receipt"])
+        recovery_id = "recovery_" + uuid.uuid4().hex
+        try:
+            UsageLedger(cfg["shared_root"]).fence_recovery(key, recovery_id)
+        except Exception as exc:
+            raise SprintError(str(exc)) from exc
         if operator_attested:
             try:
                 consume_recovery(
@@ -2613,16 +2622,14 @@ def reconcile_preserved_pr(args: argparse.Namespace, cfg: dict[str, Any]) -> Non
                     operator_capability(args),
                 )
             except AuthorityError as exc:
+                UsageLedger(cfg["shared_root"]).release_recovery_fence(
+                    key, recovery_id
+                )
                 raise SprintError(
                     "preserved PR execution unit is not proven absent; "
                     "a separately issued one-shot recovery capability is required: "
                     + str(exc)
                 ) from exc
-        recovery_id = "recovery_" + uuid.uuid4().hex
-        try:
-            UsageLedger(cfg["shared_root"]).fence_recovery(key, recovery_id)
-        except Exception as exc:
-            raise SprintError(str(exc)) from exc
         ticket["state"] = "pending"
         ticket["reason"] = (
             "preserved PR and clean quiescent worktree verified for bounded repair"
@@ -2741,20 +2748,43 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
         if ticket["state"] == "pending" and admission_reasons[ticket["key"]]
     ]
     decomposition, repair, recovery = [], [], []
-    pr_reconciliation = sorted(
+    preserved_candidates = sorted(
         ticket["key"]
         for ticket in ordered
         if preserved_pr_reconciliation_candidate(
             ticket, cfg, spend.get(ticket["key"], {})
         )
     )
-    pr_reconciliation_set = set(pr_reconciliation)
+    pr_reconciliation = []
+    pr_reconciliation_requires_authority = []
+    for key in preserved_candidates:
+        identity = state["tickets"][key].get("worker_identity")
+        if (
+            isinstance(identity, dict)
+            and identity.get("kind") == "execution_unit"
+            and execution_unit_status(identity) == "absent"
+        ):
+            pr_reconciliation.append(key)
+        else:
+            pr_reconciliation_requires_authority.append(key)
+    pr_reconciliation_set = set(preserved_candidates)
     recovery_waiting = []
     retry_waiting = []
     decisions = []
     for ticket in ordered:
         key, status = ticket["key"], ticket["state"]
         if key in pr_reconciliation_set:
+            if key in pr_reconciliation_requires_authority:
+                decisions.append(
+                    {
+                        "key": key,
+                        "reason": (
+                            "preserved PR execution absence requires a separately "
+                            "issued one-shot recovery capability"
+                        ),
+                        "action": "reconcile-preserved-pr-with-operator-capability",
+                    }
+                )
             continue
         failure = (
             current_startup_failure(ticket, cfg) if status == "recoverable" else None
@@ -2915,6 +2945,7 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
         "repair": [] if runtime_hold else repair,
         "recovery": [] if runtime_hold else recovery,
         "pr_reconciliation": pr_reconciliation,
+        "pr_reconciliation_requires_authority": pr_reconciliation_requires_authority,
         "recovery_waiting": recovery_waiting,
         "retry_waiting": retry_waiting,
         "legacy_reconciliation": legacy_reconciliation(state),

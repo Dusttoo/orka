@@ -313,10 +313,26 @@ class ResilienceTests(unittest.TestCase):
             worker_identity={"kind": "execution_unit", "pid": "123"},
             verified_commits={"a" * 40: "b" * 40},
         )
-        plan = controller.plan_value(self.state, self.cfg)
+        with patch.object(controller, "execution_unit_status", return_value="absent"):
+            plan = controller.plan_value(self.state, self.cfg)
         self.assertEqual(plan["pr_reconciliation"], ["PROJ-1"])
         self.assertEqual(plan["decision_queue"], [])
         self.assertTrue(plan["autonomous_work_remaining"])
+
+    def test_preserved_pr_missing_identity_is_an_operator_decision(self):
+        self.cfg["preserved_pr_auto_recovery"] = True
+        self.ticket(
+            "PROJ-1",
+            "recoverable",
+            attempts=2,
+            worker_identity="",
+            verified_commits={"a" * 40: "b" * 40},
+        )
+        plan = controller.plan_value(self.state, self.cfg)
+        self.assertEqual(plan["pr_reconciliation"], [])
+        self.assertEqual(plan["pr_reconciliation_requires_authority"], ["PROJ-1"])
+        self.assertEqual(plan["decision_queue"][0]["key"], "PROJ-1")
+        self.assertFalse(plan["autonomous_work_remaining"])
 
     def test_reconcile_preserved_pr_creates_bounded_repair_continuation(self):
         self.cfg.update(preserved_pr_auto_recovery=True)
@@ -541,6 +557,14 @@ class ResilienceTests(unittest.TestCase):
         with patch("github_progress.observe") as observe:
             controller.verify_recovery_binding(self.cfg, ticket)
         observe.assert_not_called()
+
+    def test_malformed_preserved_binding_cannot_fall_back_to_legacy(self):
+        ticket = self.ticket(
+            "PROJ-1",
+            recovery_binding={"recovery_id": "recovery-test", "worktree": "/tmp/x"},
+        )
+        with self.assertRaisesRegex(controller.SprintError, "invalid kind"):
+            controller.verify_recovery_binding(self.cfg, ticket)
 
     def test_reservation_keeps_recovery_fence_until_launch_ack_boundary(self):
         config = self.cfg["shared_root"] / "config.yaml"
