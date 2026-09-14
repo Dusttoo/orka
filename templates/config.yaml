@@ -26,6 +26,10 @@
 # explicitly migrate to schema_version: 2.
 schema_version: 1
 
+# Optional minimum runtime release. Leave blank for portable scaffolding; set a
+# release such as 1.5.2 when repository policy depends on newer safety fences.
+minimum_orka_version: ""
+
 # --- Orchestration worker threat model ---------------------------------- agent
 # This governs only the boundary between an orchestration worker and its host.
 # It never relaxes application security for users, tenants, remote clients,

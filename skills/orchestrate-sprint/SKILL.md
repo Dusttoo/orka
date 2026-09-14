@@ -243,6 +243,12 @@ repository config. Caller environment and CLI values cannot replace that policy.
      [--model <configured-model>] --cd <repository> -
    ```
 
+   The command's `--cd` value is never trusted as recovery authority. The
+   controller replaces it with the authenticated preserved-PR worktree for a
+   recovery lane, or with the shared checkout for an ordinary lane, and the
+   supervisor verifies that checkout belongs to the managed repository before
+   spawning the worker.
+
    Pass the ticket body through a temporary file or stdin; never interpolate
 Before launching, resolve the executable because non-interactive SSH shells may not load the npm-global PATH: `CODEX_BIN="$(command -v codex || printf '%s' /home/orchestrator/.npm-global/bin/codex)"`; verify it is executable. Pass that executable and arguments to `launch-local`; do not background it independently or supply a PID to `attach`.
    Jira text into a shell command. Keep the detached worker's PID in the

@@ -37,6 +37,8 @@ check_not() {
 
 check "template declares legacy schema by default" \
   grep -Eq '^schema_version:[[:space:]]*1([[:space:]]|$)' "$ROOT/templates/config.yaml"
+check "template exposes an optional minimum Orka release" \
+  grep -Eq '^minimum_orka_version:[[:space:]]*""([[:space:]]|$)' "$ROOT/templates/config.yaml"
 check "template defaults to the portable cooperative worker profile" \
   grep -Eq '^worker_trust_profile:[[:space:]]*cooperative-worker([[:space:]]|$)' "$ROOT/templates/config.yaml"
 check_not "template does not actively enable schema v2" \
@@ -128,6 +130,43 @@ assert sys.argv[2]=='2' and v['installation_status']=='ready' and not v['executi
 CHECK
 }
 check "captain separates installed plugin from unverified provider readiness" check_runtime_unverified
+check_minimum_version_rejected() {
+  cp "$PREFLIGHT_REPO/.orchestration/config.yaml" "$PREFLIGHT_REPO/minimum.yaml"
+  python3 - "$PREFLIGHT_REPO/.orchestration/config.yaml" <<'PY'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+path.write_text(path.read_text().replace('minimum_orka_version: ""', 'minimum_orka_version: 99.0.0'))
+PY
+  ! python3 "$ROOT/scripts/captain-preflight.py" --plugin-root "$ROOT" \
+    --repo "$PREFLIGHT_REPO" --host codex > "$PREFLIGHT_REPO/minimum-preflight.json"
+  python3 - "$PREFLIGHT_REPO/minimum-preflight.json" <<'CHECK'
+import json,sys
+v=json.load(open(sys.argv[1]))
+assert v['status']=='blocked' and v['installation_status']=='incompatible'
+assert v['minimum_orka_version']=='99.0.0'
+CHECK
+  mv "$PREFLIGHT_REPO/minimum.yaml" "$PREFLIGHT_REPO/.orchestration/config.yaml"
+}
+check "captain rejects a runtime below the repository minimum" check_minimum_version_rejected
+check_minimum_version_parser() {
+  python3 - "$ROOT/scripts/captain-preflight.py" <<'PY'
+import importlib.util,sys
+spec=importlib.util.spec_from_file_location("captain_preflight", sys.argv[1])
+module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+assert module.release_version("1.5.2") == (1, 5, 2)
+assert module.release_version("1.5.2+codex.20260914") == (1, 5, 2)
+assert module.release_version("1.6.0") > module.release_version("1.5.2")
+try:
+    module.release_version("1.5")
+except ValueError:
+    pass
+else:
+    raise AssertionError("malformed release was accepted")
+PY
+}
+check "minimum version comparison accepts equal, newer, and cachebuster releases" \
+  check_minimum_version_parser
 check_runtime_verified_subscription() {
   PATH="$FAKE_BIN:$PATH" python3 "$ROOT/scripts/captain-preflight.py" \
     --plugin-root "$ROOT" --repo "$PREFLIGHT_REPO" --host claude \

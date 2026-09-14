@@ -47,6 +47,7 @@ from api_agent import (
     load_orchestration_env,
 )
 from provider_health import (
+    bind_native_working_directory,
     ProviderHealth,
     HealthError,
     desktop_subscription_status,
@@ -2536,7 +2537,7 @@ def observe_preserved_pr(
 
 def verify_recovery_binding(
     cfg: dict[str, Any], ticket: dict[str, Any]
-) -> None:
+) -> dict[str, Any] | None:
     binding = ticket.get("recovery_binding") or {}
     if not binding:
         return
@@ -2563,6 +2564,7 @@ def verify_recovery_binding(
     if not worktree_is_quiescent(worktree):
         raise SprintError("preserved PR recovery worktree is no longer quiescent")
     verify_worktree_receipt(worktree, receipt)
+    return binding
 
 
 def reconcile_preserved_pr(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
@@ -3828,6 +3830,104 @@ def signal_process_group(child: subprocess.Popen[Any], signum: int) -> None:
             raise
 
 
+def authenticate_supervisor_context(
+    args: argparse.Namespace,
+    cfg: dict[str, Any],
+    worker_cwd: Path,
+    original_command: list[str],
+    *,
+    claim: bool,
+) -> None:
+    checkpoint = state_path(cfg["state_dir"], str(args.sprint))
+    # Checkpoint writes are atomic. Do not take the controller lock here: the
+    # launching controller deliberately retains it until this supervisor has
+    # acknowledged and spawned, which itself fences concurrent mutation.
+    state = load(checkpoint)
+    ticket = state.get("tickets", {}).get(normalize_key(args.ticket))
+    if not isinstance(ticket, dict) or ticket.get("state") != "running":
+        raise SprintError("supervisor ticket is not an active controller lane")
+    evidence = ticket.get("launch_evidence")
+    if not isinstance(evidence, dict):
+        raise SprintError("supervisor has no persisted controller launch evidence")
+    artifact_paths = {
+        "ready_path": args.ready,
+        "ack_path": args.ack,
+        "tombstone_path": args.tombstone,
+        "output_path": args.output,
+        "input_path": args.stdin_file or "",
+    }
+    command_sha256 = hashlib.sha256(
+        json.dumps(original_command, separators=(",", ":")).encode()
+    ).hexdigest()
+    capability_sha256 = hashlib.sha256(
+        args.supervisor_capability.encode()
+    ).hexdigest()
+    if (
+        evidence.get("status") != "launching"
+        or evidence.get("invocation_id") != args.invocation_id
+        or evidence.get("ticket") != normalize_key(args.ticket)
+        or str(evidence.get("sprint")) != str(args.sprint)
+        or Path(str(evidence.get("repository") or "")).resolve()
+        != Path(cfg["shared_root"]).resolve()
+        or Path(str(evidence.get("worker_cwd") or "")).resolve() != worker_cwd
+        or evidence.get("command_sha256") != command_sha256
+        or evidence.get("subscription_route")
+        is not bool(getattr(args, "subscription_route", False))
+        or evidence.get("supervisor_capability_sha256") != capability_sha256
+        or any(evidence.get(key) != value for key, value in artifact_paths.items())
+    ):
+        raise SprintError("supervisor context differs from persisted launch evidence")
+    claim_path = Path(str(evidence.get("supervisor_claim_path") or ""))
+    expected_claim_path = Path(args.ready).parent / (
+        f"execution-{args.invocation_id}.claim.json"
+    )
+    if claim_path != expected_claim_path:
+        raise SprintError("supervisor claim path differs from persisted launch evidence")
+    claim_value = {
+        "invocation_id": args.invocation_id,
+        "pid": os.getpid(),
+        "capability_sha256": capability_sha256,
+    }
+    if claim:
+        try:
+            with claim_path.open("x", encoding="utf-8") as handle:
+                json.dump(claim_value, handle, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except FileExistsError as exc:
+            raise SprintError("supervisor capability was already claimed") from exc
+    elif read_json(claim_path, label="supervisor claim") != claim_value:
+        raise SprintError("supervisor claim does not belong to this process")
+    recovery_binding = ticket.get("recovery_binding") or None
+    if evidence.get("recovery_binding") != recovery_binding:
+        raise SprintError("recovery binding changed after launch intent was persisted")
+    verified_binding = verify_recovery_binding(cfg, ticket)
+    expected_cwd = Path(cfg["shared_root"]).resolve()
+    if isinstance(verified_binding, dict):
+        expected_cwd = Path(str(verified_binding["worktree"])).resolve()
+    if worker_cwd != expected_cwd:
+        raise SprintError("worker cwd is not the controller-authenticated checkout")
+    try:
+        shared_common_dir = subprocess.run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            cwd=cfg["shared_root"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        worker_common_dir = subprocess.run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            cwd=worker_cwd,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise SprintError("worker cwd must be a checkout of the managed repository") from exc
+    if Path(shared_common_dir).resolve() != Path(worker_common_dir).resolve():
+        raise SprintError("worker cwd belongs to a different git repository")
+
+
 def supervise_local(args: argparse.Namespace, _cfg: dict[str, Any]) -> None:
     """Internal shim: establish identity before spawn and retain a tombstone."""
     command = list(args.command)
@@ -3835,6 +3935,18 @@ def supervise_local(args: argparse.Namespace, _cfg: dict[str, Any]) -> None:
         command.pop(0)
     if not command:
         raise SprintError("supervisor requires a worker command")
+    original_command = list(command)
+    explicit_worker_cwd = hasattr(args, "worker_cwd")
+    worker_cwd = Path(
+        getattr(args, "worker_cwd", _cfg["shared_root"])
+    ).expanduser().resolve()
+    # Production invocations can only arrive through the parser, where this
+    # controller-owned argument is required. The fallback exists solely for
+    # older in-process test fixtures.
+    if explicit_worker_cwd:
+        authenticate_supervisor_context(
+            args, _cfg, worker_cwd, original_command, claim=True
+        )
     ready_path, ack_path = Path(args.ready), Path(args.ack)
     tombstone_path, output_path = Path(args.tombstone), Path(args.output)
     identity = process_identity(str(os.getpid()))
@@ -3952,9 +4064,17 @@ def supervise_local(args: argparse.Namespace, _cfg: dict[str, Any]) -> None:
             command = launch_arguments([executable, *command[1:]], endpoint)
         if args.stdin_file:
             input_handle = Path(args.stdin_file).open("rb")
+        if explicit_worker_cwd:
+            authenticate_supervisor_context(
+                args, _cfg, worker_cwd, original_command, claim=False
+            )
+        if Path(command[0]).name == "codex":
+            route = llm_route_from_config(_cfg["config"], "sprint-worker")
+            command = bind_native_working_directory(command, route, worker_cwd)
         with output_path.open("ab") as output_handle:
             child = subprocess.Popen(
                 command,
+                cwd=worker_cwd,
                 stdin=input_handle,
                 stdout=output_handle,
                 stderr=subprocess.STDOUT,
@@ -4149,12 +4269,15 @@ def launch_local(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
     if input_path is not None and not input_path.is_file():
         raise SprintError("worker input must be an existing repository file")
     route = None
+    worker_cwd = Path(cfg["shared_root"]).resolve()
     with locked(path):
         state = load(path)
         ticket = state["tickets"].get(key)
         if not ticket or ticket["state"] != "running":
             raise SprintError(f"ticket {key} is not running")
-        verify_recovery_binding(cfg, ticket)
+        recovery_binding = verify_recovery_binding(cfg, ticket)
+        if isinstance(recovery_binding, dict) and recovery_binding.get("kind") == "preserved_pr":
+            worker_cwd = Path(str(recovery_binding["worktree"])).resolve()
         expected = str(ticket.get("attach_capability") or "")
         if (
             not expected
@@ -4176,15 +4299,20 @@ def launch_local(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
                     "provider admission held: " + json.dumps(hold, sort_keys=True)
                 )
             command = validate_native_command(command, route)
+            command = bind_native_working_directory(command, route, worker_cwd)
         invocation_id = uuid.uuid4().hex
         runtime_prefix = cfg["state_dir"] / f"execution-{invocation_id}"
         ready_path = runtime_prefix.with_suffix(".ready.json")
         ack_path = runtime_prefix.with_suffix(".ack")
         tombstone_path = runtime_prefix.with_suffix(".terminal.json")
+        claim_path = runtime_prefix.with_suffix(".claim.json")
+        supervisor_capability = "supervisor_" + uuid.uuid4().hex
         evidence = {
             "token": "launch_" + uuid.uuid4().hex,
             "status": "launching",
             "repository": str(cfg["shared_root"]),
+            "worker_cwd": str(worker_cwd),
+            "recovery_binding": recovery_binding,
             "sprint": str(args.sprint),
             "ticket": key,
             "attempt": ticket["attempts"],
@@ -4193,6 +4321,16 @@ def launch_local(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             "ready_path": str(ready_path),
             "ack_path": str(ack_path),
             "tombstone_path": str(tombstone_path),
+            "output_path": str(output_path),
+            "input_path": str(input_path) if input_path is not None else "",
+            "command_sha256": hashlib.sha256(
+                json.dumps(command, separators=(",", ":")).encode()
+            ).hexdigest(),
+            "subscription_route": bool(route and model_less_desktop_route(route)),
+            "supervisor_capability_sha256": hashlib.sha256(
+                supervisor_capability.encode()
+            ).hexdigest(),
+            "supervisor_claim_path": str(claim_path),
             "created_at": now(),
             "base_commit": subprocess.run(
                 ["git", "rev-parse", "--verify", "HEAD"],
@@ -4226,6 +4364,10 @@ def launch_local(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             str(tombstone_path),
             "--output",
             str(output_path),
+            "--worker-cwd",
+            str(worker_cwd),
+            "--supervisor-capability",
+            supervisor_capability,
         ]
         if input_path is not None:
             supervisor.extend(["--stdin-file", str(input_path)])
@@ -4290,12 +4432,18 @@ def launch_local(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         ):
             worker.terminate()
             raise SprintError("systemd launch did not enter its assigned cgroup scope")
+        ack_path.touch(exist_ok=False)
+        launched = wait_for_runtime_record(ready_path, worker, "worker launch")
+        spawn_proved = launched.get("phase") == "launched" or (
+            launched.get("phase") == "terminal" and launched.get("spawned") is True
+        )
+        if not spawn_proved or not launched.get("worker_pid"):
+            worker.terminate()
+            raise SprintError("supervisor did not prove a spawned worker")
         evidence.update({"status": "launched", "identity": identity})
         ticket["launch_evidence"] = evidence
-        # The binding is a one-launch authentication receipt. Once the
-        # controller-owned execution unit exists, normal progress and crash
-        # recovery must be allowed to advance the worktree beyond the old PR
-        # head without reusing this receipt.
+        # The binding remains active through the supervisor's final pre-spawn
+        # validation. Only a proved child launch consumes it.
         recovery_id = str((ticket.get("recovery_binding") or {}).get("recovery_id") or "")
         if recovery_id:
             try:
@@ -4303,6 +4451,7 @@ def launch_local(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
                     key, recovery_id
                 )
             except Exception as exc:
+                worker.terminate()
                 evidence.update({"status": "launch-failed", "error": str(exc)})
                 ticket["launch_evidence"] = evidence
                 save(path, state)
@@ -4315,9 +4464,7 @@ def launch_local(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             {"at": now(), "event": "worker-launched", "worker_identity": identity}
         )
         save(path, state)
-        ack_path.touch(exist_ok=False)
-        launched = wait_for_runtime_record(ready_path, worker, "worker launch")
-        worker_pid = launched.get("worker_pid") or identity["pid"]
+        worker_pid = launched["worker_pid"]
     emit(
         {
             "ticket": key,
@@ -5120,6 +5267,8 @@ def parser() -> argparse.ArgumentParser:
     supervisor_parser.add_argument("--ack", required=True)
     supervisor_parser.add_argument("--tombstone", required=True)
     supervisor_parser.add_argument("--output", required=True)
+    supervisor_parser.add_argument("--worker-cwd", required=True)
+    supervisor_parser.add_argument("--supervisor-capability", required=True)
     supervisor_parser.add_argument("--stdin-file")
     supervisor_parser.add_argument("--subscription-route", action="store_true")
     supervisor_parser.add_argument("command", nargs=argparse.REMAINDER)

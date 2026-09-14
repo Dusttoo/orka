@@ -135,6 +135,10 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    as the `codex exec` prompt so the file contents, not its pathname, reach stdin.
    The complete input-bearing form is
    `launch-local --sprint <id> --ticket <key> --attach-capability <attach_capability> --output <checkpoint-dir>/<run-ref>.jsonl --stdin-file <checkpoint-dir>/<run-ref>.prompt -- <codex-bin> exec --ephemeral --json --sandbox danger-full-access [--model <configured-model>] --cd <repository> -`.
+   The caller's `--cd` is not authority: the controller replaces it with the
+   authenticated preserved-PR worktree for recovery, or the shared checkout
+   for ordinary work, and the supervisor verifies repository ownership before
+   spawning the worker.
    Include `--model` only when the resolved route has a nonempty model.
    A native task reference is display metadata, not liveness evidence; if no
    supported adapter exposes its process identity, leave it reserved for
