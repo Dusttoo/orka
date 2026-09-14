@@ -178,6 +178,34 @@ class NativeGatewayTests(unittest.TestCase):
             self.gateway.request("/v1/messages", self.payload)
         self.assertEqual(self.transport.paid, 1)
 
+    def test_recovery_fence_atomically_blocks_and_releases_reservations(self):
+        ledger = self.gateway.ledger
+        ledger.fence_recovery("T-1", "recovery-test")
+        with self.assertRaisesRegex(BudgetError, "fenced for preserved-PR recovery"):
+            ledger.reserve(
+                projected=Decimal(".01"),
+                limits=self.gateway.limits,
+                run_id="stale-worker",
+                ticket="T-1",
+                sprint="1",
+                provider="anthropic",
+                model="test",
+                role="implementer",
+            )
+        ledger.release_recovery_fence("T-1", "recovery-test")
+        ledger.release_recovery_fence("T-1", "recovery-test")
+        reservation = ledger.reserve(
+            projected=Decimal(".01"),
+            limits=self.gateway.limits,
+            run_id="current-worker",
+            ticket="T-1",
+            sprint="1",
+            provider="anthropic",
+            model="test",
+            role="implementer",
+        )
+        self.assertTrue(reservation.startswith("resv_"))
+
     def test_malformed_cache_usage_retains_reservation_without_poisoning_ledger(self):
         original = self.transport.request
         for field in ('cache_read_input_tokens', 'cache_creation_input_tokens'):

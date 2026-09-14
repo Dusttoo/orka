@@ -1554,6 +1554,21 @@ self_check:
                 **binding,
             )
 
+    def test_implementer_revalidates_attempt_before_each_provider_request(self):
+        transport = FakeTransport([])
+        agent = self.agent(
+            transport, role="implementer", run_id="superseded-worker"
+        )
+        checkpoint = next(
+            (self.root / ".orchestration/.sprint-state").glob("*.json")
+        )
+        state = json.loads(checkpoint.read_text())
+        state["tickets"]["PROJ-1"]["state"] = "pending"
+        checkpoint.write_text(json.dumps(state))
+        with self.assertRaisesRegex(api_agent.AgentError, "stale|active lane"):
+            agent._submit({"messages": [], "max_tokens": 10})
+        self.assertEqual(transport.calls, [])
+
     def test_review_phase_permit_is_single_use_and_bound_to_head(self):
         token = self.phase_permit()
         head = subprocess.run(

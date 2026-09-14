@@ -9,6 +9,7 @@ the standard library; Bedrock uses boto3 and the ambient AWS credential chain.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import fcntl
 import importlib.util
@@ -32,6 +33,7 @@ from typing import Any
 import context_pipeline
 from attempt_capability import (
     AttemptCapabilityError,
+    locked_validation as locked_attempt_validation,
     validate as validate_attempt_capability,
 )
 from operator_authority import (
@@ -643,6 +645,80 @@ class UsageLedger:
         return value is not None and str(event.get(field) or "") == value
 
     @staticmethod
+    def _active_recovery_fence(
+        events: list[dict[str, Any]], ticket: str
+    ) -> dict[str, Any] | None:
+        active = None
+        for event in events:
+            if not UsageLedger._matches(event, "ticket", ticket):
+                continue
+            if event.get("kind") == "recovery_fence":
+                active = event
+            elif event.get("kind") == "recovery_unfence" and active:
+                if event.get("recovery_id") == active.get("recovery_id"):
+                    active = None
+        return active
+
+    def fence_recovery(self, ticket: str, recovery_id: str) -> None:
+        """Atomically block new ticket reservations while recovery is rebound."""
+        self.directory.mkdir(parents=True, exist_ok=True)
+        with self.lock_path.open("a+", encoding="utf-8") as lock:
+            os.chmod(self.lock_path, 0o600)
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            events = self._events()
+            _, pending = self._totals(events)
+            if any(self._matches(item, "ticket", ticket) for item in pending.values()):
+                raise BudgetError(
+                    f"ticket {ticket} has an open usage reservation; recovery cannot be fenced"
+                )
+            self._append_locked(
+                {
+                    "kind": "recovery_fence",
+                    "timestamp": utc_now(),
+                    "ticket": ticket,
+                    "recovery_id": recovery_id,
+                }
+            )
+
+    def release_recovery_fence(self, ticket: str, recovery_id: str) -> None:
+        self.directory.mkdir(parents=True, exist_ok=True)
+        with self.lock_path.open("a+", encoding="utf-8") as lock:
+            os.chmod(self.lock_path, 0o600)
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            events = self._events()
+            latest = next(
+                (
+                    event
+                    for event in reversed(events)
+                    if self._matches(event, "ticket", ticket)
+                    and event.get("kind") in {"recovery_fence", "recovery_unfence"}
+                ),
+                None,
+            )
+            if (
+                latest
+                and latest.get("kind") == "recovery_unfence"
+                and latest.get("recovery_id") == recovery_id
+            ):
+                return
+            if (
+                not latest
+                or latest.get("kind") != "recovery_fence"
+                or latest.get("recovery_id") != recovery_id
+            ):
+                raise BudgetError(
+                    f"ticket {ticket} recovery fence is missing or superseded"
+                )
+            self._append_locked(
+                {
+                    "kind": "recovery_unfence",
+                    "timestamp": utc_now(),
+                    "ticket": ticket,
+                    "recovery_id": recovery_id,
+                }
+            )
+
+    @staticmethod
     def phase_totals(
         events: list[dict[str, Any]], ticket: str
     ) -> dict[str, dict[str, Decimal]]:
@@ -752,6 +828,11 @@ class UsageLedger:
             os.chmod(self.lock_path, 0o600)
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             events = self._events()
+            if ticket and (fence := self._active_recovery_fence(events, ticket)):
+                raise BudgetError(
+                    f"ticket {ticket} is fenced for preserved-PR recovery "
+                    f"({fence['recovery_id']})"
+                )
             authority_ceiling: Decimal | None = None
             try:
                 restart = (
@@ -1898,26 +1979,29 @@ class ApiAgent:
                 raise AgentError(
                     "orchestration worker requires ticket, sprint, and a controller-issued attempt capability"
                 )
-            try:
-                validate_attempt_capability(
-                    state_dir=runtime_path(
-                        self.shared_root,
-                        str(
-                            self.config.get("sprint_checkpoint_dir")
-                            or ".orchestration/.sprint-state"
-                        ),
+            self.attempt_validation = {
+                "state_dir": runtime_path(
+                    self.shared_root,
+                    str(
+                        self.config.get("sprint_checkpoint_dir")
+                        or ".orchestration/.sprint-state"
                     ),
-                    token=self.attempt_capability,
-                    repository=str(self.shared_root),
-                    sprint=self.sprint,
-                    ticket=self.ticket,
-                    role=self.role,
-                    run_id=self.run_id,
-                    worker=self.worker_ref,
-                    route=self.route,
-                )
+                ),
+                "token": self.attempt_capability,
+                "repository": str(self.shared_root),
+                "sprint": self.sprint,
+                "ticket": self.ticket,
+                "role": self.role,
+                "run_id": self.run_id,
+                "worker": self.worker_ref,
+                "route": self.route,
+            }
+            try:
+                validate_attempt_capability(**self.attempt_validation)
             except AttemptCapabilityError as exc:
                 raise AgentError(str(exc)) from exc
+        else:
+            self.attempt_validation = None
         state_directory = runtime_path(self.shared_root, ".orchestration/.llm-runs")
         self.state_path = state_directory / f"{run_id}.json"
         if self.state_path.exists():
@@ -2021,6 +2105,11 @@ class ApiAgent:
         return count
 
     def _submit(self, body: dict[str, Any]) -> dict[str, Any]:
+        if self.attempt_validation:
+            try:
+                validate_attempt_capability(**self.attempt_validation)
+            except AttemptCapabilityError as exc:
+                raise AgentError(str(exc)) from exc
         input_tokens = self._count(body)
         output_cap = (
             int(body.get("max_tokens") or 0)
@@ -2034,17 +2123,26 @@ class ApiAgent:
             else int(body.get("max_output_tokens") or 0)
         )
         projected = self.pricing.worst_case(input_tokens, output_cap)
-        reservation = self.ledger.reserve(
-            projected=projected,
-            limits=self.budgets,
-            logical_review_id=getattr(self, "logical_review_id", None),
-            run_id=self.run_id,
-            ticket=self.ticket,
-            sprint=self.sprint,
-            provider=self.provider,
-            model=self.model,
-            role=self.role,
+        attempt_guard = (
+            locked_attempt_validation(**self.attempt_validation)
+            if self.attempt_validation
+            else contextlib.nullcontext()
         )
+        try:
+            with attempt_guard:
+                reservation = self.ledger.reserve(
+                    projected=projected,
+                    limits=self.budgets,
+                    logical_review_id=getattr(self, "logical_review_id", None),
+                    run_id=self.run_id,
+                    ticket=self.ticket,
+                    sprint=self.sprint,
+                    provider=self.provider,
+                    model=self.model,
+                    role=self.role,
+                )
+        except AttemptCapabilityError as exc:
+            raise AgentError(str(exc)) from exc
         self.state["reservations"].append(reservation)
         self._save(
             status="pending_submission",
