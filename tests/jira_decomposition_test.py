@@ -72,19 +72,25 @@ class JiraDecompositionTests(unittest.TestCase):
     def test_structural_decomposition_does_not_require_threshold_score(self):
         value = self.assessment()
         value["complexity_score"] = 62
-        self.assertEqual(decomposition.validated_input(self.config(), value)[1], "PROJ-1")
+        self.assertEqual(
+            decomposition.validated_input(self.config(), value)[1], "PROJ-1"
+        )
 
     def test_subtask_slices_are_created_as_siblings(self):
         jira = object.__new__(decomposition.Jira)
-        jira.request = Mock(return_value={"fields": {
-            "issuetype": {"subtask": True}, "parent": {"key": "PROJ-9"}
-        }})
+        jira.request = Mock(
+            return_value={
+                "fields": {"issuetype": {"subtask": True}, "parent": {"key": "PROJ-9"}}
+            }
+        )
         self.assertEqual(jira.decomposition_parent("PROJ-1", "sibling"), "PROJ-9")
 
     def test_subtask_without_parent_fails_closed(self):
         jira = object.__new__(decomposition.Jira)
         jira.request = Mock(return_value={"fields": {"issuetype": {"subtask": True}}})
-        with self.assertRaisesRegex(decomposition.DecompositionError, "no authoritative parent"):
+        with self.assertRaisesRegex(
+            decomposition.DecompositionError, "no authoritative parent"
+        ):
             jira.decomposition_parent("PROJ-1", "sibling")
 
     def test_existing_child_requires_exact_type_content_and_provenance(self):
@@ -139,14 +145,27 @@ class JiraDecompositionTests(unittest.TestCase):
     def test_dependency_idempotency_requires_the_configured_direction(self):
         jira = object.__new__(decomposition.Jira)
         calls = []
-        jira.issue_links = lambda _key: [
+        links = [
             {
                 "type": {"name": "Blocks"},
                 "outwardIssue": {"key": "PROJ-2"},
                 "inwardIssue": {"key": "PROJ-1"},
             }
         ]
-        jira.request = lambda method, path, body=None: calls.append((method, path, body)) or {}
+        jira.issue_links = lambda _key: links
+
+        def request(method, path, body=None):
+            calls.append((method, path, body))
+            links.append(
+                {
+                    "type": {"name": "Blocks"},
+                    "outwardIssue": {"key": "PROJ-1"},
+                    "inwardIssue": {"key": "PROJ-2"},
+                }
+            )
+            return {}
+
+        jira.request = request
         self.assertFalse(
             jira.ensure_dependency(
                 blocked="PROJ-1",
@@ -169,14 +188,25 @@ class JiraDecompositionTests(unittest.TestCase):
 
     def test_dependency_lookup_accepts_jira_counterpart_only_records(self):
         jira = object.__new__(decomposition.Jira)
-        jira.issue_links = lambda _key: [{"type": {"name": "Blocks"}, "outwardIssue": {"key": "PROJ-2"}}]
+        jira.issue_links = lambda _key: [
+            {"type": {"name": "Blocks"}, "outwardIssue": {"key": "PROJ-2"}}
+        ]
         jira.request = Mock()
-        self.assertFalse(jira.ensure_dependency(blocked="PROJ-1", prerequisite="PROJ-2", link_type="Blocks", blocked_side="inward"))
+        self.assertFalse(
+            jira.ensure_dependency(
+                blocked="PROJ-1",
+                prerequisite="PROJ-2",
+                link_type="Blocks",
+                blocked_side="inward",
+            )
+        )
         jira.request.assert_not_called()
 
     @staticmethod
     def status(name, category="new"):
-        return {"fields": {"status": {"name": name, "statusCategory": {"key": category}}}}
+        return {
+            "fields": {"status": {"name": name, "statusCategory": {"key": category}}}
+        }
 
     def ready_jira(self, *responses):
         jira = object.__new__(decomposition.Jira)
@@ -187,43 +217,83 @@ class JiraDecompositionTests(unittest.TestCase):
         jira = self.ready_jira(
             self.status("Backlog"),
             {"transitions": [{"id": "21", "to": {"name": "Ready"}, "fields": {}}]},
-            {}, self.status("Ready"),
+            {},
+            self.status("Ready"),
         )
         result = jira.ensure_ready("PROJ-2", self.config())
         self.assertTrue(result["transitioned"])
-        self.assertEqual(jira.request.call_args_list[2].args, ("POST", "rest/api/3/issue/PROJ-2/transitions", {"transition": {"id": "21"}}))
+        self.assertEqual(
+            jira.request.call_args_list[2].args,
+            (
+                "POST",
+                "rest/api/3/issue/PROJ-2/transitions",
+                {"transition": {"id": "21"}},
+            ),
+        )
 
     def test_readiness_retry_never_reopens_done_or_moves_active_work(self):
-        for name, category in (("Ready", "new"), ("Done", "done"), ("In Progress", "indeterminate"), ("Blocked", "new")):
+        for name, category in (
+            ("Ready", "new"),
+            ("Done", "done"),
+            ("In Progress", "indeterminate"),
+            ("Blocked", "new"),
+        ):
             with self.subTest(name=name):
                 jira = self.ready_jira(self.status(name, category))
                 if name in {"Ready", "Done"}:
-                    self.assertFalse(jira.ensure_ready("PROJ-2", self.config())["transitioned"])
+                    self.assertFalse(
+                        jira.ensure_ready("PROJ-2", self.config())["transitioned"]
+                    )
                 else:
-                    with self.assertRaisesRegex(decomposition.DecompositionError, "preserving"):
+                    with self.assertRaisesRegex(
+                        decomposition.DecompositionError, "preserving"
+                    ):
                         jira.ensure_ready("PROJ-2", self.config())
                 self.assertEqual(jira.request.call_count, 1)
 
     def test_transition_timeout_reconciles_status_without_duplicate_post(self):
         jira = self.ready_jira(
-            self.status("Backlog"), {"transitions": [{"id": "21", "to": {"name": "Ready"}}]},
-            decomposition.DecompositionError("timeout"), self.status("Ready"), self.status("Ready"),
+            self.status("Backlog"),
+            {"transitions": [{"id": "21", "to": {"name": "Ready"}}]},
+            decomposition.DecompositionError("timeout"),
+            self.status("Ready"),
+            self.status("Ready"),
         )
         self.assertTrue(jira.ensure_ready("PROJ-2", self.config())["transitioned"])
-        self.assertEqual(sum(call.args[0] == "POST" for call in jira.request.call_args_list), 1)
+        self.assertEqual(
+            sum(call.args[0] == "POST" for call in jira.request.call_args_list), 1
+        )
 
     def test_ready_transition_does_not_invent_required_fields(self):
-        jira = self.ready_jira(self.status("Backlog"), {"transitions": [{
-            "id": "21", "to": {"name": "Ready"}, "fields": {"customfield_1": {"required": True, "hasDefaultValue": False}},
-        }]})
-        with self.assertRaisesRegex(decomposition.DecompositionError, "missing required fields"):
+        jira = self.ready_jira(
+            self.status("Backlog"),
+            {
+                "transitions": [
+                    {
+                        "id": "21",
+                        "to": {"name": "Ready"},
+                        "fields": {
+                            "customfield_1": {
+                                "required": True,
+                                "hasDefaultValue": False,
+                            }
+                        },
+                    }
+                ]
+            },
+        )
+        with self.assertRaisesRegex(
+            decomposition.DecompositionError, "missing required fields"
+        ):
             jira.ensure_ready("PROJ-2", self.config())
         self.assertEqual(jira.request.call_count, 2)
 
     def test_successful_post_requires_observed_ready_status(self):
         jira = self.ready_jira(
-            self.status("Backlog"), {"transitions": [{"id": "21", "to": {"name": "Ready"}}]},
-            {}, self.status("Backlog"),
+            self.status("Backlog"),
+            {"transitions": [{"id": "21", "to": {"name": "Ready"}}]},
+            {},
+            self.status("Backlog"),
         )
         with self.assertRaisesRegex(decomposition.DecompositionError, "did not reach"):
             jira.ensure_ready("PROJ-2", self.config())
@@ -231,68 +301,141 @@ class JiraDecompositionTests(unittest.TestCase):
     def test_transition_selection_obeys_configured_status_order(self):
         config = self.config()
         config["sprint_ready_statuses"] = ["Selected", "Ready"]
-        jira = self.ready_jira(self.status("Backlog"), {"transitions": [
-            {"id": "21", "to": {"name": "Ready"}}, {"id": "31", "to": {"name": "Selected"}},
-        ]}, {}, self.status("Selected"))
+        jira = self.ready_jira(
+            self.status("Backlog"),
+            {
+                "transitions": [
+                    {"id": "21", "to": {"name": "Ready"}},
+                    {"id": "31", "to": {"name": "Selected"}},
+                ]
+            },
+            {},
+            self.status("Selected"),
+        )
         jira.ensure_ready("PROJ-2", config)
-        self.assertEqual(jira.request.call_args_list[2].args[2]["transition"]["id"], "31")
+        self.assertEqual(
+            jira.request.call_args_list[2].args[2]["transition"]["id"], "31"
+        )
 
     def test_child_follows_configured_multistep_path_to_ready(self):
         config = self.config()
         config["sprint_ready_statuses"] = ["Ready"]
-        config["sprint_decomposition"]["jira_ready_transition_path"] = ["Scoping", "Ready"]
+        config["sprint_decomposition"]["jira_ready_transition_path"] = [
+            "Scoping",
+            "Ready",
+        ]
         jira = self.ready_jira(
             self.status("To Do"),
-            {"transitions": [{"id": "11", "name": "Start Scoping", "to": {"name": "Scoping"}, "fields": {}}]},
-            {}, self.status("Scoping", "indeterminate"),
-            {"transitions": [{"id": "22", "name": "Scoping Done", "to": {"name": "Ready"}, "fields": {}}]},
-            {}, self.status("Ready"),
+            {
+                "transitions": [
+                    {
+                        "id": "11",
+                        "name": "Start Scoping",
+                        "to": {"name": "Scoping"},
+                        "fields": {},
+                    }
+                ]
+            },
+            {},
+            self.status("Scoping", "indeterminate"),
+            {
+                "transitions": [
+                    {
+                        "id": "22",
+                        "name": "Scoping Done",
+                        "to": {"name": "Ready"},
+                        "fields": {},
+                    }
+                ]
+            },
+            {},
+            self.status("Ready"),
         )
         result = jira.ensure_ready("PROJ-2", config)
-        self.assertEqual(result, {"key": "PROJ-2", "status": "Ready", "transitioned": True})
-        posts = [call.args for call in jira.request.call_args_list if call.args[0] == "POST"]
+        self.assertEqual(
+            result, {"key": "PROJ-2", "status": "Ready", "transitioned": True}
+        )
+        posts = [
+            call.args for call in jira.request.call_args_list if call.args[0] == "POST"
+        ]
         self.assertEqual([args[2]["transition"]["id"] for args in posts], ["11", "22"])
 
     def test_child_resumes_from_configured_intermediate_status(self):
         config = self.config()
         config["sprint_ready_statuses"] = ["Ready"]
-        config["sprint_decomposition"]["jira_ready_transition_path"] = ["Scoping", "Ready"]
+        config["sprint_decomposition"]["jira_ready_transition_path"] = [
+            "Scoping",
+            "Ready",
+        ]
         jira = self.ready_jira(
             self.status("Scoping", "indeterminate"),
             {"transitions": [{"id": "22", "to": {"name": "Ready"}, "fields": {}}]},
-            {}, self.status("Ready"),
+            {},
+            self.status("Ready"),
         )
         self.assertTrue(jira.ensure_ready("PROJ-2", config)["transitioned"])
-        self.assertEqual(jira.request.call_args_list[2].args[2]["transition"]["id"], "22")
+        self.assertEqual(
+            jira.request.call_args_list[2].args[2]["transition"]["id"], "22"
+        )
 
     def test_multistep_timeout_reconciles_before_next_step(self):
         config = self.config()
         config["sprint_ready_statuses"] = ["Ready"]
-        config["sprint_decomposition"]["jira_ready_transition_path"] = ["Scoping", "Ready"]
+        config["sprint_decomposition"]["jira_ready_transition_path"] = [
+            "Scoping",
+            "Ready",
+        ]
         jira = self.ready_jira(
             self.status("To Do"),
             {"transitions": [{"id": "11", "to": {"name": "Scoping"}, "fields": {}}]},
-            decomposition.DecompositionError("timeout"), self.status("Scoping", "indeterminate"),
+            decomposition.DecompositionError("timeout"),
+            self.status("Scoping", "indeterminate"),
             {"transitions": [{"id": "22", "to": {"name": "Ready"}, "fields": {}}]},
-            {}, self.status("Ready"),
+            {},
+            self.status("Ready"),
         )
         self.assertTrue(jira.ensure_ready("PROJ-2", config)["transitioned"])
-        self.assertEqual(sum(call.args[0] == "POST" for call in jira.request.call_args_list), 2)
+        self.assertEqual(
+            sum(call.args[0] == "POST" for call in jira.request.call_args_list), 2
+        )
 
     def test_multistep_path_rejects_required_intermediate_fields(self):
         config = self.config()
         config["sprint_ready_statuses"] = ["Ready"]
-        config["sprint_decomposition"]["jira_ready_transition_path"] = ["Scoping", "Ready"]
-        jira = self.ready_jira(self.status("To Do"), {"transitions": [{
-            "id": "11", "to": {"name": "Scoping"},
-            "fields": {"customfield_1": {"required": True, "hasDefaultValue": False}},
-        }]})
-        with self.assertRaisesRegex(decomposition.DecompositionError, "no transition to Scoping"):
+        config["sprint_decomposition"]["jira_ready_transition_path"] = [
+            "Scoping",
+            "Ready",
+        ]
+        jira = self.ready_jira(
+            self.status("To Do"),
+            {
+                "transitions": [
+                    {
+                        "id": "11",
+                        "to": {"name": "Scoping"},
+                        "fields": {
+                            "customfield_1": {
+                                "required": True,
+                                "hasDefaultValue": False,
+                            }
+                        },
+                    }
+                ]
+            },
+        )
+        with self.assertRaisesRegex(
+            decomposition.DecompositionError, "no transition to Scoping"
+        ):
             jira.ensure_ready("PROJ-2", config)
-        self.assertEqual(sum(call.args[0] == "POST" for call in jira.request.call_args_list), 0)
+        self.assertEqual(
+            sum(call.args[0] == "POST" for call in jira.request.call_args_list), 0
+        )
 
     def test_multistep_path_must_end_ready_and_cannot_repeat(self):
-        for path, message in ((["Scoping"], "must end"), (["Scoping", "Scoping", "Ready"], "must not repeat")):
+        for path, message in (
+            (["Scoping"], "must end"),
+            (["Scoping", "Scoping", "Ready"], "must not repeat"),
+        ):
             with self.subTest(path=path):
                 config = self.config()
                 config["sprint_ready_statuses"] = ["Ready"]
@@ -303,7 +446,10 @@ class JiraDecompositionTests(unittest.TestCase):
     def test_multistep_path_cannot_make_an_intermediate_status_launchable(self):
         config = self.config()
         config["sprint_ready_statuses"] = ["Scoping", "Ready"]
-        config["sprint_decomposition"]["jira_ready_transition_path"] = ["Scoping", "Ready"]
+        config["sprint_decomposition"]["jira_ready_transition_path"] = [
+            "Scoping",
+            "Ready",
+        ]
         with self.assertRaisesRegex(decomposition.DecompositionError, "only the final"):
             decomposition.validated_input(config, self.assessment())
 
@@ -319,12 +465,30 @@ class JiraDecompositionTests(unittest.TestCase):
             jira.create_child.side_effect = ["PROJ-2", "PROJ-3"]
             jira.ensure_dependency.return_value = True
             jira.ensure_ready.side_effect = [
-                decomposition.DecompositionError("required field needs operator decision"),
+                decomposition.DecompositionError(
+                    "required field needs operator decision"
+                ),
                 {"key": "PROJ-3", "status": "Ready", "transitioned": True},
             ]
-            with patch.object(sys, "argv", ["decompose", "--config", str(root / "config.yaml"), "--assessment", str(assessment), "--output", str(output), "--apply"]), \
-                 patch.object(decomposition, "load_yaml", return_value=self.config()), \
-                 patch.object(decomposition, "Jira", return_value=jira), contextlib.redirect_stdout(io.StringIO()):
+            with (
+                patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "decompose",
+                        "--config",
+                        str(root / "config.yaml"),
+                        "--assessment",
+                        str(assessment),
+                        "--output",
+                        str(output),
+                        "--apply",
+                    ],
+                ),
+                patch.object(decomposition, "load_yaml", return_value=self.config()),
+                patch.object(decomposition, "Jira", return_value=jira),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
                 self.assertEqual(decomposition.main(), 0)
             result = json.loads(output.read_text())
             self.assertEqual(result["children"], ["PROJ-2", "PROJ-3"])

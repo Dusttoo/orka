@@ -248,6 +248,30 @@ id, and the provider-reported token counts. This settles actual cost, but the
 controller must still inspect the recovered result before advancing workflow
 state. Never release an uncertain reservation merely to make budget available.
 
+For several historical reservations, first generate a bounded manifest inside
+the repository:
+
+```text
+scripts/api_agent.py reservation-migration-plan --repo . \
+  > .orchestration/reservation-migration.json
+```
+
+Fill every entry's `evidence` with the provider lookup and timestamp that proves
+the request was not found. Orka accepts only `not-found` outcomes in this bulk
+path; completed requests still require individual token and response-id
+reconciliation. Validate the entire manifest before mutation, then apply it:
+
+```text
+scripts/api_agent.py reconcile-reservations --repo . \
+  --manifest .orchestration/reservation-migration.json
+scripts/api_agent.py reconcile-reservations --repo . \
+  --manifest .orchestration/reservation-migration.json --apply
+```
+
+The manifest is repository-bound, limited to 100 unique reservations, and each
+entry must match both the run marker and the open ledger reservation. Application
+is idempotent and copies the exact evidence into the run's durable audit record.
+
 ### Logical review retries
 
 API reviewers derive their logical review identity from the consumed permit's

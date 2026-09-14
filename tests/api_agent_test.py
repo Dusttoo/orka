@@ -14,7 +14,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
-SPEC = importlib.util.spec_from_file_location("api_agent", ROOT / "scripts" / "api_agent.py")
+SPEC = importlib.util.spec_from_file_location(
+    "api_agent", ROOT / "scripts" / "api_agent.py"
+)
 assert SPEC and SPEC.loader
 api_agent = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = api_agent
@@ -80,14 +82,26 @@ class FakeHTTPResponse:
     def read(self):
         return self.body
 
+
 class ApiAgentTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         subprocess.run(["git", "init", "-q", str(self.root)], check=True)
         subprocess.run(
-            ["git", "-C", str(self.root), "-c", "user.name=Test", "-c",
-             "user.email=test@example.com", "commit", "--allow-empty", "-qm", "initial"],
+            [
+                "git",
+                "-C",
+                str(self.root),
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "initial",
+            ],
             check=True,
         )
         (self.root / ".orchestration").mkdir()
@@ -97,7 +111,10 @@ class ApiAgentTests(unittest.TestCase):
 
     def config(self, provider="anthropic", model="test-model", extra=""):
         path = self.root / ".orchestration" / "config.yaml"
-        roles = extra or "    code-reviewer:\n      allowed_tools: [read_file, search, git_diff, git_status, run_check]"
+        roles = (
+            extra
+            or "    code-reviewer:\n      allowed_tools: [read_file, search, git_diff, git_status, run_check]"
+        )
         path.write_text(
             f"""schema_version: 1
 require_review_authorization: false
@@ -138,20 +155,38 @@ self_check:
         if not ledger_path.exists():
             subprocess.run(
                 [sys.executable, str(ROOT / "scripts/review-ledger.py"), "open", pr],
-                cwd=self.root, check=True, capture_output=True, text=True,
+                cwd=self.root,
+                check=True,
+                capture_output=True,
+                text=True,
             )
         head = subprocess.run(
             ["git", "-C", str(self.root), "rev-parse", "HEAD"],
-            check=True, capture_output=True, text=True,
+            check=True,
+            capture_output=True,
+            text=True,
         ).stdout.strip()
         permit = subprocess.run(
-            [sys.executable, str(ROOT / "scripts/review-ledger.py"), "permit-review", pr,
-             "--role", role, "--head", head],
-            cwd=self.root, check=True, capture_output=True, text=True,
+            [
+                sys.executable,
+                str(ROOT / "scripts/review-ledger.py"),
+                "permit-review",
+                pr,
+                "--role",
+                role,
+                "--head",
+                head,
+            ],
+            cwd=self.root,
+            check=True,
+            capture_output=True,
+            text=True,
         )
         return json.loads(permit.stdout)["review_phase_permit"]
 
-    def agent(self, transport, provider="anthropic", role="code-reviewer", run_id="test-run"):
+    def agent(
+        self, transport, provider="anthropic", role="code-reviewer", run_id="test-run"
+    ):
         review = {}
         if role in {"design-reviewer", "code-reviewer", "security-reviewer"}:
             review = {
@@ -173,21 +208,48 @@ self_check:
             **worker,
         )
 
-    def attempt_capability(self, *, run_id, role="implementer", ticket="PROJ-1", sprint="SPRINT-1", worker_ref=None):
+    def attempt_capability(
+        self,
+        *,
+        run_id,
+        role="implementer",
+        ticket="PROJ-1",
+        sprint="SPRINT-1",
+        worker_ref=None,
+    ):
         token = "attemptcap_" + run_id.replace("-", "_")
         worker = worker_ref or run_id
         directory = self.root / ".orchestration/.sprint-state"
         directory.mkdir(parents=True, exist_ok=True)
-        (directory / f"test-{run_id}.json").write_text(json.dumps({
-            "schema_version": 2,
-            "tickets": {ticket: {"state": "running", "attempt_capability": {
-                "token": token, "repository": str(self.root.resolve()), "sprint": sprint,
-                "ticket": ticket, "role": role, "run_id": run_id, "worker": worker, "attempt": 1,
-            }, "attempts": 1}},
-        }), encoding="utf-8")
+        (directory / f"test-{run_id}.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "tickets": {
+                        ticket: {
+                            "state": "running",
+                            "attempt_capability": {
+                                "token": token,
+                                "repository": str(self.root.resolve()),
+                                "sprint": sprint,
+                                "ticket": ticket,
+                                "role": role,
+                                "run_id": run_id,
+                                "worker": worker,
+                                "attempt": 1,
+                            },
+                            "attempts": 1,
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
         return {"attempt_capability": token, "worker_ref": worker}
 
-    def test_repository_env_loads_provider_credentials_without_overriding_container(self):
+    def test_repository_env_loads_provider_credentials_without_overriding_container(
+        self,
+    ):
         config = self.config()
         (config.parent / ".env").write_text(
             "# local orchestration secrets\n"
@@ -199,14 +261,18 @@ self_check:
             "PATH=/untrusted/path\n",
             encoding="utf-8",
         )
-        with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "container-key"}, clear=False):
+        with mock.patch.dict(
+            os.environ, {"ANTHROPIC_API_KEY": "container-key"}, clear=False
+        ):
             os.environ.pop("ANTHROPIC_BASE_URL", None)
             os.environ.pop("OPENAI_API_KEY", None)
             os.environ.pop("AZURE_ADM_API_KEY", None)
             os.environ.pop("AZURE_ADM_BASE_URL", None)
             loaded = api_agent.load_orchestration_env(config)
             self.assertEqual(os.environ["ANTHROPIC_API_KEY"], "container-key")
-            self.assertEqual(os.environ["ANTHROPIC_BASE_URL"], "https://proxy.example/v1")
+            self.assertEqual(
+                os.environ["ANTHROPIC_BASE_URL"], "https://proxy.example/v1"
+            )
             self.assertEqual(os.environ["OPENAI_API_KEY"], "repo-openai")
             self.assertEqual(os.environ["AZURE_ADM_API_KEY"], "repo-azure")
             self.assertEqual(
@@ -224,14 +290,18 @@ self_check:
                 ],
             )
 
-    @unittest.skipUnless(importlib.util.find_spec("botocore"), "optional Bedrock SDK absent")
+    @unittest.skipUnless(
+        importlib.util.find_spec("botocore"), "optional Bedrock SDK absent"
+    )
     def test_bedrock_transport_uses_request_metadata_and_aws_request_id(self):
         client = FakeBedrockClient(
             response={
                 "ResponseMetadata": {"RequestId": "aws-request-123"},
                 "stopReason": "end_turn",
                 "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2},
-                "output": {"message": {"role": "assistant", "content": [{"text": "ok"}]}},
+                "output": {
+                    "message": {"role": "assistant", "content": [{"text": "ok"}]}
+                },
             }
         )
         transport = api_agent.HttpTransport(bedrock_client=client)
@@ -251,7 +321,9 @@ self_check:
             "resv_123",
         )
 
-    @unittest.skipUnless(importlib.util.find_spec("botocore"), "optional Bedrock SDK absent")
+    @unittest.skipUnless(
+        importlib.util.find_spec("botocore"), "optional Bedrock SDK absent"
+    )
     def test_bedrock_transport_retries_only_explicit_rejections(self):
         from botocore.exceptions import ClientError
 
@@ -263,9 +335,9 @@ self_check:
             "Converse",
         )
         with self.assertRaisesRegex(api_agent.ProviderHTTPError, "HTTP 429"):
-            api_agent.HttpTransport(bedrock_client=FakeBedrockClient(error=throttled)).request(
-                "bedrock", "converse", {}
-            )
+            api_agent.HttpTransport(
+                bedrock_client=FakeBedrockClient(error=throttled)
+            ).request("bedrock", "converse", {})
         uncertain = ClientError(
             {
                 "Error": {"Code": "InternalServerException", "Message": "unknown"},
@@ -274,9 +346,9 @@ self_check:
             "Converse",
         )
         with self.assertRaises(api_agent.ProviderAmbiguous):
-            api_agent.HttpTransport(bedrock_client=FakeBedrockClient(error=uncertain)).request(
-                "bedrock", "converse", {}
-            )
+            api_agent.HttpTransport(
+                bedrock_client=FakeBedrockClient(error=uncertain)
+            ).request("bedrock", "converse", {})
 
     @unittest.skipUnless(
         importlib.util.find_spec("boto3") and importlib.util.find_spec("botocore"),
@@ -302,9 +374,10 @@ self_check:
                 "usage": {"prompt_tokens": 1, "completion_tokens": 1},
             }
         )
-        with mock.patch("boto3.Session", return_value=session), mock.patch(
-            "urllib.request.urlopen", return_value=response
-        ) as urlopen:
+        with (
+            mock.patch("boto3.Session", return_value=session),
+            mock.patch("urllib.request.urlopen", return_value=response) as urlopen,
+        ):
             result = api_agent.HttpTransport().request(
                 "bedrock_mantle",
                 "chat/completions",
@@ -330,14 +403,20 @@ self_check:
     def test_anthropic_base_url_accepts_host_or_v1_form(self):
         response = FakeHTTPResponse({"id": "msg_1"})
         for base in ("https://api.anthropic.com", "https://api.anthropic.com/v1/"):
-            with self.subTest(base=base), mock.patch.dict(
-                os.environ,
-                {"ANTHROPIC_API_KEY": "test-key", "ANTHROPIC_BASE_URL": base},
-                clear=False,
-            ), mock.patch("urllib.request.urlopen", return_value=response) as urlopen:
+            with (
+                self.subTest(base=base),
+                mock.patch.dict(
+                    os.environ,
+                    {"ANTHROPIC_API_KEY": "test-key", "ANTHROPIC_BASE_URL": base},
+                    clear=False,
+                ),
+                mock.patch("urllib.request.urlopen", return_value=response) as urlopen,
+            ):
                 api_agent.HttpTransport().request("anthropic", "messages", {})
                 request = urlopen.call_args.args[0]
-                self.assertEqual(request.full_url, "https://api.anthropic.com/v1/messages")
+                self.assertEqual(
+                    request.full_url, "https://api.anthropic.com/v1/messages"
+                )
 
     def test_anthropic_tool_loop_and_usage(self):
         transport = FakeTransport(
@@ -346,7 +425,14 @@ self_check:
                     "id": "msg_1",
                     "stop_reason": "tool_use",
                     "usage": {"input_tokens": 100, "output_tokens": 10},
-                    "content": [{"type": "tool_use", "id": "tool_1", "name": "git_status", "input": {}}],
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "tool_1",
+                            "name": "git_status",
+                            "input": {},
+                        }
+                    ],
                 },
                 {
                     "id": "msg_2",
@@ -362,7 +448,12 @@ self_check:
         )
         agent = self.agent(transport)
         result = agent.run(
-            {"model": "test-model", "max_tokens": 500, "system": [], "messages": [{"role": "user", "content": "review"}]}
+            {
+                "model": "test-model",
+                "max_tokens": 500,
+                "system": [],
+                "messages": [{"role": "user", "content": "review"}],
+            }
         )
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["review"]["verdict"], "PASS")
@@ -375,7 +466,9 @@ self_check:
         self.assertNotIn('"strict"', tool_payload)
         self.assertIn('"maxItems"', tool_payload)
         self.assertIn('"minimum"', tool_payload)
-        self.assertEqual(message_calls[1][2]["messages"][-1]["content"][0]["type"], "tool_result")
+        self.assertEqual(
+            message_calls[1][2]["messages"][-1]["content"][0]["type"], "tool_result"
+        )
         summary = agent.ledger.summary()
         self.assertEqual(summary["input_tokens"], 120)
         self.assertEqual(summary["cache_read_tokens"], 80)
@@ -389,7 +482,14 @@ self_check:
                     "id": "msg_1",
                     "stop_reason": "tool_use",
                     "usage": {"input_tokens": 100, "output_tokens": 10},
-                    "content": [{"type": "tool_use", "id": "tool_1", "name": "git_status", "input": {}}],
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "tool_1",
+                            "name": "git_status",
+                            "input": {},
+                        }
+                    ],
                 },
                 {
                     "id": "msg_2",
@@ -401,9 +501,16 @@ self_check:
         )
         agent = self.agent(transport)
         agent.run(
-            {"model": "test-model", "max_tokens": 500, "system": [], "messages": [{"role": "user", "content": "review"}]}
+            {
+                "model": "test-model",
+                "max_tokens": 500,
+                "system": [],
+                "messages": [{"role": "user", "content": "review"}],
+            }
         )
-        resubmitted = [call for call in transport.calls if call[1] == "messages"][1][2]["messages"]
+        resubmitted = [call for call in transport.calls if call[1] == "messages"][1][2][
+            "messages"
+        ]
         marked = [
             (index, block)
             for index, message in enumerate(resubmitted)
@@ -414,7 +521,9 @@ self_check:
         # spend two of Anthropic's four, and adding one per round would exceed it.
         self.assertEqual(len(marked), 1)
         self.assertEqual(marked[0][0], len(resubmitted) - 1)
-        self.assertEqual(resubmitted[-1]["content"][-1]["cache_control"], {"type": "ephemeral"})
+        self.assertEqual(
+            resubmitted[-1]["content"][-1]["cache_control"], {"type": "ephemeral"}
+        )
 
     def test_rolling_cache_breakpoint_does_not_mutate_provider_content(self):
         assistant_content = [{"type": "text", "text": "prior"}]
@@ -423,14 +532,20 @@ self_check:
             {"role": "assistant", "content": assistant_content},
         ]
         rolled = api_agent.roll_conversation_cache_breakpoint(messages)
-        self.assertEqual(rolled[-1]["content"][-1]["cache_control"], {"type": "ephemeral"})
+        self.assertEqual(
+            rolled[-1]["content"][-1]["cache_control"], {"type": "ephemeral"}
+        )
         self.assertNotIn("cache_control", assistant_content[-1])
 
     def _commit_initial(self):
         git = [
-            "git", "-C", str(self.root),
-            "-c", "user.email=test@example.com",
-            "-c", "user.name=test",
+            "git",
+            "-C",
+            str(self.root),
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=test",
         ]
         (self.root / "README.md").write_text("seed\n", encoding="utf-8")
         subprocess.run(git + ["add", "README.md"], check=True, capture_output=True)
@@ -495,14 +610,17 @@ self_check:
         override = Path(self.temp.name) / "elsewhere"
         override.mkdir()
         with mock.patch.dict(os.environ, {"ORCHESTRATION_USAGE_ROOT": str(override)}):
-            self.assertEqual(api_agent.shared_repository_root(self.root), self.root.resolve())
+            self.assertEqual(
+                api_agent.shared_repository_root(self.root), self.root.resolve()
+            )
 
     def test_conflicting_worktree_runtime_state_fails_closed(self):
         git = self._commit_initial()
         worktree = self.root / ".claude" / "worktrees" / "conflict"
         subprocess.run(
             git + ["worktree", "add", "-q", str(worktree), "-b", "conflict-lane"],
-            check=True, capture_output=True,
+            check=True,
+            capture_output=True,
         )
         self.config()
         shared = self.root / ".orchestration/.llm-usage/usage.jsonl"
@@ -511,11 +629,17 @@ self_check:
         legacy.parent.mkdir(parents=True, exist_ok=True)
         shared.write_text('{"kind":"usage","cost_usd":"1"}\n', encoding="utf-8")
         legacy.write_text('{"kind":"usage","cost_usd":"2"}\n', encoding="utf-8")
-        with self.assertRaisesRegex(api_agent.AgentError, "conflicting legacy runtime state"):
+        with self.assertRaisesRegex(
+            api_agent.AgentError, "conflicting legacy runtime state"
+        ):
             api_agent.ApiAgent(
-                root=worktree, config_path=self.root / ".orchestration/config.yaml",
-                role="implementer", ticket="PROJ-1", sprint="S-1",
-                run_id="conflict", transport=FakeTransport([]),
+                root=worktree,
+                config_path=self.root / ".orchestration/config.yaml",
+                role="implementer",
+                ticket="PROJ-1",
+                sprint="S-1",
+                run_id="conflict",
+                transport=FakeTransport([]),
             )
 
     def test_shared_root_falls_back_outside_a_repository(self):
@@ -526,7 +650,9 @@ self_check:
             with mock.patch.object(
                 api_agent.subprocess, "run", side_effect=OSError("git missing")
             ):
-                self.assertEqual(api_agent.shared_repository_root(plain), plain.resolve())
+                self.assertEqual(
+                    api_agent.shared_repository_root(plain), plain.resolve()
+                )
 
     def test_usage_events_record_role_and_request_latency(self):
         transport = FakeTransport(
@@ -534,14 +660,23 @@ self_check:
                 {
                     "id": "msg_1",
                     "stop_reason": "end_turn",
-                    "usage": {"input_tokens": 30, "cache_read_input_tokens": 70, "output_tokens": 5},
+                    "usage": {
+                        "input_tokens": 30,
+                        "cache_read_input_tokens": 70,
+                        "output_tokens": 5,
+                    },
                     "content": [{"type": "text", "text": CLEAN_REVIEW}],
                 }
             ]
         )
         agent = self.agent(transport)
         agent.run(
-            {"model": "test-model", "max_tokens": 500, "system": [], "messages": [{"role": "user", "content": "review"}]}
+            {
+                "model": "test-model",
+                "max_tokens": 500,
+                "system": [],
+                "messages": [{"role": "user", "content": "review"}],
+            }
         )
         events = agent.ledger._events()
         usage = [event for event in events if event["kind"] == "usage"]
@@ -572,15 +707,19 @@ self_check:
         directory = self.root / ".orchestration" / ".llm-usage"
         directory.mkdir(parents=True, exist_ok=True)
         (directory / "usage.jsonl").write_text(
-            "".join(json.dumps(event, separators=(",", ":")) + "\n" for event in events),
+            "".join(
+                json.dumps(event, separators=(",", ":")) + "\n" for event in events
+            ),
             encoding="utf-8",
         )
 
     @staticmethod
-    def _usage_event(role, cost, *, cache_read=900, fresh=100, latency=1000, age_hours=1, **extra):
-        moment = api_agent.dt.datetime.now(api_agent.dt.timezone.utc) - api_agent.dt.timedelta(
-            hours=age_hours
-        )
+    def _usage_event(
+        role, cost, *, cache_read=900, fresh=100, latency=1000, age_hours=1, **extra
+    ):
+        moment = api_agent.dt.datetime.now(
+            api_agent.dt.timezone.utc
+        ) - api_agent.dt.timedelta(hours=age_hours)
         event = {
             "kind": "usage",
             "timestamp": moment.isoformat(),
@@ -607,8 +746,12 @@ self_check:
         self._write_ledger(
             [
                 self._usage_event("implementer", "0.500000", cache_read=900, fresh=100),
-                self._usage_event("implementer", "0.250000", cache_read=900, fresh=100, age_hours=2),
-                self._usage_event("code-reviewer", "0.100000", cache_read=500, fresh=500, age_hours=3),
+                self._usage_event(
+                    "implementer", "0.250000", cache_read=900, fresh=100, age_hours=2
+                ),
+                self._usage_event(
+                    "code-reviewer", "0.100000", cache_read=500, fresh=500, age_hours=3
+                ),
             ]
         )
         report = api_agent.build_report(self.root, self._report_args())
@@ -632,7 +775,9 @@ self_check:
         recent = api_agent.build_report(self.root, self._report_args(since="24h"))
         self.assertEqual(recent["totals"]["requests"], 2)
         self.assertEqual(recent["totals"]["cost_usd"], "5.000000")
-        scoped = api_agent.build_report(self.root, self._report_args(role="code-reviewer"))
+        scoped = api_agent.build_report(
+            self.root, self._report_args(role="code-reviewer")
+        )
         self.assertEqual(scoped["totals"]["cost_usd"], "4.000000")
         self.assertEqual(scoped["filters"], {"role": "code-reviewer"})
 
@@ -645,11 +790,18 @@ self_check:
         self.assertEqual(report["groups"][0]["key"], "unknown")
         self.assertIsNone(report["totals"]["latency_p50_ms"])
         self.assertEqual(report["totals"]["latency_samples"], 0)
-        self.assertIn("latency recorded for 0 of 1 requests", api_agent.format_report(report))
+        self.assertIn(
+            "latency recorded for 0 of 1 requests", api_agent.format_report(report)
+        )
 
     def test_report_top_reports_what_it_hid(self):
         self._write_ledger(
-            [self._usage_event(f"role-{index}", f"{index}.000000", age_hours=index + 1) for index in range(1, 5)]
+            [
+                self._usage_event(
+                    f"role-{index}", f"{index}.000000", age_hours=index + 1
+                )
+                for index in range(1, 5)
+            ]
         )
         report = api_agent.build_report(self.root, self._report_args(top=2))
         self.assertEqual(len(report["groups"]), 2)
@@ -659,12 +811,18 @@ self_check:
 
     def test_parse_window_accepts_relative_and_absolute_forms(self):
         now = api_agent.dt.datetime.now(api_agent.dt.timezone.utc)
-        self.assertLess(abs((now - api_agent.parse_window("30m")).total_seconds() - 1800), 5)
-        self.assertLess(abs((now - api_agent.parse_window("2w")).total_seconds() - 1209600), 5)
+        self.assertLess(
+            abs((now - api_agent.parse_window("30m")).total_seconds() - 1800), 5
+        )
+        self.assertLess(
+            abs((now - api_agent.parse_window("2w")).total_seconds() - 1209600), 5
+        )
         absolute = api_agent.parse_window("2026-08-01T00:00:00+00:00")
         self.assertEqual(absolute.year, 2026)
         # A naive timestamp is read as UTC rather than silently taking local time.
-        self.assertEqual(api_agent.parse_window("2026-08-01").tzinfo, api_agent.dt.timezone.utc)
+        self.assertEqual(
+            api_agent.parse_window("2026-08-01").tzinfo, api_agent.dt.timezone.utc
+        )
         with self.assertRaises(api_agent.AgentError):
             api_agent.parse_window("last tuesday")
 
@@ -690,7 +848,10 @@ self_check:
                     "status": "completed",
                     "usage": {
                         "input_tokens": 90,
-                        "input_tokens_details": {"cached_tokens": 60, "cache_write_tokens": 10},
+                        "input_tokens_details": {
+                            "cached_tokens": 60,
+                            "cache_write_tokens": 10,
+                        },
                         "output_tokens": 4,
                     },
                     "output_text": "done",
@@ -716,12 +877,20 @@ self_check:
         )
         result = agent.run(
             {
-                "model": "test-model", "max_output_tokens": 100,
-                "input": [{"role": "user", "content": [{
-                    "type": "input_text",
-                    "text": "work",
-                    "prompt_cache_breakpoint": {"mode": "explicit"},
-                }]}],
+                "model": "test-model",
+                "max_output_tokens": 100,
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": "work",
+                                "prompt_cache_breakpoint": {"mode": "explicit"},
+                            }
+                        ],
+                    }
+                ],
                 "text": {"verbosity": "low"},
                 "prompt_cache_key": "stale-key",
                 "prompt_cache_options": {"mode": "explicit"},
@@ -731,9 +900,13 @@ self_check:
         response_calls = [call for call in transport.calls if call[1] == "responses"]
         self.assertEqual(result["output_text"], "done")
         self.assertEqual(response_calls[1][2]["previous_response_id"], "resp_1")
-        self.assertEqual(response_calls[1][2]["input"][0]["type"], "function_call_output")
+        self.assertEqual(
+            response_calls[1][2]["input"][0]["type"], "function_call_output"
+        )
         self.assertEqual(response_calls[1][2]["text"], {"verbosity": "low"})
-        self.assertIn("apply_patch", {tool["name"] for tool in response_calls[0][2]["tools"]})
+        self.assertIn(
+            "apply_patch", {tool["name"] for tool in response_calls[0][2]["tools"]}
+        )
         serialized_calls = json.dumps(response_calls)
         for field in api_agent.OPENAI_CACHE_REQUEST_FIELDS:
             self.assertNotIn(field, serialized_calls)
@@ -753,7 +926,10 @@ self_check:
                                     {
                                         "id": "call_1",
                                         "type": "function",
-                                        "function": {"name": "git_status", "arguments": "{}"},
+                                        "function": {
+                                            "name": "git_status",
+                                            "arguments": "{}",
+                                        },
                                     }
                                 ],
                             },
@@ -803,7 +979,9 @@ self_check:
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["output_text"], "done")
         self.assertEqual(len(chat_calls), 2)
-        self.assertFalse(any(call[1].endswith("input_tokens") for call in transport.calls))
+        self.assertFalse(
+            any(call[1].endswith("input_tokens") for call in transport.calls)
+        )
         self.assertIn(
             "apply_patch",
             {tool["function"]["name"] for tool in chat_calls[0][2]["tools"]},
@@ -1065,7 +1243,9 @@ self_check:
         converse = next(call for call in transport.calls if call[1] == "converse")
         self.assertEqual(result["status"], "completed")
         self.assertFalse(any(call[1] == "count_tokens" for call in transport.calls))
-        self.assertTrue(all("cachePoint" not in block for block in converse[2]["system"]))
+        self.assertTrue(
+            all("cachePoint" not in block for block in converse[2]["system"])
+        )
         self.assertTrue(
             all("cachePoint" not in tool for tool in converse[2]["toolConfig"]["tools"])
         )
@@ -1075,7 +1255,12 @@ self_check:
         agent = self.agent(transport, run_id="budget-run")
         with self.assertRaises(api_agent.BudgetError):
             agent.run(
-                {"model": "test-model", "max_tokens": 100, "system": [], "messages": [{"role": "user", "content": "review"}]}
+                {
+                    "model": "test-model",
+                    "max_tokens": 100,
+                    "system": [],
+                    "messages": [{"role": "user", "content": "review"}],
+                }
             )
         self.assertFalse(any(call[1] == "messages" for call in transport.calls))
         self.assertEqual(agent.state["status"], "budget_blocked")
@@ -1086,29 +1271,61 @@ self_check:
         limits["max_model_runs_per_ticket"] = 2
         limits["max_reviewer_runs_per_ticket"] = 1
         ledger.reserve(
-            projected=api_agent.Decimal("0.01"), limits=limits, run_id="review-1",
-            ticket="PROJ-1", sprint="S-1", provider="openai", model="m", role="code-reviewer",
+            projected=api_agent.Decimal("0.01"),
+            limits=limits,
+            run_id="review-1",
+            ticket="PROJ-1",
+            sprint="S-1",
+            provider="openai",
+            model="m",
+            role="code-reviewer",
         )
         # A second provider/tool round inside one run does not consume another run slot.
         ledger.reserve(
-            projected=api_agent.Decimal("0.01"), limits=limits, run_id="review-1",
-            ticket="PROJ-1", sprint="S-1", provider="openai", model="m", role="code-reviewer",
+            projected=api_agent.Decimal("0.01"),
+            limits=limits,
+            run_id="review-1",
+            ticket="PROJ-1",
+            sprint="S-1",
+            provider="openai",
+            model="m",
+            role="code-reviewer",
         )
-        with self.assertRaisesRegex(api_agent.BudgetError, "max_reviewer_runs_per_ticket"):
+        with self.assertRaisesRegex(
+            api_agent.BudgetError, "max_reviewer_runs_per_ticket"
+        ):
             ledger.reserve(
-                projected=api_agent.Decimal("0.01"), limits=limits, run_id="review-2",
-                ticket="PROJ-1", sprint="S-1", provider="openai", model="m", role="security-reviewer",
+                projected=api_agent.Decimal("0.01"),
+                limits=limits,
+                run_id="review-2",
+                ticket="PROJ-1",
+                sprint="S-1",
+                provider="openai",
+                model="m",
+                role="security-reviewer",
             )
         worker_limits = dict(limits)
         worker_limits["max_model_runs_per_ticket"] = 1
         ledger.reserve(
-            projected=api_agent.Decimal("0.01"), limits=worker_limits, run_id="implement-1",
-            ticket="PROJ-2", sprint="S-1", provider="anthropic", model="m", role="implementer",
+            projected=api_agent.Decimal("0.01"),
+            limits=worker_limits,
+            run_id="implement-1",
+            ticket="PROJ-2",
+            sprint="S-1",
+            provider="anthropic",
+            model="m",
+            role="implementer",
         )
         with self.assertRaisesRegex(api_agent.BudgetError, "max_model_runs_per_ticket"):
             ledger.reserve(
-                projected=api_agent.Decimal("0.01"), limits=worker_limits, run_id="implement-2",
-                ticket="PROJ-2", sprint="S-1", provider="anthropic", model="m", role="implementer",
+                projected=api_agent.Decimal("0.01"),
+                limits=worker_limits,
+                run_id="implement-2",
+                ticket="PROJ-2",
+                sprint="S-1",
+                provider="anthropic",
+                model="m",
+                role="implementer",
             )
 
     def test_design_rounds_do_not_exhaust_post_implementation_review_capacity(self):
@@ -1117,26 +1334,45 @@ self_check:
         limits["max_reviewer_runs_per_ticket"] = 1
         for index in range(6):
             ledger.reserve(
-                projected=api_agent.Decimal("0.01"), limits=limits,
-                run_id=f"design-{index}", ticket="PROJ-3", sprint="S-1",
-                provider="openai", model="m", role="design-reviewer",
+                projected=api_agent.Decimal("0.01"),
+                limits=limits,
+                run_id=f"design-{index}",
+                ticket="PROJ-3",
+                sprint="S-1",
+                provider="openai",
+                model="m",
+                role="design-reviewer",
             )
         # Simulate the stale pause emitted by the old shared reviewer counter.
-        ledger._append_locked({
-            "kind": "ticket_budget_pause", "timestamp": api_agent.utc_now(),
-            "ticket": "PROJ-3", "run_id": "old-code-review",
-            "reason": "max_reviewer_runs_per_ticket",
-        })
+        ledger._append_locked(
+            {
+                "kind": "ticket_budget_pause",
+                "timestamp": api_agent.utc_now(),
+                "ticket": "PROJ-3",
+                "run_id": "old-code-review",
+                "reason": "max_reviewer_runs_per_ticket",
+            }
+        )
         ledger.reserve(
-            projected=api_agent.Decimal("0.01"), limits=limits,
-            run_id="code-1", ticket="PROJ-3", sprint="S-1",
-            provider="openai", model="m", role="code-reviewer",
+            projected=api_agent.Decimal("0.01"),
+            limits=limits,
+            run_id="code-1",
+            ticket="PROJ-3",
+            sprint="S-1",
+            provider="openai",
+            model="m",
+            role="code-reviewer",
         )
         with self.assertRaisesRegex(api_agent.BudgetError, "post-implementation"):
             ledger.reserve(
-                projected=api_agent.Decimal("0.01"), limits=limits,
-                run_id="security-2", ticket="PROJ-3", sprint="S-1",
-                provider="openai", model="m", role="security-reviewer",
+                projected=api_agent.Decimal("0.01"),
+                limits=limits,
+                run_id="security-2",
+                ticket="PROJ-3",
+                sprint="S-1",
+                provider="openai",
+                model="m",
+                role="security-reviewer",
             )
 
     def test_ticket_pause_is_durable_and_has_no_self_approval_bypass(self):
@@ -1146,21 +1382,38 @@ self_check:
         limits["pause_usd_per_ticket"] = api_agent.Decimal("0.10")
         with self.assertRaisesRegex(api_agent.BudgetError, "operator policy change"):
             ledger.reserve(
-                projected=api_agent.Decimal("0.11"), limits=limits, run_id="costly",
-                ticket="PROJ-9", sprint="S-1", provider="openai", model="m", role="implementer",
+                projected=api_agent.Decimal("0.11"),
+                limits=limits,
+                run_id="costly",
+                ticket="PROJ-9",
+                sprint="S-1",
+                provider="openai",
+                model="m",
+                role="implementer",
             )
         events = ledger._events()
-        self.assertTrue(any(event.get("kind") == "ticket_budget_pause" for event in events))
-        ledger._append_locked({
-            "kind": "ticket_budget_pause", "timestamp": api_agent.utc_now(),
-            "ticket": "PROJ-9", "run_id": "later-counter-stop",
-            "reason": "max_reviewer_runs_per_ticket",
-        })
+        self.assertTrue(
+            any(event.get("kind") == "ticket_budget_pause" for event in events)
+        )
+        ledger._append_locked(
+            {
+                "kind": "ticket_budget_pause",
+                "timestamp": api_agent.utc_now(),
+                "ticket": "PROJ-9",
+                "run_id": "later-counter-stop",
+                "reason": "max_reviewer_runs_per_ticket",
+            }
+        )
         with self.assertRaisesRegex(api_agent.BudgetError, "ticket_budget_pause"):
             ledger.reserve(
-                projected=api_agent.Decimal("0.01"), limits=limits,
-                run_id="still-paused", ticket="PROJ-9", sprint="S-1",
-                provider="openai", model="m", role="implementer",
+                projected=api_agent.Decimal("0.01"),
+                limits=limits,
+                run_id="still-paused",
+                ticket="PROJ-9",
+                sprint="S-1",
+                provider="openai",
+                model="m",
+                role="implementer",
             )
         self.assertFalse(hasattr(ledger, "approve_ticket_budget"))
 
@@ -1171,20 +1424,40 @@ self_check:
         limits["pause_usd_per_ticket"] = api_agent.Decimal("0.10")
         with self.assertRaises(api_agent.BudgetError):
             ledger.reserve(
-                projected=api_agent.Decimal("0.11"), limits=limits, run_id="before-grant",
-                ticket="PROJ-9", sprint="S-1", provider="openai", model="m", role="implementer",
+                projected=api_agent.Decimal("0.11"),
+                limits=limits,
+                run_id="before-grant",
+                ticket="PROJ-9",
+                sprint="S-1",
+                provider="openai",
+                model="m",
+                role="implementer",
             )
         with mock.patch.object(
-            api_agent, "authorized_budget_ceiling", return_value=api_agent.Decimal("0.20")
+            api_agent,
+            "authorized_budget_ceiling",
+            return_value=api_agent.Decimal("0.20"),
         ):
             ledger.reserve(
-                projected=api_agent.Decimal("0.05"), limits=limits, run_id="after-grant",
-                ticket="PROJ-9", sprint="S-1", provider="openai", model="m", role="implementer",
+                projected=api_agent.Decimal("0.05"),
+                limits=limits,
+                run_id="after-grant",
+                ticket="PROJ-9",
+                sprint="S-1",
+                provider="openai",
+                model="m",
+                role="implementer",
             )
             with self.assertRaisesRegex(api_agent.BudgetError, "max_usd_per_ticket"):
                 ledger.reserve(
-                    projected=api_agent.Decimal("0.16"), limits=limits, run_id="over-grant",
-                    ticket="PROJ-9", sprint="S-1", provider="openai", model="m", role="implementer",
+                    projected=api_agent.Decimal("0.16"),
+                    limits=limits,
+                    run_id="over-grant",
+                    ticket="PROJ-9",
+                    sprint="S-1",
+                    provider="openai",
+                    model="m",
+                    role="implementer",
                 )
 
     def test_incident_breakers_are_active_and_config_can_only_tighten(self):
@@ -1193,12 +1466,21 @@ self_check:
         self.assertEqual(legacy["max_reviewer_runs_per_ticket"], 6)
         self.assertEqual(legacy["pause_usd_per_ticket"], api_agent.Decimal("20"))
         self.assertEqual(legacy["provider_read_timeout_seconds"], 900)
-        raised = api_agent.budgets_from_config({"llm": {"budgets": {
-            "max_usd_per_run": 999, "max_usd_per_ticket": 999,
-            "max_usd_per_sprint": 9999, "pause_usd_per_ticket": 998,
-            "warn_usd_per_ticket": 10, "max_model_runs_per_ticket": 999,
-            "max_reviewer_runs_per_ticket": 999,
-        }}})
+        raised = api_agent.budgets_from_config(
+            {
+                "llm": {
+                    "budgets": {
+                        "max_usd_per_run": 999,
+                        "max_usd_per_ticket": 999,
+                        "max_usd_per_sprint": 9999,
+                        "pause_usd_per_ticket": 998,
+                        "warn_usd_per_ticket": 10,
+                        "max_model_runs_per_ticket": 999,
+                        "max_reviewer_runs_per_ticket": 999,
+                    }
+                }
+            }
+        )
         self.assertEqual(raised["max_usd_per_ticket"], api_agent.Decimal("30"))
         self.assertEqual(raised["pause_usd_per_ticket"], api_agent.Decimal("20"))
         self.assertEqual(raised["max_model_runs_per_ticket"], 12)
@@ -1223,55 +1505,91 @@ self_check:
     def test_free_form_accounting_scopes_fail_closed(self):
         with self.assertRaisesRegex(api_agent.AgentError, "canonical Jira key"):
             api_agent.normalize_ticket_scope("PROJ-1/../2")
-        with self.assertRaisesRegex(api_agent.AgentError, "sprint must be a canonical id"):
+        with self.assertRaisesRegex(
+            api_agent.AgentError, "sprint must be a canonical id"
+        ):
             api_agent.normalize_sprint_scope("Sprint 1")
 
     def test_alternate_config_path_is_rejected(self):
         self.config()
         alternate = self.root / "alternate.yaml"
         alternate.write_text("llm: {}\n", encoding="utf-8")
-        with self.assertRaisesRegex(api_agent.AgentError, "alternate orchestration config"):
+        with self.assertRaisesRegex(
+            api_agent.AgentError, "alternate orchestration config"
+        ):
             api_agent.ApiAgent(
-                root=self.root, config_path=alternate, role="implementer",
-                ticket="PROJ-1", sprint="S-1", run_id="alternate",
+                root=self.root,
+                config_path=alternate,
+                role="implementer",
+                ticket="PROJ-1",
+                sprint="S-1",
+                run_id="alternate",
                 transport=FakeTransport([]),
             )
 
     def test_implementer_requires_exact_controller_attempt_capability(self):
         config = self.config(extra="    implementer:\n      allowed_tools: [read_file]")
-        with self.assertRaisesRegex(api_agent.AgentError, "controller-issued attempt capability"):
+        with self.assertRaisesRegex(
+            api_agent.AgentError, "controller-issued attempt capability"
+        ):
             api_agent.ApiAgent(
-                root=self.root, config_path=config, role="implementer",
-                ticket="PROJ-1", sprint="SPRINT-1", run_id="uncap",
+                root=self.root,
+                config_path=config,
+                role="implementer",
+                ticket="PROJ-1",
+                sprint="SPRINT-1",
+                run_id="uncap",
                 transport=FakeTransport([]),
             )
         binding = self.attempt_capability(run_id="bound", ticket="PROJ-1")
         with self.assertRaisesRegex(api_agent.AgentError, "does not match"):
             api_agent.ApiAgent(
-                root=self.root, config_path=config, role="implementer",
-                ticket="PROJ-1", sprint="SPRINT-1", run_id="different",
-                transport=FakeTransport([]), **binding,
+                root=self.root,
+                config_path=config,
+                role="implementer",
+                ticket="PROJ-1",
+                sprint="SPRINT-1",
+                run_id="different",
+                transport=FakeTransport([]),
+                **binding,
             )
 
     def test_review_phase_permit_is_single_use_and_bound_to_head(self):
         token = self.phase_permit()
         head = subprocess.run(
-            ["git", "-C", str(self.root), "rev-parse", "HEAD"], check=True,
-            capture_output=True, text=True,
+            ["git", "-C", str(self.root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
         ).stdout.strip()
         with self.assertRaisesRegex(api_agent.ReviewPermitError, "does not match"):
             api_agent.consume_review_permit(
-                shared_root=self.root, ledger_dir=".orchestration/.review-ledger", pr="1",
-                token=token, role="security-reviewer", head=head, timestamp="now",
+                shared_root=self.root,
+                ledger_dir=".orchestration/.review-ledger",
+                pr="1",
+                token=token,
+                role="security-reviewer",
+                head=head,
+                timestamp="now",
             )
         api_agent.consume_review_permit(
-            shared_root=self.root, ledger_dir=".orchestration/.review-ledger", pr="1",
-            token=token, role="code-reviewer", head=head, timestamp="now",
+            shared_root=self.root,
+            ledger_dir=".orchestration/.review-ledger",
+            pr="1",
+            token=token,
+            role="code-reviewer",
+            head=head,
+            timestamp="now",
         )
         with self.assertRaisesRegex(api_agent.ReviewPermitError, "already started"):
             api_agent.consume_review_permit(
-                shared_root=self.root, ledger_dir=".orchestration/.review-ledger", pr="1",
-                token=token, role="code-reviewer", head=head, timestamp="later",
+                shared_root=self.root,
+                ledger_dir=".orchestration/.review-ledger",
+                pr="1",
+                token=token,
+                role="code-reviewer",
+                head=head,
+                timestamp="later",
             )
 
     def test_explicit_rate_limit_retries_with_same_reservation(self):
@@ -1289,7 +1607,12 @@ self_check:
         agent = self.agent(transport, run_id="retry-run")
         with mock.patch.object(api_agent.time, "sleep") as sleep:
             result = agent.run(
-                {"model": "test-model", "max_tokens": 100, "system": [], "messages": [{"role": "user", "content": "review"}]}
+                {
+                    "model": "test-model",
+                    "max_tokens": 100,
+                    "system": [],
+                    "messages": [{"role": "user", "content": "review"}],
+                }
             )
         message_calls = [call for call in transport.calls if call[1] == "messages"]
         self.assertEqual(result["status"], "completed")
@@ -1301,7 +1624,9 @@ self_check:
     def test_rate_limit_honors_provider_retry_after(self):
         transport = FakeTransport(
             [
-                api_agent.ProviderHTTPError(429, "rate limited", retry_after_seconds=17.5),
+                api_agent.ProviderHTTPError(
+                    429, "rate limited", retry_after_seconds=17.5
+                ),
                 {
                     "id": "msg_after_retry_after",
                     "stop_reason": "end_turn",
@@ -1313,7 +1638,12 @@ self_check:
         agent = self.agent(transport, run_id="retry-after-run")
         with mock.patch.object(api_agent.time, "sleep") as sleep:
             result = agent.run(
-                {"model": "test-model", "max_tokens": 100, "system": [], "messages": [{"role": "user", "content": "review"}]}
+                {
+                    "model": "test-model",
+                    "max_tokens": 100,
+                    "system": [],
+                    "messages": [{"role": "user", "content": "review"}],
+                }
             )
         self.assertEqual(result["status"], "completed")
         sleep.assert_called_once_with(17.5)
@@ -1321,20 +1651,36 @@ self_check:
 
     def test_reviewer_output_fails_closed_when_not_structured(self):
         transport = FakeTransport(
-            [{
-                "id": "msg_invalid", "stop_reason": "end_turn",
-                "usage": {"input_tokens": 100, "output_tokens": 2},
-                "content": [{"type": "text", "text": "VERDICT: PASS"}],
-            }]
+            [
+                {
+                    "id": "msg_invalid",
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 100, "output_tokens": 2},
+                    "content": [{"type": "text", "text": "VERDICT: PASS"}],
+                }
+            ]
         )
         agent = self.agent(transport, run_id="invalid-review")
         with self.assertRaisesRegex(api_agent.AgentError, "invalid structured output"):
-            agent.run({"model": "test-model", "max_tokens": 100, "system": [], "messages": [{"role": "user", "content": "review"}]})
+            agent.run(
+                {
+                    "model": "test-model",
+                    "max_tokens": 100,
+                    "system": [],
+                    "messages": [{"role": "user", "content": "review"}],
+                }
+            )
         self.assertEqual(agent.state["status"], "invalid_output")
         failed_cost = api_agent.Decimal(agent.state["cost_usd"])
         self.assertGreater(failed_cost, 0)
         retry = self.agent(self._completed_transport(), run_id="valid-review-retry")
-        result = retry.run({"model": "test-model", "max_tokens": 100, "messages": [{"role": "user", "content": "review"}]})
+        result = retry.run(
+            {
+                "model": "test-model",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "review"}],
+            }
+        )
         self.assertEqual(result["status"], "completed")
         self.assertGreater(api_agent.Decimal(result["usage"]["cost_usd"]), failed_cost)
 
@@ -1342,16 +1688,31 @@ self_check:
         transport = self._completed_transport()
         transport.responses[0]["stop_reason"] = "max_tokens"
         agent = self.agent(transport, run_id="truncated-review")
-        self.assertEqual(agent.run({"model": "test-model", "max_tokens": 100})["status"], "incomplete")
+        self.assertEqual(
+            agent.run({"model": "test-model", "max_tokens": 100})["status"],
+            "incomplete",
+        )
         self.assertTrue(self.phase_permit())
         self.assertGreater(api_agent.Decimal(agent.ledger.summary()["cost_usd"]), 0)
 
     def test_tool_exhaustion_releases_review_permit(self):
-        transport = FakeTransport([{
-            "id": "msg_tools", "stop_reason": "tool_use",
-            "usage": {"input_tokens": 10, "output_tokens": 2},
-            "content": [{"type": "tool_use", "id": "tool_1", "name": "git_status", "input": {}}],
-        }])
+        transport = FakeTransport(
+            [
+                {
+                    "id": "msg_tools",
+                    "stop_reason": "tool_use",
+                    "usage": {"input_tokens": 10, "output_tokens": 2},
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "tool_1",
+                            "name": "git_status",
+                            "input": {},
+                        }
+                    ],
+                }
+            ]
+        )
         agent = self.agent(transport)
         agent.state["tool_rounds"] = agent.budgets["max_tool_rounds"]
         with self.assertRaisesRegex(api_agent.BudgetError, "max_tool_rounds"):
@@ -1366,23 +1727,48 @@ self_check:
         self.assertTrue(self.phase_permit())
 
     def test_nonterminal_openai_response_keeps_review_fenced(self):
-        transport = FakeTransport([{
-            "id": "resp_live", "status": "in_progress",
-            "usage": {"input_tokens": 10, "output_tokens": 2}, "output": [],
-        }])
+        transport = FakeTransport(
+            [
+                {
+                    "id": "resp_live",
+                    "status": "in_progress",
+                    "usage": {"input_tokens": 10, "output_tokens": 2},
+                    "output": [],
+                }
+            ]
+        )
         agent = self.agent(transport, provider="openai")
-        self.assertEqual(agent.run({"model": "test-model", "max_output_tokens": 100})["status"], "needs_reconcile")
+        self.assertEqual(
+            agent.run({"model": "test-model", "max_output_tokens": 100})["status"],
+            "needs_reconcile",
+        )
         with self.assertRaises(subprocess.CalledProcessError):
             self.phase_permit()
 
     def test_token_counter_failure_after_tool_turn_allows_review_retry(self):
-        transport = FakeTransport([{
-            "id": "msg_tools", "stop_reason": "tool_use",
-            "usage": {"input_tokens": 10, "output_tokens": 2},
-            "content": [{"type": "tool_use", "id": "tool_1", "name": "git_status", "input": {}}],
-        }])
+        transport = FakeTransport(
+            [
+                {
+                    "id": "msg_tools",
+                    "stop_reason": "tool_use",
+                    "usage": {"input_tokens": 10, "output_tokens": 2},
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "tool_1",
+                            "name": "git_status",
+                            "input": {},
+                        }
+                    ],
+                }
+            ]
+        )
         agent = self.agent(transport)
-        with mock.patch.object(agent, "_count", side_effect=[10, api_agent.AgentError("counter unavailable")]):
+        with mock.patch.object(
+            agent,
+            "_count",
+            side_effect=[10, api_agent.AgentError("counter unavailable")],
+        ):
             with self.assertRaisesRegex(api_agent.AgentError, "counter unavailable"):
                 agent.run({"model": "test-model", "max_tokens": 100})
         self.assertTrue(self.phase_permit())
@@ -1393,8 +1779,15 @@ self_check:
         limits = dict(api_agent.DEFAULT_BUDGETS)
         limits["max_reviewer_runs_per_ticket"] = 1
         limits["max_model_runs_per_ticket"] = 3
-        common = dict(projected=api_agent.Decimal(".01"), limits=limits,
-                      ticket="PROJ-1", sprint="1", provider="anthropic", model="m", role="code-reviewer")
+        common = dict(
+            projected=api_agent.Decimal(".01"),
+            limits=limits,
+            ticket="PROJ-1",
+            sprint="1",
+            provider="anthropic",
+            model="m",
+            role="code-reviewer",
+        )
         for run in ("rejected-1", "rejected-2"):
             reservation = ledger.reserve(run_id=run, **common)
             ledger.release(reservation, run, "known rejection")
@@ -1405,44 +1798,103 @@ self_check:
     def test_rejected_final_request_does_not_erase_accepted_review_work(self):
         ledger = api_agent.UsageLedger(self.root)
         limits = dict(api_agent.DEFAULT_BUDGETS, max_reviewer_runs_per_ticket=1)
-        common = dict(projected=api_agent.Decimal(".01"), limits=limits,
-                      ticket="PROJ-1", sprint="1", provider="anthropic", model="m", role="code-reviewer")
+        common = dict(
+            projected=api_agent.Decimal(".01"),
+            limits=limits,
+            ticket="PROJ-1",
+            sprint="1",
+            provider="anthropic",
+            model="m",
+            role="code-reviewer",
+        )
         reservation = ledger.reserve(run_id="partial", **common)
-        ledger.settle(reservation, run_id="partial", ticket="PROJ-1", sprint="1", provider="anthropic",
-                      model="m", response_id="msg_partial", usage={}, cost=api_agent.Decimal(".005"), role="code-reviewer")
+        ledger.settle(
+            reservation,
+            run_id="partial",
+            ticket="PROJ-1",
+            sprint="1",
+            provider="anthropic",
+            model="m",
+            response_id="msg_partial",
+            usage={},
+            cost=api_agent.Decimal(".005"),
+            role="code-reviewer",
+        )
         rejected = ledger.reserve(run_id="partial", **common)
         ledger.release(rejected, "partial", "known rejection")
-        with self.assertRaisesRegex(api_agent.BudgetError, "max_reviewer_runs_per_ticket"):
+        with self.assertRaisesRegex(
+            api_agent.BudgetError, "max_reviewer_runs_per_ticket"
+        ):
             ledger.reserve(run_id="replacement", **common)
 
     def test_sprint_reservation_pressure_is_not_a_ticket_pause(self):
         ledger = api_agent.UsageLedger(self.root)
-        limits = dict(api_agent.DEFAULT_BUDGETS, max_usd_per_sprint=api_agent.Decimal("1"))
+        limits = dict(
+            api_agent.DEFAULT_BUDGETS, max_usd_per_sprint=api_agent.Decimal("1")
+        )
         common = dict(limits=limits, sprint="1", provider="anthropic", model="m")
-        reservation = ledger.reserve(projected=api_agent.Decimal(".8"), run_id="a", ticket="PROJ-1", **common)
+        reservation = ledger.reserve(
+            projected=api_agent.Decimal(".8"), run_id="a", ticket="PROJ-1", **common
+        )
         with self.assertRaisesRegex(api_agent.BudgetError, "max_usd_per_sprint"):
-            ledger.reserve(projected=api_agent.Decimal(".3"), run_id="b", ticket="PROJ-2", **common)
+            ledger.reserve(
+                projected=api_agent.Decimal(".3"), run_id="b", ticket="PROJ-2", **common
+            )
         ledger.release(reservation, "a", "known rejection")
         # Historical v1.0.1 pressure events must also stop latching ticket pauses.
-        ledger.append({"kind": "ticket_budget_pause", "ticket": "PROJ-2", "reason": "max_usd_per_sprint"})
-        ledger.reserve(projected=api_agent.Decimal(".3"), run_id="b-retry", ticket="PROJ-2", **common)
+        ledger.append(
+            {
+                "kind": "ticket_budget_pause",
+                "ticket": "PROJ-2",
+                "reason": "max_usd_per_sprint",
+            }
+        )
+        ledger.reserve(
+            projected=api_agent.Decimal(".3"),
+            run_id="b-retry",
+            ticket="PROJ-2",
+            **common,
+        )
 
     def test_settled_sprint_exhaustion_still_blocks_other_tickets(self):
         ledger = api_agent.UsageLedger(self.root)
-        limits = dict(api_agent.DEFAULT_BUDGETS, max_usd_per_sprint=api_agent.Decimal("1"))
+        limits = dict(
+            api_agent.DEFAULT_BUDGETS, max_usd_per_sprint=api_agent.Decimal("1")
+        )
         common = dict(limits=limits, sprint="1", provider="anthropic", model="m")
-        reservation = ledger.reserve(projected=api_agent.Decimal("1"), run_id="a", ticket="PROJ-1", **common)
-        ledger.settle(reservation, run_id="a", ticket="PROJ-1", sprint="1", provider="anthropic",
-                      model="m", response_id="msg_a", usage={}, cost=api_agent.Decimal("1"))
+        reservation = ledger.reserve(
+            projected=api_agent.Decimal("1"), run_id="a", ticket="PROJ-1", **common
+        )
+        ledger.settle(
+            reservation,
+            run_id="a",
+            ticket="PROJ-1",
+            sprint="1",
+            provider="anthropic",
+            model="m",
+            response_id="msg_a",
+            usage={},
+            cost=api_agent.Decimal("1"),
+        )
         with self.assertRaisesRegex(api_agent.BudgetError, "max_usd_per_sprint"):
-            ledger.reserve(projected=api_agent.Decimal(".01"), run_id="b", ticket="PROJ-2", **common)
+            ledger.reserve(
+                projected=api_agent.Decimal(".01"),
+                run_id="b",
+                ticket="PROJ-2",
+                **common,
+            )
 
     def test_ambiguous_submission_keeps_reservation_for_reconciliation(self):
         transport = FakeTransport([api_agent.ProviderAmbiguous("timeout")])
         agent = self.agent(transport, run_id="ambiguous-run")
         with self.assertRaises(api_agent.ProviderAmbiguous):
             agent.run(
-                {"model": "test-model", "max_tokens": 100, "system": [], "messages": [{"role": "user", "content": "review"}]}
+                {
+                    "model": "test-model",
+                    "max_tokens": 100,
+                    "system": [],
+                    "messages": [{"role": "user", "content": "review"}],
+                }
             )
         self.assertEqual(agent.state["status"], "needs_reconcile")
         self.assertEqual(len(agent.ledger.summary()["open_reservations"]), 1)
@@ -1468,8 +1920,64 @@ self_check:
         self.assertEqual(reconciled["status"], "reconciled_not_found")
         self.assertEqual(reconciled["usage"]["open_reservations"], [])
 
+    def test_bulk_reservation_reconciliation_requires_and_preserves_evidence(self):
+        ledger = api_agent.UsageLedger(self.root)
+        run_id = "historical-timeout"
+        reservation = ledger.reserve(
+            projected=api_agent.Decimal(".10"),
+            limits=dict(api_agent.DEFAULT_BUDGETS),
+            run_id=run_id,
+            ticket="PROJ-1",
+            sprint="1",
+            provider="anthropic",
+            model="test-model",
+            role="implementer",
+        )
+        state_path = self.root / ".orchestration" / ".llm-runs" / f"{run_id}.json"
+        state_path.parent.mkdir(parents=True)
+        state_path.write_text(
+            json.dumps(
+                {
+                    "run_id": run_id,
+                    "status": "needs_reconcile",
+                    "pending_reservation": reservation,
+                    "pending_request": {"request": "redacted"},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        plan = api_agent.reservation_migration_plan(self.root)
+        self.assertEqual(plan["entries"][0]["reservation_id"], reservation)
+        self.assertEqual(plan["entries"][0]["evidence"], "")
+
+        manifest_path = self.root / ".orchestration" / "reservation-migration.json"
+        manifest_path.write_text(json.dumps(plan), encoding="utf-8")
+        args = type("Args", (), {"manifest": str(manifest_path), "apply": False})()
+        with self.assertRaisesRegex(api_agent.AgentError, "requires a valid run"):
+            api_agent.reconcile_reservation_manifest(args, self.root)
+
+        plan["entries"][0]["evidence"] = (
+            "Anthropic dashboard search on 2026-09-14 found no request or usage."
+        )
+        manifest_path.write_text(json.dumps(plan), encoding="utf-8")
+        args.apply = True
+        result = api_agent.reconcile_reservation_manifest(args, self.root)
+        self.assertEqual(result["applied_runs"], [run_id])
+        self.assertEqual(result["usage"]["open_reservations"], [])
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["status"], "reconciled_not_found")
+        self.assertIn("Anthropic dashboard", state["reconciliation_evidence"])
+
+        # Reapplying the exact audited manifest is deliberately idempotent.
+        repeated = api_agent.reconcile_reservation_manifest(args, self.root)
+        self.assertEqual(repeated["applied_runs"], [run_id])
+        self.assertEqual(repeated["usage"]["open_reservations"], [])
+
     def test_reviewer_cannot_add_write_tool(self):
-        config = self.config(extra="    code-reviewer:\n      allowed_tools: [read_file, apply_patch]")
+        config = self.config(
+            extra="    code-reviewer:\n      allowed_tools: [read_file, apply_patch]"
+        )
         with self.assertRaisesRegex(api_agent.AgentError, "may not receive"):
             api_agent.ApiAgent(
                 root=self.root,
@@ -1499,7 +2007,9 @@ self_check:
 
     def test_missing_price_fails_closed(self):
         config = self.config()
-        text = config.read_text(encoding="utf-8").replace("    test-model:\n", "    another-model:\n")
+        text = config.read_text(encoding="utf-8").replace(
+            "    test-model:\n", "    another-model:\n"
+        )
         config.write_text(text, encoding="utf-8")
         with self.assertRaisesRegex(api_agent.AgentError, "pricing.test-model"):
             api_agent.ApiAgent(
@@ -1514,12 +2024,23 @@ self_check:
 
     def test_response_without_usage_remains_reserved(self):
         transport = FakeTransport(
-            [{"id": "msg_no_usage", "stop_reason": "end_turn", "content": [{"type": "text", "text": "done"}]}]
+            [
+                {
+                    "id": "msg_no_usage",
+                    "stop_reason": "end_turn",
+                    "content": [{"type": "text", "text": "done"}],
+                }
+            ]
         )
         agent = self.agent(transport, run_id="missing-usage")
         with self.assertRaises(api_agent.ProviderAmbiguous):
             agent.run(
-                {"model": "test-model", "max_tokens": 100, "system": [], "messages": [{"role": "user", "content": "review"}]}
+                {
+                    "model": "test-model",
+                    "max_tokens": 100,
+                    "system": [],
+                    "messages": [{"role": "user", "content": "review"}],
+                }
             )
         self.assertEqual(agent.state["status"], "needs_reconcile")
         self.assertEqual(len(agent.ledger.summary()["open_reservations"]), 1)

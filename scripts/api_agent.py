@@ -30,8 +30,15 @@ from pathlib import Path
 from typing import Any
 
 import context_pipeline
-from attempt_capability import AttemptCapabilityError, validate as validate_attempt_capability
-from operator_authority import AuthorityError, budget_ceiling as authorized_budget_ceiling, restart_grant as authorized_restart_grant
+from attempt_capability import (
+    AttemptCapabilityError,
+    validate as validate_attempt_capability,
+)
+from operator_authority import (
+    AuthorityError,
+    budget_ceiling as authorized_budget_ceiling,
+    restart_grant as authorized_restart_grant,
+)
 from review_permit import (
     ReviewPermitError,
     cancel_started as cancel_review_permit,
@@ -47,7 +54,14 @@ from runtime_state import (
 
 
 MILLION = Decimal("1000000")
-TOOL_NAMES = {"read_file", "search", "git_diff", "git_status", "run_check", "apply_patch"}
+TOOL_NAMES = {
+    "read_file",
+    "search",
+    "git_diff",
+    "git_status",
+    "run_check",
+    "apply_patch",
+}
 READ_TOOLS = {"read_file", "search", "git_diff", "git_status", "run_check"}
 SCOPING_TOOLS = {"read_file", "search", "git_status"}
 OPENAI_CACHE_REQUEST_FIELDS = {
@@ -91,13 +105,18 @@ PHASE_BUDGETS = {
 def spending_phase(role: str | None) -> str:
     # Unknown/legacy roles consume implementation capacity rather than escaping
     # phase accounting. Phase selection is never accepted from model output.
-    return {"ticket-scoper": "design", "design-reviewer": "design",
-            "code-reviewer": "code_review", "security-reviewer": "security_review"}.get(
-                role, "implementation")
+    return {
+        "ticket-scoper": "design",
+        "design-reviewer": "design",
+        "code-reviewer": "code_review",
+        "security-reviewer": "security_review",
+    }.get(role, "implementation")
+
 
 # Admission pressure is recomputed; only ticket-local dollar incidents latch.
 TRANSIENT_PAUSE_REASONS = {
-    "max_model_runs_per_ticket", "max_reviewer_runs_per_ticket",
+    "max_model_runs_per_ticket",
+    "max_reviewer_runs_per_ticket",
     "max_usd_per_sprint",
 }
 DEFAULT_PROVIDER_READ_TIMEOUT_SECONDS = 900
@@ -153,7 +172,9 @@ class ProviderAdmissionError(AgentError):
 
 
 class ProviderHTTPError(AgentError):
-    def __init__(self, status: int, body: str, retry_after_seconds: float | None = None):
+    def __init__(
+        self, status: int, body: str, retry_after_seconds: float | None = None
+    ):
         super().__init__(f"provider returned HTTP {status}: {body[:500]}")
         self.status = status
         self.body = body
@@ -187,12 +208,16 @@ def load_orchestration_env(config_path: Path) -> list[str]:
             try:
                 value = json.loads(value)
             except json.JSONDecodeError as exc:
-                raise AgentError(f"invalid quoted value in {env_path} line {line_no}") from exc
+                raise AgentError(
+                    f"invalid quoted value in {env_path} line {line_no}"
+                ) from exc
             if not isinstance(value, str):
                 raise AgentError(f"invalid quoted value in {env_path} line {line_no}")
         elif value.startswith("'"):
             if len(value) < 2 or not value.endswith("'"):
-                raise AgentError(f"unterminated quoted value in {env_path} line {line_no}")
+                raise AgentError(
+                    f"unterminated quoted value in {env_path} line {line_no}"
+                )
             value = value[1:-1]
         else:
             value = re.split(r"\s+#", value, maxsplit=1)[0].rstrip()
@@ -379,7 +404,9 @@ class Pricing:
         missing = [key for key in required if key not in entry]
         if missing:
             raise AgentError(f"llm.pricing.{model} is missing: {', '.join(missing)}")
-        rates = [decimal_value(entry[key], f"llm.pricing.{model}.{key}") for key in required]
+        rates = [
+            decimal_value(entry[key], f"llm.pricing.{model}.{key}") for key in required
+        ]
         threshold = int_value(
             entry.get("long_context_threshold_tokens", 10**12),
             f"llm.pricing.{model}.long_context_threshold_tokens",
@@ -397,7 +424,11 @@ class Pricing:
         return cls(*rates, threshold, input_multiplier, output_multiplier)
 
     def actual_cost(self, usage: dict[str, int]) -> Decimal:
-        input_total = usage["input_tokens"] + usage["cache_write_tokens"] + usage["cache_read_tokens"]
+        input_total = (
+            usage["input_tokens"]
+            + usage["cache_write_tokens"]
+            + usage["cache_read_tokens"]
+        )
         input_multiplier = (
             self.long_context_input_multiplier
             if input_total > self.long_context_threshold_tokens
@@ -408,11 +439,15 @@ class Pricing:
             if input_total > self.long_context_threshold_tokens
             else Decimal("1")
         )
-        total = input_multiplier * (
-            Decimal(usage["input_tokens"]) * self.input_per_mtok
-            + Decimal(usage["cache_write_tokens"]) * self.cache_write_per_mtok
-            + Decimal(usage["cache_read_tokens"]) * self.cache_read_per_mtok
-        ) + output_multiplier * Decimal(usage["output_tokens"]) * self.output_per_mtok
+        total = (
+            input_multiplier
+            * (
+                Decimal(usage["input_tokens"]) * self.input_per_mtok
+                + Decimal(usage["cache_write_tokens"]) * self.cache_write_per_mtok
+                + Decimal(usage["cache_read_tokens"]) * self.cache_read_per_mtok
+            )
+            + output_multiplier * Decimal(usage["output_tokens"]) * self.output_per_mtok
+        )
         return total / MILLION
 
     def worst_case(self, input_tokens: int, output_tokens: int) -> Decimal:
@@ -441,8 +476,11 @@ def budgets_from_config(config: dict[str, Any]) -> dict[str, Any]:
         raise AgentError("llm.budgets must be a map")
     raw = raw or {}
     for key in (
-        "max_usd_per_run", "max_usd_per_ticket", "max_usd_per_sprint",
-        "warn_usd_per_ticket", "pause_usd_per_ticket",
+        "max_usd_per_run",
+        "max_usd_per_ticket",
+        "max_usd_per_sprint",
+        "warn_usd_per_ticket",
+        "pause_usd_per_ticket",
         *(key for key, _ in PHASE_BUDGETS.values()),
     ):
         if key in raw:
@@ -462,10 +500,18 @@ def budgets_from_config(config: dict[str, Any]) -> dict[str, Any]:
         "max_reviewer_runs_per_ticket",
     ):
         if key in raw:
-            minimum = 0 if key in {
-                "max_pre_ack_retries", "max_rate_limit_retries", "retry_backoff_seconds",
-                "max_model_runs_per_ticket", "max_reviewer_runs_per_ticket",
-            } else 1
+            minimum = (
+                0
+                if key
+                in {
+                    "max_pre_ack_retries",
+                    "max_rate_limit_retries",
+                    "retry_backoff_seconds",
+                    "max_model_runs_per_ticket",
+                    "max_reviewer_runs_per_ticket",
+                }
+                else 1
+            )
             result[key] = int_value(raw[key], f"llm.budgets.{key}", minimum=minimum)
     for key, _ in PHASE_BUDGETS.values():
         if result[key] <= 0:
@@ -508,7 +554,9 @@ def normalize_sprint_scope(value: str | None) -> str | None:
         return None
     normalized = value.strip()
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", normalized):
-        raise AgentError("sprint must be a canonical id containing only letters, digits, dot, underscore, or hyphen")
+        raise AgentError(
+            "sprint must be a canonical id containing only letters, digits, dot, underscore, or hyphen"
+        )
     return normalized
 
 
@@ -565,13 +613,18 @@ class UsageLedger:
         """
         _, pending = UsageLedger._totals(events)
         runs: dict[str, dict[str, Any]] = {}
-        for event in [*pending.values(), *(e for e in events if e.get("kind") == "usage")]:
+        for event in [
+            *pending.values(),
+            *(e for e in events if e.get("kind") == "usage"),
+        ]:
             if event.get("run_id"):
                 runs[str(event.get("logical_review_id") or event["run_id"])] = event
         return runs
 
     @staticmethod
-    def _totals(events: list[dict[str, Any]]) -> tuple[Decimal, dict[str, dict[str, Any]]]:
+    def _totals(
+        events: list[dict[str, Any]],
+    ) -> tuple[Decimal, dict[str, dict[str, Any]]]:
         spent = Decimal("0")
         open_reservations: dict[str, dict[str, Any]] = {}
         for event in events:
@@ -590,32 +643,61 @@ class UsageLedger:
         return value is not None and str(event.get(field) or "") == value
 
     @staticmethod
-    def phase_totals(events: list[dict[str, Any]], ticket: str) -> dict[str, dict[str, Decimal]]:
-        totals = {phase: {"spent_usd": Decimal("0"), "reserved_usd": Decimal("0")}
-                  for phase in PHASE_BUDGETS}
+    def phase_totals(
+        events: list[dict[str, Any]], ticket: str
+    ) -> dict[str, dict[str, Decimal]]:
+        totals = {
+            phase: {"spent_usd": Decimal("0"), "reserved_usd": Decimal("0")}
+            for phase in PHASE_BUDGETS
+        }
         _, pending = UsageLedger._totals(events)
-        reservations = {e.get("reservation_id"): e for e in events if e.get("kind") == "reservation"}
+        reservations = {
+            e.get("reservation_id"): e for e in events if e.get("kind") == "reservation"
+        }
         for event in events:
-            if event.get("kind") == "usage" and UsageLedger._matches(event, "ticket", ticket):
-                role = reservations.get(event.get("reservation_id"), {}).get("role") or event.get("role")
+            if event.get("kind") == "usage" and UsageLedger._matches(
+                event, "ticket", ticket
+            ):
+                role = reservations.get(event.get("reservation_id"), {}).get(
+                    "role"
+                ) or event.get("role")
                 totals[spending_phase(role)]["spent_usd"] += decimal_value(
-                    event.get("cost_usd", 0), "phase cost")
+                    event.get("cost_usd", 0), "phase cost"
+                )
         for event in pending.values():
             if UsageLedger._matches(event, "ticket", ticket):
-                totals[spending_phase(event.get("role"))]["reserved_usd"] += decimal_value(
-                    event.get("projected_cost_usd", 0), "phase reservation")
+                totals[spending_phase(event.get("role"))]["reserved_usd"] += (
+                    decimal_value(
+                        event.get("projected_cost_usd", 0), "phase reservation"
+                    )
+                )
         return totals
 
     @staticmethod
     def phase_limits(events, ticket, limits):
-        result = {phase: min(decimal_value(limits.get(key, maximum), key), maximum)
-                  for phase, (key, maximum) in PHASE_BUDGETS.items()}
-        transfer = next((e for e in events if e.get("kind") == "design_budget_transferred"
-                         and e.get("ticket") == ticket), None)
+        result = {
+            phase: min(decimal_value(limits.get(key, maximum), key), maximum)
+            for phase, (key, maximum) in PHASE_BUDGETS.items()
+        }
+        transfer = next(
+            (
+                e
+                for e in events
+                if e.get("kind") == "design_budget_transferred"
+                and e.get("ticket") == ticket
+            ),
+            None,
+        )
         if transfer:
             # Reconfiguration may tighten envelopes; never manufacture capacity.
-            amount = min(decimal_value(transfer["amount_usd"], "transfer"),
-                         max(Decimal("0"), result["design"] - decimal_value(transfer["design_spent_usd"], "spent")))
+            amount = min(
+                decimal_value(transfer["amount_usd"], "transfer"),
+                max(
+                    Decimal("0"),
+                    result["design"]
+                    - decimal_value(transfer["design_spent_usd"], "spent"),
+                ),
+            )
             result["design"] -= amount
             result["implementation"] += amount
         return result
@@ -627,7 +709,11 @@ class UsageLedger:
             os.chmod(self.lock_path, 0o600)
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             events = self._events()
-            if any(e.get("kind") == "design_budget_transferred" and e.get("ticket") == ticket for e in events):
+            if any(
+                e.get("kind") == "design_budget_transferred"
+                and e.get("ticket") == ticket
+                for e in events
+            ):
                 return False
             totals = self.phase_totals(events, ticket)["design"]
             if totals["reserved_usd"]:
@@ -636,9 +722,16 @@ class UsageLedger:
             amount = max(Decimal("0"), maximum - totals["spent_usd"])
             if amount <= 0:
                 return False
-            self._append_locked(dict(kind="design_budget_transferred", timestamp=utc_now(),
-                ticket=ticket, amount_usd=str(amount), design_spent_usd=str(totals["spent_usd"]),
-                receipt=receipt))
+            self._append_locked(
+                dict(
+                    kind="design_budget_transferred",
+                    timestamp=utc_now(),
+                    ticket=ticket,
+                    amount_usd=str(amount),
+                    design_spent_usd=str(totals["spent_usd"]),
+                    receipt=receipt,
+                )
+            )
             return True
 
     def reserve(
@@ -661,7 +754,9 @@ class UsageLedger:
             events = self._events()
             authority_ceiling: Decimal | None = None
             try:
-                restart = authorized_restart_grant(self.root, ticket) if ticket else None
+                restart = (
+                    authorized_restart_grant(self.root, ticket) if ticket else None
+                )
             except AuthorityError as exc:
                 raise BudgetError(str(exc)) from exc
             allowances = restart["allowances"] if restart else {}
@@ -669,7 +764,10 @@ class UsageLedger:
                 try:
                     authority_ceiling = authorized_budget_ceiling(self.root, ticket)
                     if restart:
-                        authority_ceiling = max(authority_ceiling or Decimal("0"), Decimal(allowances["ticket_usd"]))
+                        authority_ceiling = max(
+                            authority_ceiling or Decimal("0"),
+                            Decimal(allowances["ticket_usd"]),
+                        )
                 except AuthorityError as exc:
                     raise BudgetError(str(exc)) from exc
             if ticket:
@@ -682,20 +780,22 @@ class UsageLedger:
                 ]
                 last_cost_pause = max(cost_pause_indexes, default=-1)
                 last_reset = max(
-                    (index for index, event in enumerate(events)
-                     if event.get("kind") == "ticket_budget_reset"
-                     and self._matches(event, "ticket", ticket)),
+                    (
+                        index
+                        for index, event in enumerate(events)
+                        if event.get("kind") == "ticket_budget_reset"
+                        and self._matches(event, "ticket", ticket)
+                    ),
                     default=-1,
                 )
                 # Run-count incidents are recomputed below from the current,
                 # phase-aware counters. They must not leave a stale dollar
                 # pause behind after a reviewed plugin upgrade changes the
                 # classification. Genuine cost pauses remain capability-gated.
-                if (
-                    last_cost_pause > last_reset
-                    and authority_ceiling is None
-                ):
-                    raise BudgetError(f"ticket_budget_pause is active for {ticket}; operator reset required")
+                if last_cost_pause > last_reset and authority_ceiling is None:
+                    raise BudgetError(
+                        f"ticket_budget_pause is active for {ticket}; operator reset required"
+                    )
                 # Preserve the independent total execution-attempt breaker:
                 # zero-cost failures must not enable an unbounded retry loop.
                 run_ids = {
@@ -707,31 +807,52 @@ class UsageLedger:
                     and event.get("role") != "design-reviewer"
                 }
                 is_new_run = run_id not in run_ids
-                max_runs = max(limits["max_model_runs_per_ticket"], allowances.get("model_runs", 0))
-                if role != "design-reviewer" and is_new_run and max_runs and len(run_ids) >= max_runs:
-                    self._append_locked({
-                        "kind": "ticket_budget_pause", "timestamp": utc_now(), "ticket": ticket,
-                        "run_id": run_id, "reason": "max_model_runs_per_ticket",
-                    })
+                max_runs = max(
+                    limits["max_model_runs_per_ticket"], allowances.get("model_runs", 0)
+                )
+                if (
+                    role != "design-reviewer"
+                    and is_new_run
+                    and max_runs
+                    and len(run_ids) >= max_runs
+                ):
+                    self._append_locked(
+                        {
+                            "kind": "ticket_budget_pause",
+                            "timestamp": utc_now(),
+                            "ticket": ticket,
+                            "run_id": run_id,
+                            "reason": "max_model_runs_per_ticket",
+                        }
+                    )
                     raise BudgetError(
                         f"max_model_runs_per_ticket={max_runs} reached for {ticket}; human action required"
                     )
                 reviewer_run_ids = {
-                    run for run, event in self.counted_runs(events).items()
+                    run
+                    for run, event in self.counted_runs(events).items()
                     if self._matches(event, "ticket", ticket)
                     and event.get("role") in POST_IMPLEMENTATION_REVIEWER_ROLES
                 }
-                max_reviewers = max(limits["max_reviewer_runs_per_ticket"], allowances.get("review_runs", 0))
+                max_reviewers = max(
+                    limits["max_reviewer_runs_per_ticket"],
+                    allowances.get("review_runs", 0),
+                )
                 if (
                     (logical_review_id or run_id) not in reviewer_run_ids
                     and role in POST_IMPLEMENTATION_REVIEWER_ROLES
                     and max_reviewers
                     and len(reviewer_run_ids) >= max_reviewers
                 ):
-                    self._append_locked({
-                        "kind": "ticket_budget_pause", "timestamp": utc_now(), "ticket": ticket,
-                        "run_id": run_id, "reason": "max_reviewer_runs_per_ticket",
-                    })
+                    self._append_locked(
+                        {
+                            "kind": "ticket_budget_pause",
+                            "timestamp": utc_now(),
+                            "ticket": ticket,
+                            "run_id": run_id,
+                            "reason": "max_reviewer_runs_per_ticket",
+                        }
+                    )
                     raise BudgetError(
                         f"max_reviewer_runs_per_ticket={max_reviewers} post-implementation "
                         f"review runs reached for {ticket}; "
@@ -739,16 +860,34 @@ class UsageLedger:
                     )
             # Operational retries share a review round, but cannot loop forever.
             if logical_review_id:
-                attempts = {e.get("run_id") for e in events
-                            if e.get("kind") == "reservation"
-                            and e.get("logical_review_id") == logical_review_id}
+                attempts = {
+                    e.get("run_id")
+                    for e in events
+                    if e.get("kind") == "reservation"
+                    and e.get("logical_review_id") == logical_review_id
+                }
                 if run_id not in attempts and len(attempts) >= 3:
                     raise BudgetError("review operational retry ceiling reached")
-                phase_rounds = {identity for identity, event in self.counted_runs(events).items()
-                                if self._matches(event, "ticket", ticket) and event.get("role") == role}
-                if (role in POST_IMPLEMENTATION_REVIEWER_ROLES
-                        and logical_review_id not in phase_rounds
-                        and len(phase_rounds) >= max(3, allowances.get("security_rounds" if role == "security-reviewer" else "code_rounds", 0))):
+                phase_rounds = {
+                    identity
+                    for identity, event in self.counted_runs(events).items()
+                    if self._matches(event, "ticket", ticket)
+                    and event.get("role") == role
+                }
+                if (
+                    role in POST_IMPLEMENTATION_REVIEWER_ROLES
+                    and logical_review_id not in phase_rounds
+                    and len(phase_rounds)
+                    >= max(
+                        3,
+                        allowances.get(
+                            "security_rounds"
+                            if role == "security-reviewer"
+                            else "code_rounds",
+                            0,
+                        ),
+                    )
+                ):
                     raise BudgetError(f"{role} logical review round ceiling reached")
             scopes = [
                 ("run_id", run_id, "max_usd_per_run"),
@@ -765,14 +904,17 @@ class UsageLedger:
                     (
                         decimal_value(event.get("cost_usd", 0), "ledger cost")
                         for event in events
-                        if event.get("kind") == "usage" and self._matches(event, field, value)
+                        if event.get("kind") == "usage"
+                        and self._matches(event, field, value)
                     ),
                     Decimal("0"),
                 )
                 _, open_items = self._totals(events)
                 reserved = sum(
                     (
-                        decimal_value(event.get("projected_cost_usd", 0), "ledger reservation")
+                        decimal_value(
+                            event.get("projected_cost_usd", 0), "ledger reservation"
+                        )
                         for event in open_items.values()
                         if self._matches(event, field, value)
                     ),
@@ -780,11 +922,16 @@ class UsageLedger:
                 )
                 if used + reserved + projected > limit:
                     if ticket and field == "ticket":
-                        self._append_locked({
-                            "kind": "ticket_budget_pause", "timestamp": utc_now(), "ticket": ticket,
-                            "run_id": run_id, "reason": limit_key,
-                            "projected_total_usd": str(used + reserved + projected),
-                        })
+                        self._append_locked(
+                            {
+                                "kind": "ticket_budget_pause",
+                                "timestamp": utc_now(),
+                                "ticket": ticket,
+                                "run_id": run_id,
+                                "reason": limit_key,
+                                "projected_total_usd": str(used + reserved + projected),
+                            }
+                        )
                     raise BudgetError(
                         f"{limit_key} would be exceeded: spent ${used:.6f}, reserved "
                         f"${reserved:.6f}, next request up to ${projected:.6f}, limit ${limit:.6f}"
@@ -792,7 +939,10 @@ class UsageLedger:
             if ticket:
                 phase = spending_phase(role)
                 phase_key, default_limit = PHASE_BUDGETS[phase]
-                limit = max(self.phase_limits(events, ticket, limits)[phase], Decimal(allowances.get(phase + "_usd", "0")))
+                limit = max(
+                    self.phase_limits(events, ticket, limits)[phase],
+                    Decimal(allowances.get(phase + "_usd", "0")),
+                )
                 totals = self.phase_totals(events, ticket)[phase]
                 if totals["spent_usd"] + totals["reserved_usd"] + projected > limit:
                     # This is request admission pressure, not a sticky ticket
@@ -801,16 +951,26 @@ class UsageLedger:
                     raise BudgetError(
                         f"{phase_key} would be exceeded for {ticket}: spent "
                         f"${totals['spent_usd']:.6f}, reserved ${totals['reserved_usd']:.6f}, "
-                        f"next request up to ${projected:.6f}, limit ${limit:.6f}")
+                        f"next request up to ${projected:.6f}, limit ${limit:.6f}"
+                    )
                 used = sum(
-                    (decimal_value(event.get("cost_usd", 0), "ledger cost") for event in events
-                     if event.get("kind") == "usage" and self._matches(event, "ticket", ticket)),
+                    (
+                        decimal_value(event.get("cost_usd", 0), "ledger cost")
+                        for event in events
+                        if event.get("kind") == "usage"
+                        and self._matches(event, "ticket", ticket)
+                    ),
                     Decimal("0"),
                 )
                 _, open_items = self._totals(events)
                 reserved = sum(
-                    (decimal_value(event.get("projected_cost_usd", 0), "ledger reservation")
-                     for event in open_items.values() if self._matches(event, "ticket", ticket)),
+                    (
+                        decimal_value(
+                            event.get("projected_cost_usd", 0), "ledger reservation"
+                        )
+                        for event in open_items.values()
+                        if self._matches(event, "ticket", ticket)
+                    ),
                     Decimal("0"),
                 )
                 projected_total = used + reserved + projected
@@ -824,25 +984,39 @@ class UsageLedger:
                         and event.get("run_id") == run_id
                         for event in events
                     ):
-                        self._append_locked({
-                            "kind": "ticket_budget_pause", "timestamp": utc_now(),
-                            "ticket": ticket, "run_id": run_id,
-                            "projected_total_usd": str(projected_total),
-                            "pause_usd": str(pause),
-                        })
+                        self._append_locked(
+                            {
+                                "kind": "ticket_budget_pause",
+                                "timestamp": utc_now(),
+                                "ticket": ticket,
+                                "run_id": run_id,
+                                "projected_total_usd": str(projected_total),
+                                "pause_usd": str(pause),
+                            }
+                        )
                     raise BudgetError(
                         f"pause_usd_per_ticket requires operator action for {ticket}: projected total "
                         f"${projected_total:.6f}, pause ${pause:.6f}; operator policy change required"
                     )
                 warning = limits["warn_usd_per_ticket"]
-                if warning and projected_total > warning and not any(
-                    event.get("kind") == "ticket_budget_warning"
-                    and self._matches(event, "ticket", ticket) for event in events
+                if (
+                    warning
+                    and projected_total > warning
+                    and not any(
+                        event.get("kind") == "ticket_budget_warning"
+                        and self._matches(event, "ticket", ticket)
+                        for event in events
+                    )
                 ):
-                    self._append_locked({
-                        "kind": "ticket_budget_warning", "timestamp": utc_now(), "ticket": ticket,
-                        "projected_total_usd": str(projected_total), "warning_usd": str(warning),
-                    })
+                    self._append_locked(
+                        {
+                            "kind": "ticket_budget_warning",
+                            "timestamp": utc_now(),
+                            "ticket": ticket,
+                            "projected_total_usd": str(projected_total),
+                            "warning_usd": str(warning),
+                        }
+                    )
             reservation_id = "resv_" + uuid.uuid4().hex
             event = {
                 "kind": "reservation",
@@ -920,8 +1094,15 @@ class UsageLedger:
             os.chmod(self.lock_path, 0o600)
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             events = self._events()
-            reserved = next((e for e in events if e.get("kind") == "reservation"
-                             and e.get("reservation_id") == reservation_id), {})
+            reserved = next(
+                (
+                    e
+                    for e in events
+                    if e.get("kind") == "reservation"
+                    and e.get("reservation_id") == reservation_id
+                ),
+                {},
+            )
             if reserved.get("role"):
                 event["role"] = reserved["role"]
                 event["phase"] = spending_phase(reserved["role"])
@@ -952,10 +1133,13 @@ class UsageLedger:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             events = self._events()
             if any(
-                item.get("kind") == "usage" and item.get("reservation_id") == reservation_id
+                item.get("kind") == "usage"
+                and item.get("reservation_id") == reservation_id
                 for item in events
             ):
-                raise AgentError(f"reservation {reservation_id} already has recorded usage")
+                raise AgentError(
+                    f"reservation {reservation_id} already has recorded usage"
+                )
             _, open_items = self._totals(events)
             if reservation_id not in open_items:
                 return
@@ -972,9 +1156,18 @@ class UsageLedger:
     def summary(self) -> dict[str, Any]:
         events = self._events()
         spent, open_items = self._totals(events)
-        token_fields = ("input_tokens", "cache_write_tokens", "cache_read_tokens", "output_tokens")
+        token_fields = (
+            "input_tokens",
+            "cache_write_tokens",
+            "cache_read_tokens",
+            "output_tokens",
+        )
         tokens = {
-            field: sum(int(event.get(field, 0)) for event in events if event.get("kind") == "usage")
+            field: sum(
+                int(event.get(field, 0))
+                for event in events
+                if event.get("kind") == "usage"
+            )
             for field in token_fields
         }
         return {
@@ -990,12 +1183,20 @@ def anthropic_context_beta(payload):
     if "context_management" not in payload:
         return None
     context = payload["context_management"]
-    if (not isinstance(context, dict) or set(context) != {"edits"}
-            or not isinstance(context["edits"], list)
-            or any(not isinstance(edit, dict) or edit.get("type") not in {
-                "clear_tool_uses_20250919", "clear_thinking_20251015"
-            } for edit in context["edits"])):
-        raise AgentError("native gateway supports bounded context editing only; server compaction is not metered")
+    if (
+        not isinstance(context, dict)
+        or set(context) != {"edits"}
+        or not isinstance(context["edits"], list)
+        or any(
+            not isinstance(edit, dict)
+            or edit.get("type")
+            not in {"clear_tool_uses_20250919", "clear_thinking_20251015"}
+            for edit in context["edits"]
+        )
+    ):
+        raise AgentError(
+            "native gateway supports bounded context editing only; server compaction is not metered"
+        )
     return "context-management-2025-06-27"
 
 
@@ -1074,14 +1275,19 @@ class HttpTransport:
         except ClientError as exc:
             error = exc.response.get("Error") or {}
             code = str(error.get("Code") or "")
-            status = int((exc.response.get("ResponseMetadata") or {}).get("HTTPStatusCode") or 500)
+            status = int(
+                (exc.response.get("ResponseMetadata") or {}).get("HTTPStatusCode")
+                or 500
+            )
             message = str(error.get("Message") or exc)
             if code == "ThrottlingException":
                 raise ProviderHTTPError(429, message) from exc
             if code in {"ServiceUnavailableException", "ModelNotReadyException"}:
                 raise ProviderHTTPError(529, message) from exc
             if code in {"AccessDeniedException", "ResourceNotFoundException"}:
-                raise ProviderHTTPError(403 if code == "AccessDeniedException" else 404, message) from exc
+                raise ProviderHTTPError(
+                    403 if code == "AccessDeniedException" else 404, message
+                ) from exc
             if code == "ValidationException":
                 raise ProviderHTTPError(400, message) from exc
             # A server/model timeout or internal error can occur after work has
@@ -1089,8 +1295,15 @@ class HttpTransport:
             raise ProviderAmbiguous(
                 f"Bedrock submission outcome is unknown ({code or status}): {message}"
             ) from exc
-        except (ConnectTimeoutError, EndpointConnectionError, ReadTimeoutError, BotoCoreError) as exc:
-            raise ProviderAmbiguous(f"Bedrock submission outcome is unknown: {exc}") from exc
+        except (
+            ConnectTimeoutError,
+            EndpointConnectionError,
+            ReadTimeoutError,
+            BotoCoreError,
+        ) as exc:
+            raise ProviderAmbiguous(
+                f"Bedrock submission outcome is unknown: {exc}"
+            ) from exc
         if not isinstance(result, dict):
             raise ProviderAmbiguous("Bedrock returned an invalid response object")
         if path == "count_tokens":
@@ -1127,7 +1340,9 @@ class HttpTransport:
                 or session.region_name
             )
             if not region:
-                raise AgentError("AWS_REGION is required for Bedrock Mantle API execution")
+                raise AgentError(
+                    "AWS_REGION is required for Bedrock Mantle API execution"
+                )
             base = os.environ.get(
                 "BEDROCK_MANTLE_BASE_URL",
                 f"https://bedrock-mantle.{region}.api.aws/v1",
@@ -1170,7 +1385,9 @@ class HttpTransport:
         if provider == "bedrock_mantle":
             credentials = session.get_credentials()
             if credentials is None:
-                raise AgentError("AWS credentials are required for Bedrock Mantle API execution")
+                raise AgentError(
+                    "AWS credentials are required for Bedrock Mantle API execution"
+                )
             aws_request = AWSRequest(
                 method="POST",
                 url=url,
@@ -1204,11 +1421,15 @@ class HttpTransport:
                 retry_after = None
             raise ProviderHTTPError(exc.code, body, retry_after) from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            raise ProviderAmbiguous(f"provider submission outcome is unknown: {exc}") from exc
+            raise ProviderAmbiguous(
+                f"provider submission outcome is unknown: {exc}"
+            ) from exc
         try:
             value = json.loads(body)
         except json.JSONDecodeError as exc:
-            raise ProviderAmbiguous("provider returned a non-JSON success response") from exc
+            raise ProviderAmbiguous(
+                "provider returned a non-JSON success response"
+            ) from exc
         if not isinstance(value, dict):
             raise ProviderAmbiguous("provider returned an invalid response object")
         return value
@@ -1282,24 +1503,46 @@ class ToolExecutor:
                 raise AgentError("search query must contain 1-500 characters")
             raw_paths = arguments.get("paths") or ["."]
             if not isinstance(raw_paths, list) or len(raw_paths) > 20:
-                raise AgentError("search paths must be a list of at most 20 repository paths")
-            paths = [self._relative(str(path)) if str(path) != "." else "." for path in raw_paths]
-            return self._run(["rg", "-n", "--fixed-strings", "--max-count", "100", "--", query, *paths])
+                raise AgentError(
+                    "search paths must be a list of at most 20 repository paths"
+                )
+            paths = [
+                self._relative(str(path)) if str(path) != "." else "."
+                for path in raw_paths
+            ]
+            return self._run(
+                [
+                    "rg",
+                    "-n",
+                    "--fixed-strings",
+                    "--max-count",
+                    "100",
+                    "--",
+                    query,
+                    *paths,
+                ]
+            )
         if name == "git_diff":
             base = str(arguments.get("base") or "HEAD")
             if base.startswith("-") or not re.fullmatch(r"[A-Za-z0-9_./~^:+-]+", base):
                 raise AgentError("invalid git base revision")
             raw_paths = arguments.get("paths") or []
             if not isinstance(raw_paths, list) or len(raw_paths) > 20:
-                raise AgentError("diff paths must be a list of at most 20 repository paths")
+                raise AgentError(
+                    "diff paths must be a list of at most 20 repository paths"
+                )
             paths = [self._relative(str(path)) for path in raw_paths]
-            return self._run(["git", "diff", "--no-ext-diff", "--unified=80", base, "--", *paths])
+            return self._run(
+                ["git", "diff", "--no-ext-diff", "--unified=80", base, "--", *paths]
+            )
         if name == "git_status":
             return self._run(["git", "status", "--short", "--branch"])
         if name == "run_check":
             check = str(arguments.get("name") or "")
             if check not in self.checks:
-                raise AgentError(f"unknown check {check!r}; allowed: {', '.join(sorted(self.checks))}")
+                raise AgentError(
+                    f"unknown check {check!r}; allowed: {', '.join(sorted(self.checks))}"
+                )
             return self._run(["bash", "-c", self.checks[check]])
         if name == "apply_patch":
             patch = str(arguments.get("patch") or "")
@@ -1307,12 +1550,16 @@ class ToolExecutor:
                 raise AgentError("patch must contain 1-500000 characters")
             if "GIT binary patch" in patch or "Binary files " in patch:
                 raise AgentError("binary patches are not allowed")
-            for raw in re.findall(r"^(?:---|\+\+\+)\s+([^\t\n]+)", patch, flags=re.MULTILINE):
+            for raw in re.findall(
+                r"^(?:---|\+\+\+)\s+([^\t\n]+)", patch, flags=re.MULTILINE
+            ):
                 if raw == "/dev/null":
                     continue
                 candidate = raw[2:] if raw.startswith(("a/", "b/")) else raw
                 self._relative(candidate)
-            checked = self._run(["git", "apply", "--check", "--recount", "-"], stdin=patch)
+            checked = self._run(
+                ["git", "apply", "--check", "--recount", "-"], stdin=patch
+            )
             if not checked.startswith("exit=0"):
                 return checked
             return self._run(["git", "apply", "--recount", "-"], stdin=patch)
@@ -1396,7 +1643,9 @@ def tools_for_role(
     unknown = selected - TOOL_NAMES
     forbidden = selected - ceiling
     if unknown:
-        raise AgentError(f"unknown allowed_tools for {role}: {', '.join(sorted(unknown))}")
+        raise AgentError(
+            f"unknown allowed_tools for {role}: {', '.join(sorted(unknown))}"
+        )
     if forbidden:
         raise AgentError(f"role {role} may not receive: {', '.join(sorted(forbidden))}")
     result = []
@@ -1406,7 +1655,9 @@ def tools_for_role(
             # Anthropic strict tool use accepts a narrower JSON Schema subset
             # than these bounded tool specs use. The executor independently
             # enforces every path, range, collection, and size constraint.
-            result.append({"name": name, "description": description, "input_schema": schema})
+            result.append(
+                {"name": name, "description": description, "input_schema": schema}
+            )
         elif provider == "bedrock":
             result.append(
                 {
@@ -1461,7 +1712,9 @@ def normalize_usage(provider: str, response: dict[str, Any]) -> dict[str, int]:
             "cache_write_tokens": int(usage.get("cache_creation_input_tokens") or 0),
             "cache_read_tokens": int(usage.get("cache_read_input_tokens") or 0),
             "output_tokens": int(usage.get("output_tokens") or 0),
-            "reasoning_tokens": int((usage.get("output_tokens_details") or {}).get("thinking_tokens") or 0),
+            "reasoning_tokens": int(
+                (usage.get("output_tokens_details") or {}).get("thinking_tokens") or 0
+            ),
         }
     if provider == "bedrock":
         return {
@@ -1497,7 +1750,9 @@ def normalize_usage(provider: str, response: dict[str, Any]) -> dict[str, int]:
         "cache_write_tokens": cache_write,
         "cache_read_tokens": cached,
         "output_tokens": int(usage.get("output_tokens") or 0),
-        "reasoning_tokens": int((usage.get("output_tokens_details") or {}).get("reasoning_tokens") or 0),
+        "reasoning_tokens": int(
+            (usage.get("output_tokens_details") or {}).get("reasoning_tokens") or 0
+        ),
     }
 
 
@@ -1572,7 +1827,11 @@ def tool_calls(provider: str, response: dict[str, Any]) -> list[dict[str, Any]]:
             }
             for call in calls
         ]
-    source = response.get("content", []) if provider == "anthropic" else response.get("output", [])
+    source = (
+        response.get("content", [])
+        if provider == "anthropic"
+        else response.get("output", [])
+    )
     expected = "tool_use" if provider == "anthropic" else "function_call"
     return [item for item in source if item.get("type") == expected]
 
@@ -1602,7 +1861,9 @@ class ApiAgent:
         self.config = load_yaml(self.config_path)
         self.route = context_pipeline.llm_route_from_config(self.config_path, role)
         if self.route["execution"] != "api":
-            raise AgentError(f"role {self.route['role']} resolves to desktop, not API execution")
+            raise AgentError(
+                f"role {self.route['role']} resolves to desktop, not API execution"
+            )
         self.provider = self.route["provider"]
         self.model = self.route["model"]
         self.role = self.route["role"]
@@ -1611,13 +1872,12 @@ class ApiAgent:
         self.run_id = run_id
         self.budgets = budgets_from_config(self.config)
         from provider_health import ProviderTransport
+
         self.transport = ProviderTransport(
             self.root,
             transport
             if transport is not None
-            else HttpTransport(
-                timeout=self.budgets["provider_read_timeout_seconds"]
-            ),
+            else HttpTransport(timeout=self.budgets["provider_read_timeout_seconds"]),
         )
         self.review_authorization = review_authorization
         self.review_pr = review_pr
@@ -1642,11 +1902,19 @@ class ApiAgent:
                 validate_attempt_capability(
                     state_dir=runtime_path(
                         self.shared_root,
-                        str(self.config.get("sprint_checkpoint_dir") or ".orchestration/.sprint-state"),
+                        str(
+                            self.config.get("sprint_checkpoint_dir")
+                            or ".orchestration/.sprint-state"
+                        ),
                     ),
-                    token=self.attempt_capability, repository=str(self.shared_root),
-                    sprint=self.sprint, ticket=self.ticket, role=self.role,
-                    run_id=self.run_id, worker=self.worker_ref, route=self.route,
+                    token=self.attempt_capability,
+                    repository=str(self.shared_root),
+                    sprint=self.sprint,
+                    ticket=self.ticket,
+                    role=self.role,
+                    run_id=self.run_id,
+                    worker=self.worker_ref,
+                    route=self.route,
                 )
             except AttemptCapabilityError as exc:
                 raise AgentError(str(exc)) from exc
@@ -1663,7 +1931,10 @@ class ApiAgent:
             self.budgets["tool_timeout_seconds"],
         )
         self.tools = tools_for_role(
-            self.role, self.route.get("allowed_tools") or None, self.provider, self.model
+            self.role,
+            self.route.get("allowed_tools") or None,
+            self.provider,
+            self.model,
         )
         self.state: dict[str, Any] = {
             "run_id": run_id,
@@ -1696,7 +1967,11 @@ class ApiAgent:
             count_body.pop("max_tokens", None)
             return max(
                 1,
-                len(json.dumps(count_body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")),
+                len(
+                    json.dumps(
+                        count_body, separators=(",", ":"), ensure_ascii=False
+                    ).encode("utf-8")
+                ),
             )
         count_body = dict(body)
         if self.provider == "bedrock":
@@ -1810,11 +2085,16 @@ class ApiAgent:
                         if exc.retry_after_seconds is not None:
                             delay = exc.retry_after_seconds
                         else:
-                            base = self.budgets["retry_backoff_seconds"] * (2 ** rate_limit_retries)
+                            base = self.budgets["retry_backoff_seconds"] * (
+                                2**rate_limit_retries
+                            )
                             delay = min(base, self.budgets["retry_max_backoff_seconds"])
                             if delay:
                                 delay += random.uniform(0, min(1.0, delay * 0.1))
-                        if rate_limit_wait + delay > self.budgets["max_rate_limit_wait_seconds"]:
+                        if (
+                            rate_limit_wait + delay
+                            > self.budgets["max_rate_limit_wait_seconds"]
+                        ):
                             raise
                         rate_limit_retries += 1
                         rate_limit_wait += delay
@@ -1826,7 +2106,10 @@ class ApiAgent:
                         )
                         time.sleep(delay)
                         continue
-                    if exc.status != 529 or overload_retries >= self.budgets["max_pre_ack_retries"]:
+                    if (
+                        exc.status != 529
+                        or overload_retries >= self.budgets["max_pre_ack_retries"]
+                    ):
                         raise
                     overload_retries += 1
                     delay = self.budgets["retry_backoff_seconds"] * overload_retries
@@ -1837,14 +2120,30 @@ class ApiAgent:
                     )
                     time.sleep(delay)
         except ProviderAdmissionError as exc:
-            self.ledger.release(reservation, self.run_id, "shared provider admission refused before submission")
-            self._save(status="rejected", pending_reservation=None, pending_request=None, error=str(exc))
+            self.ledger.release(
+                reservation,
+                self.run_id,
+                "shared provider admission refused before submission",
+            )
+            self._save(
+                status="rejected",
+                pending_reservation=None,
+                pending_request=None,
+                error=str(exc),
+            )
             raise
         except ProviderHTTPError as exc:
-            if (400 <= exc.status < 500 and exc.status not in {408, 409}) or exc.status == 529:
-                self.ledger.release(reservation, self.run_id, f"provider rejected HTTP {exc.status}")
+            if (
+                400 <= exc.status < 500 and exc.status not in {408, 409}
+            ) or exc.status == 529:
+                self.ledger.release(
+                    reservation, self.run_id, f"provider rejected HTTP {exc.status}"
+                )
                 self._save(
-                    status="rejected", pending_reservation=None, pending_request=None, error=str(exc)
+                    status="rejected",
+                    pending_reservation=None,
+                    pending_request=None,
+                    error=str(exc),
                 )
             else:
                 self._save(status="needs_reconcile", error=str(exc))
@@ -1859,7 +2158,18 @@ class ApiAgent:
             self._save(status="needs_reconcile", error="provider response had no id")
             raise ProviderAmbiguous("provider response had no durable id")
         usage = normalize_usage(self.provider, response)
-        if sum(usage[key] for key in ("input_tokens", "cache_write_tokens", "cache_read_tokens", "output_tokens")) <= 0:
+        if (
+            sum(
+                usage[key]
+                for key in (
+                    "input_tokens",
+                    "cache_write_tokens",
+                    "cache_read_tokens",
+                    "output_tokens",
+                )
+            )
+            <= 0
+        ):
             self.state["response_ids"].append(response_id)
             self._save(
                 status="needs_reconcile",
@@ -1880,7 +2190,9 @@ class ApiAgent:
             cost=cost,
             role=self.role,
             latency_ms=latency_ms,
-            rate_limit_wait_seconds=round(rate_limit_wait, 3) if rate_limit_wait else None,
+            rate_limit_wait_seconds=round(rate_limit_wait, 3)
+            if rate_limit_wait
+            else None,
             tool_round=int(self.state.get("tool_rounds") or 0),
         )
         cumulative = decimal_value(self.state.get("cost_usd", "0"), "state cost") + cost
@@ -1927,7 +2239,12 @@ class ApiAgent:
                 output = f"ERROR: {exc}"
             if self.provider == "anthropic":
                 results.append(
-                    {"type": "tool_result", "tool_use_id": call_id, "content": output, "is_error": is_error}
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": call_id,
+                        "content": output,
+                        "is_error": is_error,
+                    }
                 )
             elif self.provider == "bedrock":
                 results.append(
@@ -1945,7 +2262,11 @@ class ApiAgent:
                 )
             else:
                 results.append(
-                    {"type": "function_call_output", "call_id": str(call.get("call_id") or call_id), "output": output}
+                    {
+                        "type": "function_call_output",
+                        "call_id": str(call.get("call_id") or call_id),
+                        "output": output,
+                    }
                 )
         return results
 
@@ -1959,21 +2280,37 @@ class ApiAgent:
             if (
                 self._active_review_head
                 and not self.state.get("pending_reservation")
-                and self.state.get("status") in {
-                    "ready", "tool_running", "rejected", "budget_blocked", "invalid_output", "incomplete",
+                and self.state.get("status")
+                in {
+                    "ready",
+                    "tool_running",
+                    "rejected",
+                    "budget_blocked",
+                    "invalid_output",
+                    "incomplete",
                 }
             ):
                 cancel_review_permit(
                     shared_root=self.shared_root,
-                    ledger_dir=str(self.config.get("review_ledger_dir") or ".orchestration/.review-ledger"),
-                    pr=str(self.review_pr), token=str(self.review_authorization),
-                    role=self.role, head=self._active_review_head, timestamp=utc_now(),
+                    ledger_dir=str(
+                        self.config.get("review_ledger_dir")
+                        or ".orchestration/.review-ledger"
+                    ),
+                    pr=str(self.review_pr),
+                    token=str(self.review_authorization),
+                    role=self.role,
+                    head=self._active_review_head,
+                    timestamp=utc_now(),
                 )
 
     def _run(self, request: dict[str, Any]) -> dict[str, Any]:
         if self.provider == "openai":
             strip_openai_cache_request_fields(request)
-        request_model = request.get("modelId") if self.provider == "bedrock" else request.get("model")
+        request_model = (
+            request.get("modelId")
+            if self.provider == "bedrock"
+            else request.get("model")
+        )
         if str(request_model or "") != self.model:
             raise AgentError("request model does not match the resolved role route")
         cap_key = (
@@ -2000,7 +2337,9 @@ class ApiAgent:
             )
             request["toolConfig"] = {"tools": self.tools, "toolChoice": {"auto": {}}}
         else:
-            request[cap_key] = min(requested_cap, self.budgets["max_output_tokens_per_turn"])
+            request[cap_key] = min(
+                requested_cap, self.budgets["max_output_tokens_per_turn"]
+            )
             request["tools"] = self.tools
         if self.provider == "anthropic":
             request["tool_choice"] = {"type": "auto", "disable_parallel_tool_use": True}
@@ -2011,21 +2350,33 @@ class ApiAgent:
         reviewer_roles = {"design-reviewer", "code-reviewer", "security-reviewer"}
         if self.role in reviewer_roles:
             if not self.review_authorization or not self.review_pr:
-                raise AgentError("reviewer run requires --review-pr and a ledger-issued --review-authorization")
+                raise AgentError(
+                    "reviewer run requires --review-pr and a ledger-issued --review-authorization"
+                )
             try:
                 head = subprocess.run(
-                    ["git", "rev-parse", "HEAD"], cwd=self.root, check=True,
-                    capture_output=True, text=True,
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=self.root,
+                    check=True,
+                    capture_output=True,
+                    text=True,
                 ).stdout.strip()
             except (OSError, subprocess.CalledProcessError) as exc:
-                raise AgentError("cannot bind review authorization to repository HEAD") from exc
+                raise AgentError(
+                    "cannot bind review authorization to repository HEAD"
+                ) from exc
             try:
                 self.logical_review_id = consume_review_permit(
                     shared_root=self.shared_root,
-                    ledger_dir=str(self.config.get("review_ledger_dir") or ".orchestration/.review-ledger"),
+                    ledger_dir=str(
+                        self.config.get("review_ledger_dir")
+                        or ".orchestration/.review-ledger"
+                    ),
                     pr=self.review_pr,
                     token=self.review_authorization,
-                    role=self.role, head=head, timestamp=utc_now(),
+                    role=self.role,
+                    head=head,
+                    timestamp=utc_now(),
                 )
             except ReviewPermitError as exc:
                 raise AgentError(str(exc)) from exc
@@ -2053,7 +2404,10 @@ class ApiAgent:
                     ),
                     "text": text,
                     "tool_calls": [
-                        {"name": call.get("name"), "id": call.get("id") or call.get("call_id")}
+                        {
+                            "name": call.get("name"),
+                            "id": call.get("id") or call.get("call_id"),
+                        }
                         for call in calls
                     ],
                 }
@@ -2061,7 +2415,10 @@ class ApiAgent:
             self._save(transcript=transcript)
             if not calls:
                 status = "completed"
-                if self.provider == "anthropic" and response.get("stop_reason") not in {"end_turn", "stop_sequence"}:
+                if self.provider == "anthropic" and response.get("stop_reason") not in {
+                    "end_turn",
+                    "stop_sequence",
+                }:
                     status = "incomplete"
                 if self.provider == "bedrock" and response.get("stopReason") not in {
                     "end_turn",
@@ -2070,7 +2427,9 @@ class ApiAgent:
                     status = "incomplete"
                 if self.provider == "openai" and response.get("status") != "completed":
                     status = (
-                        "incomplete" if response.get("status") in {"incomplete", "failed", "cancelled"}
+                        "incomplete"
+                        if response.get("status")
+                        in {"incomplete", "failed", "cancelled"}
                         else "needs_reconcile"
                     )
                 if self.provider in {"azure_adm", "bedrock_mantle"}:
@@ -2085,32 +2444,60 @@ class ApiAgent:
                 if status == "completed" and review_gate:
                     text = review_text(self.provider, text)
                     try:
-                        review = context_pipeline.validate_review_output(json.loads(text), review_gate)
+                        review = context_pipeline.validate_review_output(
+                            json.loads(text), review_gate
+                        )
                     except (json.JSONDecodeError, context_pipeline.ContextError) as exc:
-                        self._save(status="invalid_output", output_text=text, error=str(exc))
-                        raise AgentError(f"reviewer returned invalid structured output: {exc}") from exc
+                        self._save(
+                            status="invalid_output", output_text=text, error=str(exc)
+                        )
+                        raise AgentError(
+                            f"reviewer returned invalid structured output: {exc}"
+                        ) from exc
                 if status == "completed" and self.role in reviewer_roles:
                     completed_result: Any
                     try:
                         completed_result = json.loads(review_text(self.provider, text))
                     except json.JSONDecodeError as exc:
-                        self._save(status="invalid_output", output_text=text, error=str(exc))
-                        raise AgentError("reviewer completion output must be structured JSON") from exc
+                        self._save(
+                            status="invalid_output", output_text=text, error=str(exc)
+                        )
+                        raise AgentError(
+                            "reviewer completion output must be structured JSON"
+                        ) from exc
                     try:
                         complete_review_permit(
                             shared_root=self.shared_root,
-                            ledger_dir=str(self.config.get("review_ledger_dir") or ".orchestration/.review-ledger"),
-                            pr=str(self.review_pr), token=str(self.review_authorization),
+                            ledger_dir=str(
+                                self.config.get("review_ledger_dir")
+                                or ".orchestration/.review-ledger"
+                            ),
+                            pr=str(self.review_pr),
+                            token=str(self.review_authorization),
                             role=self.role,
                             head=subprocess.run(
-                                ["git", "rev-parse", "HEAD"], cwd=self.root, check=True,
-                                capture_output=True, text=True,
-                            ).stdout.strip().lower(),
-                            result=completed_result, timestamp=utc_now(),
+                                ["git", "rev-parse", "HEAD"],
+                                cwd=self.root,
+                                check=True,
+                                capture_output=True,
+                                text=True,
+                            )
+                            .stdout.strip()
+                            .lower(),
+                            result=completed_result,
+                            timestamp=utc_now(),
                         )
-                    except (ReviewPermitError, OSError, subprocess.CalledProcessError) as exc:
-                        self._save(status="invalid_output", output_text=text, error=str(exc))
-                        raise AgentError(f"could not create review completion receipt: {exc}") from exc
+                    except (
+                        ReviewPermitError,
+                        OSError,
+                        subprocess.CalledProcessError,
+                    ) as exc:
+                        self._save(
+                            status="invalid_output", output_text=text, error=str(exc)
+                        )
+                        raise AgentError(
+                            f"could not create review completion receipt: {exc}"
+                        ) from exc
                 self._save(status=status, output_text=text, review=review)
                 result = {
                     "run_id": self.run_id,
@@ -2135,7 +2522,9 @@ class ApiAgent:
             self._save(status="tool_running", tool_rounds=rounds + 1)
             if self.provider == "anthropic":
                 messages = list(body.get("messages") or [])
-                messages.append({"role": "assistant", "content": response.get("content") or []})
+                messages.append(
+                    {"role": "assistant", "content": response.get("content") or []}
+                )
                 messages.append({"role": "user", "content": results})
                 body = dict(body)
                 body["messages"] = roll_conversation_cache_breakpoint(messages)
@@ -2269,14 +2658,24 @@ def group_key(event: dict[str, Any], field: str) -> str:
 
 
 def aggregate(events: list[dict[str, Any]]) -> dict[str, Any]:
-    tokens = {field: sum(int(event.get(field) or 0) for event in events) for field in TOKEN_FIELDS}
+    tokens = {
+        field: sum(int(event.get(field) or 0) for event in events)
+        for field in TOKEN_FIELDS
+    }
     cost = sum(
-        (decimal_value(event.get("cost_usd", 0), "ledger cost") for event in events), Decimal("0")
+        (decimal_value(event.get("cost_usd", 0), "ledger cost") for event in events),
+        Decimal("0"),
     )
     billed_input = (
-        tokens["input_tokens"] + tokens["cache_read_tokens"] + tokens["cache_write_tokens"]
+        tokens["input_tokens"]
+        + tokens["cache_read_tokens"]
+        + tokens["cache_write_tokens"]
     )
-    latencies = [int(event["latency_ms"]) for event in events if event.get("latency_ms") is not None]
+    latencies = [
+        int(event["latency_ms"])
+        for event in events
+        if event.get("latency_ms") is not None
+    ]
     waits = sum(float(event.get("rate_limit_wait_seconds") or 0) for event in events)
     requests = len(events)
     result: dict[str, Any] = {
@@ -2320,7 +2719,9 @@ def build_report(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     }
 
     def matches(event: dict[str, Any]) -> bool:
-        return all(str(event.get(field) or "") == value for field, value in filters.items())
+        return all(
+            str(event.get(field) or "") == value for field, value in filters.items()
+        )
 
     usage_events = [
         event
@@ -2401,7 +2802,9 @@ def format_report(report: dict[str, Any]) -> str:
         return str(value)
 
     def line(row: dict[str, Any]) -> str:
-        return "  ".join(f"{cell(row, f):{align}{width}}" for f, _, width, align in columns)
+        return "  ".join(
+            f"{cell(row, f):{align}{width}}" for f, _, width, align in columns
+        )
 
     header = "  ".join(f"{label:{align}{width}}" for _, label, width, align in columns)
     lines = [header, "-" * len(header)]
@@ -2418,9 +2821,13 @@ def format_report(report: dict[str, Any]) -> str:
     window = report["window"]
     if window["since"] or window["until"]:
         lines.append("")
-        lines.append(f"window: {window['since'] or 'start'} -> {window['until'] or 'now'}")
+        lines.append(
+            f"window: {window['since'] or 'start'} -> {window['until'] or 'now'}"
+        )
     if report["run_outcomes"]:
-        outcomes = ", ".join(f"{name} {count}" for name, count in sorted(report["run_outcomes"].items()))
+        outcomes = ", ".join(
+            f"{name} {count}" for name, count in sorted(report["run_outcomes"].items())
+        )
         lines.append(f"run outcomes: {outcomes}")
     if report["open_reservations"]:
         lines.append(
@@ -2442,8 +2849,12 @@ def format_report(report: dict[str, Any]) -> str:
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     commands = result.add_subparsers(dest="command", required=True)
-    run = commands.add_parser("run", help="run a provider payload through the constrained tool loop")
-    run.add_argument("--request", required=True, help="provider payload JSON file, or - for stdin")
+    run = commands.add_parser(
+        "run", help="run a provider payload through the constrained tool loop"
+    )
+    run.add_argument(
+        "--request", required=True, help="provider payload JSON file, or - for stdin"
+    )
     run.add_argument("--config", default=".orchestration/config.yaml")
     run.add_argument("--role", required=True)
     run.add_argument("--repo", default=".")
@@ -2455,7 +2866,9 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--review-pr")
     run.add_argument("--attempt-capability")
     run.add_argument("--worker-ref")
-    usage = commands.add_parser("usage", help="summarize durable API usage and open reservations")
+    usage = commands.add_parser(
+        "usage", help="summarize durable API usage and open reservations"
+    )
     usage.add_argument("--repo", default=".")
     report = commands.add_parser(
         "report", help="group durable API usage into cost and performance insights"
@@ -2472,18 +2885,33 @@ def parser() -> argparse.ArgumentParser:
     report.add_argument("--top", type=int, help="keep only the N costliest groups")
     report.add_argument("--format", choices=["table", "json"], default="table")
     reconcile = commands.add_parser(
-        "reconcile", help="close an uncertain reservation after checking provider records"
+        "reconcile",
+        help="close an uncertain reservation after checking provider records",
     )
     reconcile.add_argument("--repo", default=".")
     reconcile.add_argument("--config", default=".orchestration/config.yaml")
     reconcile.add_argument("--run-id", required=True)
-    reconcile.add_argument("--outcome", choices=["not-found", "completed"], required=True)
+    reconcile.add_argument(
+        "--outcome", choices=["not-found", "completed"], required=True
+    )
     reconcile.add_argument("--evidence", required=True)
     reconcile.add_argument("--response-id")
     reconcile.add_argument("--input-tokens", type=int, default=0)
     reconcile.add_argument("--cache-write-tokens", type=int, default=0)
     reconcile.add_argument("--cache-read-tokens", type=int, default=0)
     reconcile.add_argument("--output-tokens", type=int, default=0)
+    migration_plan = commands.add_parser(
+        "reservation-migration-plan",
+        help="emit an evidence manifest template for every open reservation",
+    )
+    migration_plan.add_argument("--repo", default=".")
+    migration = commands.add_parser(
+        "reconcile-reservations",
+        help="validate or apply provider-confirmed not-found reservation outcomes",
+    )
+    migration.add_argument("--repo", default=".")
+    migration.add_argument("--manifest", required=True)
+    migration.add_argument("--apply", action="store_true")
     return result
 
 
@@ -2495,11 +2923,17 @@ def reconcile_run(args: argparse.Namespace, root: Path) -> dict[str, Any]:
         raise AgentError(f"run state not found: {state_path}")
     state = json.loads(state_path.read_text(encoding="utf-8"))
     if state.get("status") != "needs_reconcile" or not state.get("pending_reservation"):
-        raise AgentError("only a needs_reconcile run with an open reservation can be reconciled")
+        raise AgentError(
+            "only a needs_reconcile run with an open reservation can be reconciled"
+        )
     reservation = str(state["pending_reservation"])
     ledger = UsageLedger(root)
     if args.outcome == "not-found":
-        ledger.release(reservation, args.run_id, f"provider lookup found no request: {args.evidence}")
+        ledger.release(
+            reservation,
+            args.run_id,
+            f"provider lookup found no request: {args.evidence}",
+        )
         status = "reconciled_not_found"
         cost = Decimal("0")
     else:
@@ -2507,14 +2941,20 @@ def reconcile_run(args: argparse.Namespace, root: Path) -> dict[str, Any]:
             raise AgentError("--response-id is required for a completed reconciliation")
         usage = {
             "input_tokens": int_value(args.input_tokens, "input tokens", minimum=0),
-            "cache_write_tokens": int_value(args.cache_write_tokens, "cache write tokens", minimum=0),
-            "cache_read_tokens": int_value(args.cache_read_tokens, "cache read tokens", minimum=0),
+            "cache_write_tokens": int_value(
+                args.cache_write_tokens, "cache write tokens", minimum=0
+            ),
+            "cache_read_tokens": int_value(
+                args.cache_read_tokens, "cache read tokens", minimum=0
+            ),
             "output_tokens": int_value(args.output_tokens, "output tokens", minimum=0),
             "reasoning_tokens": 0,
         }
         if sum(usage.values()) <= 0:
             raise AgentError("completed reconciliation requires nonzero provider usage")
-        pricing = Pricing.from_config(load_yaml(Path(args.config)), str(state.get("model") or ""))
+        pricing = Pricing.from_config(
+            load_yaml(Path(args.config)), str(state.get("model") or "")
+        )
         cost = pricing.actual_cost(usage)
         ledger.settle(
             reservation,
@@ -2549,6 +2989,136 @@ def reconcile_run(args: argparse.Namespace, root: Path) -> dict[str, Any]:
     }
 
 
+def reservation_migration_plan(root: Path) -> dict[str, Any]:
+    """Produce a bounded manifest template without releasing uncertain work."""
+    ledger = UsageLedger(root)
+    open_items = sorted(
+        ledger.summary()["open_reservations"],
+        key=lambda item: (
+            str(item.get("run_id") or ""),
+            str(item.get("reservation_id") or ""),
+        ),
+    )
+    return {
+        "schema_version": 1,
+        "repository": str(root.resolve()),
+        "entries": [
+            {
+                "run_id": str(item.get("run_id") or ""),
+                "reservation_id": str(item.get("reservation_id") or ""),
+                "outcome": "not-found",
+                "evidence": "",
+            }
+            for item in open_items
+        ],
+    }
+
+
+def reconcile_reservation_manifest(
+    args: argparse.Namespace, root: Path
+) -> dict[str, Any]:
+    """Bulk-apply provider-confirmed not-found outcomes with an audit trail."""
+    root = root.resolve()
+    manifest_path = Path(args.manifest).resolve()
+    if manifest_path != root and root not in manifest_path.parents:
+        raise AgentError(
+            "reservation reconciliation manifest must be inside the repository"
+        )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("schema_version") != 1 or manifest.get("repository") != str(
+        root.resolve()
+    ):
+        raise AgentError(
+            "reservation reconciliation manifest has the wrong schema or repository"
+        )
+    entries = manifest.get("entries")
+    if not isinstance(entries, list) or not entries or len(entries) > 100:
+        raise AgentError(
+            "reservation reconciliation manifest requires 1 through 100 entries"
+        )
+    ledger = UsageLedger(root)
+    open_items = {
+        str(item.get("reservation_id") or ""): item
+        for item in ledger.summary()["open_reservations"]
+    }
+    validated = []
+    seen = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise AgentError("reservation reconciliation entries must be objects")
+        run_id = str(entry.get("run_id") or "")
+        reservation_id = str(entry.get("reservation_id") or "")
+        evidence = str(entry.get("evidence") or "").strip()
+        if (
+            not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", run_id)
+            or not re.fullmatch(r"resv_[a-f0-9]{32}", reservation_id)
+            or entry.get("outcome") != "not-found"
+            or not evidence
+            or len(evidence) > 2000
+        ):
+            raise AgentError(
+                "each manifest entry requires a valid run, reservation, "
+                "not-found outcome, and evidence"
+            )
+        if reservation_id in seen:
+            raise AgentError(f"duplicate reservation in manifest: {reservation_id}")
+        seen.add(reservation_id)
+        state_path = runtime_path(root, ".orchestration/.llm-runs") / f"{run_id}.json"
+        if not state_path.is_file():
+            raise AgentError(f"run state not found: {state_path}")
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        already_done = (
+            state.get("status") == "reconciled_not_found"
+            and state.get("pending_reservation") is None
+            and state.get("reconciliation_evidence") == evidence
+        )
+        if not already_done and (
+            state.get("status") != "needs_reconcile"
+            or state.get("pending_reservation") != reservation_id
+            or open_items.get(reservation_id, {}).get("run_id") != run_id
+        ):
+            raise AgentError(
+                f"run {run_id} is not bound to open reservation {reservation_id}"
+            )
+        validated.append(
+            (run_id, reservation_id, evidence, state_path, state, already_done)
+        )
+    applied = []
+    if args.apply:
+        for (
+            run_id,
+            reservation_id,
+            evidence,
+            state_path,
+            state,
+            already_done,
+        ) in validated:
+            if not already_done:
+                ledger.release(
+                    reservation_id,
+                    run_id,
+                    f"provider lookup found no request: {evidence}",
+                )
+                state.update(
+                    {
+                        "status": "reconciled_not_found",
+                        "pending_reservation": None,
+                        "pending_request": None,
+                        "reconciliation_evidence": evidence,
+                        "reconciled_at": utc_now(),
+                    }
+                )
+                atomic_json(state_path, state)
+            applied.append(run_id)
+    return {
+        "status": "completed",
+        "mode": "apply" if args.apply else "validate",
+        "validated_runs": [item[0] for item in validated],
+        "applied_runs": applied,
+        "usage": ledger.summary(),
+    }
+
+
 def main() -> int:
     args = parser().parse_args()
     try:
@@ -2559,10 +3129,16 @@ def main() -> int:
             output = build_report(shared_repository_root(root), args)
         elif args.command == "reconcile":
             output = reconcile_run(args, shared_repository_root(root))
+        elif args.command == "reservation-migration-plan":
+            output = reservation_migration_plan(shared_repository_root(root))
+        elif args.command == "reconcile-reservations":
+            output = reconcile_reservation_manifest(args, shared_repository_root(root))
         else:
             run_id = args.run_id or "run_" + uuid.uuid4().hex
             if not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", run_id):
-                raise AgentError("run id must contain only letters, digits, dot, underscore, or hyphen")
+                raise AgentError(
+                    "run id must contain only letters, digits, dot, underscore, or hyphen"
+                )
             agent = ApiAgent(
                 root=root,
                 config_path=Path(args.config),
@@ -2584,7 +3160,11 @@ def main() -> int:
         else:
             print(json.dumps(output, indent=2, sort_keys=False))
         status = output.get("status", "completed")
-        return 0 if status in {"completed", "reconciled_not_found", "reconciled_completed"} else 3
+        return (
+            0
+            if status in {"completed", "reconciled_not_found", "reconciled_completed"}
+            else 3
+        )
     except (AgentError, OSError, json.JSONDecodeError) as exc:
         print(f"api-agent: {exc}", file=sys.stderr)
         return 2

@@ -9,7 +9,13 @@ and exact summaries.
 
 from __future__ import annotations
 
-from slice_delivery import decomposition_provenance, validate_delivery, validate_owner
+from slice_delivery import (
+    decomposition_provenance,
+    required_contract_names,
+    validate_contracts,
+    validate_delivery,
+    validate_owner,
+)
 
 import argparse
 import contextlib
@@ -32,8 +38,13 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from api_agent import (
-    AgentError, Pricing, UsageLedger, budgets_from_config, load_yaml,
-    TRANSIENT_PAUSE_REASONS, load_orchestration_env, PHASE_BUDGETS,
+    AgentError,
+    Pricing,
+    UsageLedger,
+    budgets_from_config,
+    load_yaml,
+    TRANSIENT_PAUSE_REASONS,
+    load_orchestration_env,
 )
 from provider_health import (
     ProviderHealth,
@@ -100,6 +111,42 @@ class SprintError(RuntimeError):
 
 class ProcessAbsent(SprintError):
     """The OS conclusively reported that a process no longer exists."""
+
+
+def decision_registry(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Return reviewed repository decisions that scopers may reuse."""
+    raw = config.get("sprint_decisions") or {}
+    if not isinstance(raw, dict) or len(raw) > 100:
+        raise SprintError("sprint_decisions must be a map with at most 100 entries")
+    result: dict[str, dict[str, Any]] = {}
+    for key, value in raw.items():
+        if not isinstance(key, str) or not re.fullmatch(r"[a-z][a-z0-9_.-]{0,63}", key):
+            raise SprintError(f"invalid sprint decision key: {key!r}")
+        if not isinstance(value, dict):
+            raise SprintError(f"sprint decision {key} must be a map")
+        status = str(value.get("status") or "").strip().casefold()
+        answer = value.get("answer")
+        rationale = str(value.get("rationale") or "").strip()
+        empty_answer = (
+            answer is None
+            or (isinstance(answer, str) and not answer.strip())
+            or (isinstance(answer, (list, dict)) and not answer)
+        )
+        if status != "approved" or empty_answer or not rationale:
+            raise SprintError(
+                f"sprint decision {key} requires status approved, answer, and rationale"
+            )
+        encoded = json.dumps(answer, sort_keys=True, separators=(",", ":"))
+        if len(encoded) > 8000 or len(rationale) > 4000:
+            raise SprintError(f"sprint decision {key} exceeds bounded limits")
+        result[key] = {
+            "status": "approved",
+            "answer": answer,
+            "rationale": rationale,
+        }
+    if len(json.dumps(result, sort_keys=True, separators=(",", ":"))) > 32000:
+        raise SprintError("sprint_decisions exceeds the 32,000-character context limit")
+    return result
 
 
 def now() -> str:
@@ -226,7 +273,9 @@ def settings(args: argparse.Namespace) -> dict[str, Any]:
             or config_scalar(config, "max_worker_lifetime_seconds", "14400")
         )
     except ValueError as exc:
-        raise SprintError("lane, continuation, and work-in-progress limits must be integers") from exc
+        raise SprintError(
+            "lane, continuation, and work-in-progress limits must be integers"
+        ) from exc
     if max_lane_relaunches < 0 or max_worker_continuations < 0:
         raise SprintError("lane relaunch and continuation limits must be at least 0")
     if max_unmerged_prs < 1 or max_unmerged_prs > 20:
@@ -282,6 +331,12 @@ def settings(args: argparse.Namespace) -> dict[str, Any]:
         raise SprintError("complexity_threshold must be from 1 through 100")
     if max_usd_without_progress <= 0:
         raise SprintError("max_usd_without_progress must be positive")
+    loaded_config = load_yaml(config)
+    decomposition_feature = loaded_config.get("sprint_decomposition") or {}
+    if not isinstance(decomposition_feature, dict):
+        raise SprintError("sprint_decomposition must be a map")
+    contracts = required_contract_names(decomposition_feature, SprintError)
+    decisions = decision_registry(loaded_config)
     return {
         "config": config,
         "concurrency_max": concurrency,
@@ -299,11 +354,19 @@ def settings(args: argparse.Namespace) -> dict[str, Any]:
         "max_reviewer_runs_per_ticket": max_reviewer_runs,
         "max_auto_slices": max_auto_slices,
         "decomposition_threshold": decomposition_threshold,
+        "required_slice_contracts": contracts,
+        "decision_registry": decisions,
         "max_usd_without_progress": max_usd_without_progress,
-        "cooperative_auto_recovery": config_bool_any_depth(config, "cooperative_auto_recovery", False),
+        "cooperative_auto_recovery": config_bool_any_depth(
+            config, "cooperative_auto_recovery", False
+        ),
         "auto_decompose_large_tickets": config_bool_any_depth(
             config, "auto_decompose_large_tickets", False
         ),
+        "preserved_pr_auto_recovery": config_bool_any_depth(
+            config, "preserved_pr_auto_recovery", False
+        ),
+        "pr_drain_first": config_bool_any_depth(config, "pr_drain_first", True),
         "ready": {
             x.casefold()
             for x in config_list(config, "sprint_ready_statuses", DEFAULT_READY)
@@ -432,6 +495,8 @@ def load(path: Path) -> dict[str, Any]:
         ticket.setdefault("attached_at", "")
         ticket.setdefault("launch_evidence", {})
         ticket.setdefault("scope_assessment", {})
+        ticket.setdefault("resolved_scope_decisions", [])
+        ticket.setdefault("recovery_binding", {})
         ticket.setdefault("decomposition_children", [])
         ticket.setdefault("progress", [])
     return value
@@ -776,7 +841,9 @@ def normalized_inventory(raw: dict[str, Any], cfg: dict[str, Any]) -> dict[str, 
             "parent": (
                 normalize_key((item.get("parent") or {}).get("key"))
                 if isinstance(item.get("parent"), dict)
-                else normalize_key(item.get("parent")) if item.get("parent") else ""
+                else normalize_key(item.get("parent"))
+                if item.get("parent")
+                else ""
             ),
             "dependencies": sorted(dependencies),
             "subtasks": sorted(subtasks),
@@ -794,6 +861,8 @@ def normalized_inventory(raw: dict[str, Any], cfg: dict[str, Any]) -> dict[str, 
             "attached_at": "",
             "launch_evidence": {},
             "scope_assessment": {},
+            "resolved_scope_decisions": [],
+            "recovery_binding": {},
             "decomposition_children": [],
             "progress": [],
             "history": [],
@@ -927,12 +996,19 @@ def effective_dependencies(tickets: dict[str, dict[str, Any]], key: str) -> list
         visited.add(current)
         dependencies.update(tickets[current]["dependencies"])
         for parent in tickets.values():
-            if parent["state"] == "decomposed" and current in parent.get("decomposition_children", []):
+            if parent["state"] == "decomposed" and current in parent.get(
+                "decomposition_children", []
+            ):
                 pending.append(parent["key"])
     return sorted(dependencies)
 
 
-def dependency_complete(state: dict[str, Any], key: str, cfg: dict[str, Any], visiting: frozenset[str] = frozenset()) -> bool:
+def dependency_complete(
+    state: dict[str, Any],
+    key: str,
+    cfg: dict[str, Any],
+    visiting: frozenset[str] = frozenset(),
+) -> bool:
     """Resolve a tracking parent only through its bound, completed child set."""
     if key in visiting:
         return False
@@ -985,19 +1061,30 @@ def find_cycles(tickets: dict[str, dict[str, Any]]) -> dict[str, str]:
     return cycle_reason
 
 
-def blockers(state: dict[str, Any], key: str, cfg: dict[str, Any], cycles: dict[str, str] | None = None) -> list[str]:
-    ticket = state["tickets"][key]
+def blockers(
+    state: dict[str, Any],
+    key: str,
+    cfg: dict[str, Any],
+    cycles: dict[str, str] | None = None,
+) -> list[str]:
     reasons: list[str] = []
     if cycles is None:
         cycles = find_cycles(state["tickets"])
     if key in cycles:
         reasons.append(cycles[key])
     for parent in state["tickets"].values():
-        if key in parent.get("subtasks", []) and parent["state"] == "needs_decomposition":
+        if (
+            key in parent.get("subtasks", [])
+            and parent["state"] == "needs_decomposition"
+        ):
             reasons.append(f"parent {parent['key']} awaits decomposition binding")
         elif parent["state"] == "decomposed" and key in parent.get("subtasks", []):
-            if set(parent.get("subtasks", [])) != set(parent.get("decomposition_children", [])):
-                reasons.append(f"parent {parent['key']} child inventory changed after decomposition")
+            if set(parent.get("subtasks", [])) != set(
+                parent.get("decomposition_children", [])
+            ):
+                reasons.append(
+                    f"parent {parent['key']} child inventory changed after decomposition"
+                )
     for dependency in effective_dependencies(state["tickets"], key):
         if dependency == key:
             reasons.append(f"self dependency: {key}")
@@ -1008,7 +1095,9 @@ def blockers(state: dict[str, Any], key: str, cfg: dict[str, Any], cycles: dict[
             if dependency_complete(state, dependency, cfg):
                 continue
             if dep_state == "decomposed":
-                reasons.append(f"dependency {dependency} awaits completion of its bound children and prerequisites")
+                reasons.append(
+                    f"dependency {dependency} awaits completion of its bound children and prerequisites"
+                )
                 continue
             if dep_state in {
                 "blocked",
@@ -1045,33 +1134,44 @@ def current_startup_failure(ticket, cfg):
     if execution_unit_status(identity) != "absent":
         return None
     try:
-        terminal = read_json(Path(identity.get("tombstone_path", "")), label="startup terminal")
+        terminal = read_json(
+            Path(identity.get("tombstone_path", "")), label="startup terminal"
+        )
     except (SprintError, OSError):
         return None
     invocation = identity.get("invocation_id")
-    if (not invocation or terminal.get("invocation_id") != invocation
-            or terminal.get("startup_retryable") is not True
-            or terminal.get("stop_reason") != "provider_rate_limited"):
+    if (
+        not invocation
+        or terminal.get("invocation_id") != invocation
+        or terminal.get("startup_retryable") is not True
+        or terminal.get("stop_reason") != "provider_rate_limited"
+    ):
         return None
     events = UsageLedger(cfg["shared_root"]).snapshot()
-    reservations = {e.get("reservation_id") for e in events if e.get("kind") == "reservation" and e.get("run_id") == invocation}
+    reservations = {
+        e.get("reservation_id")
+        for e in events
+        if e.get("kind") == "reservation" and e.get("run_id") == invocation
+    }
     released = {e.get("reservation_id") for e in events if e.get("kind") == "release"}
-    if not reservations <= released or any(e.get("kind") == "usage" and e.get("run_id") == invocation for e in events):
+    if not reservations <= released or any(
+        e.get("kind") == "usage" and e.get("run_id") == invocation for e in events
+    ):
         return None
     return {"invocation_id": invocation, "finished_at": terminal.get("finished_at", "")}
 
 
 def startup_credits(ticket, cfg):
-    receipts = {item["invocation_id"] for item in ticket.get("startup_retry_receipts", [])}
+    receipts = {
+        item["invocation_id"] for item in ticket.get("startup_retry_receipts", [])
+    }
     current = current_startup_failure(ticket, cfg)
     if current:
         receipts.add(current["invocation_id"])
     return min(2, len(receipts))
 
 
-def attempt_limit_reason(
-    ticket: dict[str, Any], cfg: dict[str, Any]
-) -> str | None:
+def attempt_limit_reason(ticket: dict[str, Any], cfg: dict[str, Any]) -> str | None:
     """Return a launch blocker when this ticket has used every authorized attempt."""
     attempts = int(ticket.get("attempts") or 0)
     continuations = int(ticket.get("continuations") or 0)
@@ -1099,9 +1199,7 @@ def attempt_limit_reason(
     if charged_attempts < effective_ceiling:
         return None
     grant_detail = (
-        f"; active ticket ceiling={grant_ceiling}"
-        if grant_ceiling is not None
-        else ""
+        f"; active ticket ceiling={grant_ceiling}" if grant_ceiling is not None else ""
     )
     return (
         f"attempt ceiling exhausted after {charged_attempts} charged attempts "
@@ -1143,16 +1241,21 @@ def usage_snapshots(cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
         if (
             kind == "ticket_budget_pause"
             and ticket
-            and str(event.get("reason") or "")
-            not in TRANSIENT_PAUSE_REASONS
+            and str(event.get("reason") or "") not in TRANSIENT_PAUSE_REASONS
         ):
             pause_events[ticket] = event
             # The first request can exceed a ticket ceiling before any
             # reservation exists. Its pause must still block planner admission.
-            result.setdefault(ticket, {
-                "spent_usd": 0.0, "reserved_usd": 0.0,
-                "run_ids": set(), "design_review_run_ids": set(), "reviewer_run_ids": set(),
-            })
+            result.setdefault(
+                ticket,
+                {
+                    "spent_usd": 0.0,
+                    "reserved_usd": 0.0,
+                    "run_ids": set(),
+                    "design_review_run_ids": set(),
+                    "reviewer_run_ids": set(),
+                },
+            )
         elif kind == "ticket_budget_reset" and ticket:
             pause_events.pop(ticket, None)
         if kind == "usage" and ticket:
@@ -1172,7 +1275,9 @@ def usage_snapshots(cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
                 if event.get("role") in DESIGN_REVIEWER_ROLES:
                     item["design_review_run_ids"].add(str(event["run_id"]))
                 if event.get("role") in POST_IMPLEMENTATION_REVIEWER_ROLES:
-                    item["reviewer_run_ids"].add(str(event.get("logical_review_id") or event["run_id"]))
+                    item["reviewer_run_ids"].add(
+                        str(event.get("logical_review_id") or event["run_id"])
+                    )
     for event in open_reservations.values():
         ticket = str(event.get("ticket") or "")
         if ticket:
@@ -1192,20 +1297,31 @@ def usage_snapshots(cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
                 if event.get("role") in DESIGN_REVIEWER_ROLES:
                     item["design_review_run_ids"].add(str(event["run_id"]))
                 if event.get("role") in POST_IMPLEMENTATION_REVIEWER_ROLES:
-                    item["reviewer_run_ids"].add(str(event.get("logical_review_id") or event["run_id"]))
-    phase_limits = budgets_from_config(load_yaml(cfg["config"]) if cfg.get("config") else {})
+                    item["reviewer_run_ids"].add(
+                        str(event.get("logical_review_id") or event["run_id"])
+                    )
+    phase_limits = budgets_from_config(
+        load_yaml(cfg["config"]) if cfg.get("config") else {}
+    )
     for ticket, item in result.items():
         restart = authorized_restart_grant(cfg["shared_root"], ticket)
         allowances = restart["allowances"] if restart else {}
         item["phase_budgets"] = {}
         for phase, totals in UsageLedger.phase_totals(events, ticket).items():
-            limit = max(UsageLedger.phase_limits(events, ticket, phase_limits)[phase], Decimal(allowances.get(phase + "_usd", "0")))
+            limit = max(
+                UsageLedger.phase_limits(events, ticket, phase_limits)[phase],
+                Decimal(allowances.get(phase + "_usd", "0")),
+            )
             total = totals["spent_usd"] + totals["reserved_usd"]
             item["phase_budgets"][phase] = {
                 **{name: float(value) for name, value in totals.items()},
-                "limit_usd": float(limit), "remaining_usd": float(max(0, limit - total)),
-                "state": "exhausted" if totals["spent_usd"] >= limit else
-                         "fully_reserved" if total >= limit else "available",
+                "limit_usd": float(limit),
+                "remaining_usd": float(max(0, limit - total)),
+                "state": "exhausted"
+                if totals["spent_usd"] >= limit
+                else "fully_reserved"
+                if total >= limit
+                else "available",
             }
         item["run_count"] = len(item.pop("run_ids") - item["design_review_run_ids"])
         item["design_review_run_count"] = len(item.pop("design_review_run_ids"))
@@ -1223,20 +1339,26 @@ def usage_snapshots(cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
             except AuthorityError as exc:
                 raise SprintError(str(exc)) from exc
         if restart:
-            grant_ceiling = max(float(grant_ceiling or 0), float(allowances["ticket_usd"]))
+            grant_ceiling = max(
+                float(grant_ceiling or 0), float(allowances["ticket_usd"])
+            )
         if grant_ceiling is not None:
             pause = max(pause, float(grant_ceiling))
         warning = cfg["warn_usd_per_ticket"]
         item["state"] = (
             "operator_action"
             if (
-                (
-                    ticket in pause_events
-                    and grant_ceiling is None
-                )
+                (ticket in pause_events and grant_ceiling is None)
                 or (pause and total > pause)
-                or item["run_count"] >= max(cfg["max_model_runs_per_ticket"], allowances.get("model_runs", 0))
-                or item["reviewer_run_count"] >= max(cfg["max_reviewer_runs_per_ticket"], allowances.get("review_runs", 0))
+                or item["run_count"]
+                >= max(
+                    cfg["max_model_runs_per_ticket"], allowances.get("model_runs", 0)
+                )
+                or item["reviewer_run_count"]
+                >= max(
+                    cfg["max_reviewer_runs_per_ticket"],
+                    allowances.get("review_runs", 0),
+                )
             )
             else "warning"
             if warning and total > warning
@@ -1301,30 +1423,71 @@ def sync(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
                     # A temporary inventory exclusion can clear when the
                     # authenticated fetch includes the untouched ticket again.
                     # Worker and scoping decisions still require recovery.
-                    previous_initial = initial_state(previous.get("raw_status", ""), cfg)
+                    previous_initial = initial_state(
+                        previous.get("raw_status", ""), cfg
+                    )
                     returned_to_query = (
                         previous["state"] == "user_action"
-                        and previous.get("reason") == "ticket disappeared from the refreshed Jira sprint query"
-                        and any(event.get("event") == "removed-from-query" for event in previous.get("history", []))
-                        and not any(previous.get(field) for field in (
-                            "attempts", "attempt_token", "attempt_capability",
-                            "run_ref", "branch", "pr", "worker_identity",
-                            "attach_capability", "attached_at", "launch_evidence",
-                            "legacy_recovery_pending", "scope_assessment",
-                            "decomposition_children", "progress", "verified_commits",
-                            "ci_progress", "test_progress",
-                        ))
+                        and previous.get("reason")
+                        == "ticket disappeared from the refreshed Jira sprint query"
+                        and any(
+                            event.get("event") == "removed-from-query"
+                            for event in previous.get("history", [])
+                        )
+                        and not any(
+                            previous.get(field)
+                            for field in (
+                                "attempts",
+                                "attempt_token",
+                                "attempt_capability",
+                                "run_ref",
+                                "branch",
+                                "pr",
+                                "worker_identity",
+                                "attach_capability",
+                                "attached_at",
+                                "launch_evidence",
+                                "legacy_recovery_pending",
+                                "scope_assessment",
+                                "decomposition_children",
+                                "progress",
+                                "verified_commits",
+                                "ci_progress",
+                                "test_progress",
+                            )
+                        )
                     )
-                    no_execution_evidence = not any(previous.get(field) for field in (
-                        "attempts", "attempt_token", "attempt_capability", "run_ref",
-                        "branch", "pr", "worker_identity", "attach_capability",
-                        "attached_at", "launch_evidence", "scope_assessment",
-                        "decomposition_children", "progress", "verified_commits",
-                        "ci_progress", "test_progress", "subtasks",
-                    )) and not any(
-                        event.get("event") in {
-                            "reserved", "batch-reserved", "worker-launched", "finished",
-                            "progress", "scope-recorded", "decomposition-recorded",
+                    no_execution_evidence = not any(
+                        previous.get(field)
+                        for field in (
+                            "attempts",
+                            "attempt_token",
+                            "attempt_capability",
+                            "run_ref",
+                            "branch",
+                            "pr",
+                            "worker_identity",
+                            "attach_capability",
+                            "attached_at",
+                            "launch_evidence",
+                            "scope_assessment",
+                            "decomposition_children",
+                            "progress",
+                            "verified_commits",
+                            "ci_progress",
+                            "test_progress",
+                            "subtasks",
+                        )
+                    ) and not any(
+                        event.get("event")
+                        in {
+                            "reserved",
+                            "batch-reserved",
+                            "worker-launched",
+                            "finished",
+                            "progress",
+                            "scope-recorded",
+                            "decomposition-recorded",
                         }
                         for event in previous.get("history", [])
                     )
@@ -1346,8 +1509,20 @@ def sync(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
                         not previous.get("attempts")
                         and previous["state"] in {"pending", "blocked", "user_action"}
                         and not previous.get("scope_assessment")
-                        and (returned_to_query or (previous["state"], previous.get("reason", "")) == previous_initial)
-                        and all(event.get("event") in {"jira-status-refreshed", "removed-from-query", "returned-to-query"} for event in previous.get("history", []))
+                        and (
+                            returned_to_query
+                            or (previous["state"], previous.get("reason", ""))
+                            == previous_initial
+                        )
+                        and all(
+                            event.get("event")
+                            in {
+                                "jira-status-refreshed",
+                                "removed-from-query",
+                                "returned-to-query",
+                            }
+                            for event in previous.get("history", [])
+                        )
                     )
                     for field in (
                         "state",
@@ -1369,6 +1544,8 @@ def sync(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
                         "attached_at",
                         "launch_evidence",
                         "scope_assessment",
+                        "resolved_scope_decisions",
+                        "recovery_binding",
                         "restart_grant_id",
                         "startup_retry_receipts",
                         "decomposition_children",
@@ -1384,24 +1561,71 @@ def sync(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
                     if reconcile_legacy_readiness:
                         fresh["state"] = "pending"
                         fresh["reason"] = ""
-                        fresh["history"].append({
-                            "at": now(),
-                            "event": "legacy-readiness-reconciled",
-                            "status": fresh["raw_status"],
-                        })
+                        fresh["history"].append(
+                            {
+                                "at": now(),
+                                "event": "legacy-readiness-reconciled",
+                                "status": fresh["raw_status"],
+                            }
+                        )
                     elif refresh_readiness and returned_to_query:
-                        fresh["history"].append({"at": now(), "event": "returned-to-query", "status": fresh["raw_status"]})
-                    elif refresh_readiness and fresh["raw_status"] != previous.get("raw_status"):
-                        fresh["history"].append({"at": now(), "event": "jira-status-refreshed", "status": fresh["raw_status"]})
+                        fresh["history"].append(
+                            {
+                                "at": now(),
+                                "event": "returned-to-query",
+                                "status": fresh["raw_status"],
+                            }
+                        )
+                    elif refresh_readiness and fresh["raw_status"] != previous.get(
+                        "raw_status"
+                    ):
+                        fresh["history"].append(
+                            {
+                                "at": now(),
+                                "event": "jira-status-refreshed",
+                                "status": fresh["raw_status"],
+                            }
+                        )
                 prior_scope = fresh.get("scope_assessment") or {}
-                if (cfg.get("runtime_admission") and fresh["state"] == "operator_decision"
-                        and prior_scope.get("decision_kind") == "dependency_reconciliation"
-                        and prior_scope.get("missing_dependencies")
-                        and set(prior_scope["missing_dependencies"]).issubset(fresh.get("dependencies", []))):
+                if (
+                    cfg.get("runtime_admission")
+                    and fresh["state"] == "operator_decision"
+                    and prior_scope.get("decision_kind") == "dependency_reconciliation"
+                    and prior_scope.get("missing_dependencies")
+                    and set(prior_scope["missing_dependencies"]).issubset(
+                        fresh.get("dependencies", [])
+                    )
+                ):
                     fresh["state"] = "pending"
-                    fresh["reason"] = "authenticated prerequisite relationships reconciled; rescoping required"
+                    fresh["reason"] = (
+                        "authenticated prerequisite relationships reconciled; rescoping required"
+                    )
                     fresh["scope_assessment"] = {}
-                    fresh["history"].append({"at": now(), "event": "dependencies-reconciled"})
+                    fresh["history"].append(
+                        {"at": now(), "event": "dependencies-reconciled"}
+                    )
+                elif (
+                    cfg.get("runtime_admission")
+                    and fresh["state"] == "operator_decision"
+                    and prior_scope.get("decision_key")
+                    in cfg.get("decision_registry", {})
+                ):
+                    decision_key = prior_scope["decision_key"]
+                    fresh["state"] = "pending"
+                    fresh["reason"] = (
+                        f"repository decision {decision_key} is approved; rescoping with that policy"
+                    )
+                    fresh.setdefault("resolved_scope_decisions", []).append(
+                        {"at": now(), "decision_key": decision_key}
+                    )
+                    fresh["scope_assessment"] = {}
+                    fresh["history"].append(
+                        {
+                            "at": now(),
+                            "event": "repository-decision-applied",
+                            "decision_key": decision_key,
+                        }
+                    )
                 if cfg.get("runtime_admission") and fresh["state"] == "pending":
                     assessment = fresh.get("scope_assessment") or {}
                     if assessment.get("inventory_digest") != scope_digest(fresh):
@@ -1434,7 +1658,11 @@ def get_state(
 
 
 def validated_scope_assessment(
-    raw: dict[str, Any], ticket: str, max_slices: int, threshold: int
+    raw: dict[str, Any],
+    ticket: str,
+    max_slices: int,
+    threshold: int,
+    required_contracts: list[str] | None = None,
 ) -> dict[str, Any]:
     """Validate a scoper result before it can change controller scheduling."""
     if raw.get("schema_version") != 1:
@@ -1448,7 +1676,9 @@ def validated_scope_assessment(
         )
     score = raw.get("complexity_score")
     if isinstance(score, bool) or not isinstance(score, int) or not 0 <= score <= 100:
-        raise SprintError("scope assessment complexity_score must be an integer from 0 to 100")
+        raise SprintError(
+            "scope assessment complexity_score must be an integer from 0 to 100"
+        )
     if verdict == "ready" and score >= threshold:
         raise SprintError(
             f"complexity score {score} reaches decomposition threshold {threshold}"
@@ -1463,6 +1693,7 @@ def validated_scope_assessment(
     if len(reasons) > 20 or any(len(item) > 2000 for item in reasons):
         raise SprintError("scope assessment reasons exceed the bounded schema")
     slices = raw.get("slices", [])
+    required_contracts = required_contracts or []
     if verdict == "decompose":
         if not isinstance(slices, list) or not 2 <= len(slices) <= max_slices:
             raise SprintError(
@@ -1484,17 +1715,23 @@ def validated_scope_assessment(
             if len(str(item["summary"])) > 255 or len(str(item["behavior"])) > 8000:
                 raise SprintError(f"slice {identifier} exceeds Jira field limits")
             validate_delivery(item, SprintError)
+            validate_contracts(item, required_contracts, SprintError)
             criteria = item.get("acceptance_criteria")
             if (
                 not isinstance(criteria, list)
                 or not criteria
-                or any(not isinstance(value, str) or not value.strip() for value in criteria)
+                or any(
+                    not isinstance(value, str) or not value.strip()
+                    for value in criteria
+                )
             ):
                 raise SprintError(
                     f"slice {identifier} requires testable acceptance_criteria"
                 )
             if len(criteria) > 30 or any(len(value) > 2000 for value in criteria):
-                raise SprintError(f"slice {identifier} acceptance criteria exceed limits")
+                raise SprintError(
+                    f"slice {identifier} acceptance criteria exceed limits"
+                )
             dependencies = item.get("depends_on", [])
             if not isinstance(dependencies, list) or any(
                 not isinstance(value, str) for value in dependencies
@@ -1526,6 +1763,17 @@ def validated_scope_assessment(
             visit(identifier)
     elif slices:
         raise SprintError("only a decompose verdict may include slices")
+    decision_key = str(raw.get("decision_key") or "").strip()
+    decision_question = str(raw.get("decision_question") or "").strip()
+    if verdict == "operator_decision":
+        if decision_key and not re.fullmatch(r"[a-z][a-z0-9_.-]{0,63}", decision_key):
+            raise SprintError(
+                "scope decision_key must be a stable lower-case identifier"
+            )
+        if decision_key and (not decision_question or len(decision_question) > 2000):
+            raise SprintError("scope decision_question is required and must be bounded")
+    elif decision_key or decision_question:
+        raise SprintError("only an operator_decision verdict may identify a decision")
     return {
         "schema_version": 1,
         "ticket": ticket,
@@ -1534,26 +1782,42 @@ def validated_scope_assessment(
         "reasons": [item.strip() for item in reasons],
         "slices": slices,
         "children": raw.get("children", []),
+        "decision_key": decision_key,
+        "decision_question": decision_question,
     }
 
 
 def scope_digest(ticket):
-    return hashlib.sha256(json.dumps({k:ticket.get(k) for k in
-        ("description", "summary", "dependencies", "subtasks")},sort_keys=True).encode()).hexdigest()
+    return hashlib.sha256(
+        json.dumps(
+            {
+                k: ticket.get(k)
+                for k in ("description", "summary", "dependencies", "subtasks")
+            },
+            sort_keys=True,
+        ).encode()
+    ).hexdigest()
 
 
 def record_scope(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
     path = state_path(cfg["state_dir"], str(args.sprint))
     key = normalize_key(args.ticket)
+    shared_root = Path(cfg["shared_root"]).resolve()
     assessment_path = Path(args.assessment).resolve()
-    if assessment_path != cfg["shared_root"] and cfg["shared_root"] not in assessment_path.parents:
+    if assessment_path != shared_root and shared_root not in assessment_path.parents:
         raise SprintError("scope assessment must be stored inside the repository")
     raw = read_json(assessment_path, label="scope assessment")
     assessment = validated_scope_assessment(
-        raw, key, cfg["max_auto_slices"], cfg["decomposition_threshold"]
+        raw,
+        key,
+        cfg["max_auto_slices"],
+        cfg["decomposition_threshold"],
+        cfg.get("required_slice_contracts", []),
     )
-    assessment["artifact"] = str(assessment_path.relative_to(cfg["shared_root"]))
-    assessment["artifact_sha256"] = hashlib.sha256(assessment_path.read_bytes()).hexdigest()
+    assessment["artifact"] = str(assessment_path.relative_to(shared_root))
+    assessment["artifact_sha256"] = hashlib.sha256(
+        assessment_path.read_bytes()
+    ).hexdigest()
     assessment["recorded_at"] = now()
     with locked(path):
         state = load(path)
@@ -1564,20 +1828,32 @@ def record_scope(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         if cfg.get("runtime_admission") and assessment["verdict"] == "ready":
             prerequisites = raw.get("prerequisites")
             if not isinstance(prerequisites, list):
-                raise SprintError("ready scope must explicitly enumerate prerequisites, including an empty list")
+                raise SprintError(
+                    "ready scope must explicitly enumerate prerequisites, including an empty list"
+                )
             prerequisites = sorted(set(normalize_key(key) for key in prerequisites))
             missing = sorted(set(prerequisites) - set(ticket.get("dependencies", [])))
             if missing:
                 assessment["verdict"] = "operator_decision"
                 assessment["decision_kind"] = "dependency_reconciliation"
                 assessment["missing_dependencies"] = missing
-                assessment["reasons"] = ["dependency reconciliation required before implementation: " + ", ".join(missing)]
+                assessment["reasons"] = [
+                    "dependency reconciliation required before implementation: "
+                    + ", ".join(missing)
+                ]
             assessment["prerequisites"] = prerequisites
         assessment["inventory_digest"] = scope_digest(ticket)
         if assessment["verdict"] == "tracking_parent":
             children = assessment.get("children")
-            if not isinstance(children, list) or not children or not all(isinstance(child, str) for child in children) or sorted(children) != sorted(ticket.get("subtasks", [])):
-                raise SprintError("tracking parent assessment must bind every authenticated child exactly once")
+            if (
+                not isinstance(children, list)
+                or not children
+                or not all(isinstance(child, str) for child in children)
+                or sorted(children) != sorted(ticket.get("subtasks", []))
+            ):
+                raise SprintError(
+                    "tracking parent assessment must bind every authenticated child exactly once"
+                )
         ticket["scope_assessment"] = assessment
         verdict = assessment["verdict"]
         if verdict == "tracking_parent":
@@ -1593,6 +1869,31 @@ def record_scope(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
                 f"complexity score {assessment['complexity_score']} requires "
                 f"{len(assessment['slices'])} bounded slices"
             )
+        elif assessment.get("decision_key") in cfg.get("decision_registry", {}):
+            decision_key = assessment["decision_key"]
+            already_applied = any(
+                item.get("decision_key") == decision_key
+                for item in ticket.get("resolved_scope_decisions", [])
+            )
+            if already_applied:
+                ticket["state"] = "operator_decision"
+                ticket["reason"] = (
+                    f"scoping still requires {decision_key} after its approved "
+                    "repository decision was applied"
+                )
+            else:
+                ticket["state"] = "pending"
+                ticket["reason"] = (
+                    f"repository decision {decision_key} is approved; rescoping with that policy"
+                )
+                ticket.setdefault("resolved_scope_decisions", []).append(
+                    {
+                        "at": now(),
+                        "decision_key": decision_key,
+                        "assessment_sha256": assessment["artifact_sha256"],
+                    }
+                )
+                ticket["scope_assessment"] = {}
         else:
             ticket["state"] = "operator_decision"
             ticket["reason"] = "; ".join(assessment["reasons"])
@@ -1618,6 +1919,8 @@ def scope_context(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             "url": ticket.get("url", ""),
             "dependencies": ticket.get("dependencies", []),
             "subtasks": ticket.get("subtasks", []),
+            "resolved_decisions": cfg.get("decision_registry", {}),
+            "required_slice_contracts": cfg.get("required_slice_contracts", []),
         }
     )
 
@@ -1626,18 +1929,27 @@ def record_decomposition(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
     """Close a tracking parent after fresh Jira sync proves every created child."""
     path = state_path(cfg["state_dir"], str(args.sprint))
     key = normalize_key(args.ticket)
-    requested = sorted({normalize_key(value) for value in args.children.split(",") if value.strip()})
+    requested = sorted(
+        {normalize_key(value) for value in args.children.split(",") if value.strip()}
+    )
     if len(requested) < 2:
-        raise SprintError("record-decomposition requires at least two child ticket keys")
+        raise SprintError(
+            "record-decomposition requires at least two child ticket keys"
+        )
     with locked(path):
         state = load(path)
         ticket = state["tickets"].get(key)
         if not ticket or ticket["state"] != "needs_decomposition":
             current = ticket["state"] if ticket else "missing"
-            raise SprintError(f"ticket {key} cannot record decomposition from state {current}")
+            raise SprintError(
+                f"ticket {key} cannot record decomposition from state {current}"
+            )
         missing = sorted(set(requested) - set(state["tickets"]))
         if missing:
-            raise SprintError("decomposition children are absent from inventory: " + ", ".join(missing))
+            raise SprintError(
+                "decomposition children are absent from inventory: "
+                + ", ".join(missing)
+            )
         exact_children = requested == sorted(ticket.get("subtasks", []))
         mode = config_scalar_any_depth(
             cfg["config"], "jira_subtask_decomposition_mode", "sibling"
@@ -1660,7 +1972,8 @@ def record_decomposition(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             and len(expected_labels) == len(assessment_slices)
             and observed_labels == expected_labels
             and all(
-                len(set(state["tickets"][child].get("labels", [])) & expected_labels) == 1
+                len(set(state["tickets"][child].get("labels", [])) & expected_labels)
+                == 1
                 for child in requested
             )
         )
@@ -1676,10 +1989,34 @@ def record_decomposition(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
                 == str(slice_by_label[label].get("summary") or "").strip()
                 and decomposition_provenance(key, slice_by_label[label])
                 in state["tickets"][child].get("labels", [])
-                for label in set(state["tickets"][child].get("labels", [])) & expected_labels
+                for label in set(state["tickets"][child].get("labels", []))
+                & expected_labels
             )
             for child in requested
         )
+        child_by_slice: dict[str, str] = {}
+        for child in requested:
+            child_labels = set(state["tickets"][child].get("labels", []))
+            matching = [
+                str(slice_["id"])
+                for label, slice_ in slice_by_label.items()
+                if label in child_labels
+            ]
+            if len(matching) == 1:
+                child_by_slice[matching[0]] = child
+        dependency_match = len(child_by_slice) == len(assessment_slices)
+        if dependency_match:
+            for slice_ in assessment_slices:
+                child = child_by_slice[str(slice_["id"])]
+                expected = {
+                    child_by_slice[str(dependency)]
+                    for dependency in slice_.get("depends_on", [])
+                }
+                if not expected.issubset(
+                    set(state["tickets"][child].get("dependencies", []))
+                ):
+                    dependency_match = False
+                    break
         source_parent = ticket.get("parent") or ""
         sibling_children = bool(
             mode == "sibling"
@@ -1690,6 +2027,10 @@ def record_decomposition(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
                 for child in requested
             )
         )
+        if not dependency_match:
+            raise SprintError(
+                "created slices are missing one or more authenticated Jira dependency links"
+            )
         if not (exact_children and identity_match) and not sibling_children:
             raise SprintError(
                 "created keys must be authoritative children, or verified sibling slices of a Jira subtask"
@@ -1704,17 +2045,28 @@ def record_decomposition(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
     emit({"ticket": key, "state": "decomposed", "children": requested})
 
 
-def progress_review_ledger(cfg: dict[str, Any], key: str, evidence: str) -> dict[str, Any]:
-    directory = (cfg["shared_root"] / str(load_yaml(cfg["config"]).get(
-        "review_ledger_dir", ".orchestration/.review-ledger"))).resolve()
+def progress_review_ledger(
+    cfg: dict[str, Any], key: str, evidence: str
+) -> dict[str, Any]:
+    directory = (
+        cfg["shared_root"]
+        / str(
+            load_yaml(cfg["config"]).get(
+                "review_ledger_dir", ".orchestration/.review-ledger"
+            )
+        )
+    ).resolve()
     evidence_path = (cfg["shared_root"] / evidence).resolve()
     if evidence_path.parent != directory or evidence_path.suffix != ".json":
-        raise SprintError("progress requires this ticket's canonical review ledger file")
+        raise SprintError(
+            "progress requires this ticket's canonical review ledger file"
+        )
     with locked(evidence_path):
         review = read_json(evidence_path, label="progress review ledger")
     subject = review.get("work_subject") or {}
-    if (subject.get("id") != key
-            or subject.get("repository") != str(cfg["shared_root"].resolve())):
+    if subject.get("id") != key or subject.get("repository") != str(
+        cfg["shared_root"].resolve()
+    ):
         raise SprintError("progress receipt belongs to another ticket or repository")
     return review
 
@@ -1734,80 +2086,141 @@ def record_progress(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         with locked(path):
             snapshot = load(path)
             initial_ticket = snapshot["tickets"].get(key)
-            if not initial_ticket or initial_ticket["state"] not in {"running", "needs_repair", "recoverable"}:
+            if not initial_ticket or initial_ticket["state"] not in {
+                "running",
+                "needs_repair",
+                "recoverable",
+            }:
                 raise SprintError("ticket is not eligible for progress verification")
             require_attempt(initial_ticket, args.attempt_token)
         if args.milestone in {"failing_test", "tests_repaired"}:
             from test_progress import observe, TestProgressError
+
             try:
-                test_observation = observe(cfg["shared_root"], initial_ticket, load_yaml(cfg["config"]),
-                                           args.milestone, args.evidence)
+                test_observation = observe(
+                    cfg["shared_root"],
+                    initial_ticket,
+                    load_yaml(cfg["config"]),
+                    args.milestone,
+                    args.evidence,
+                )
             except TestProgressError as exc:
                 raise SprintError(str(exc)) from exc
         else:
             from github_progress import observe, ProgressError
+
             try:
-                github_observation = observe(cfg["shared_root"], initial_ticket, args.milestone, args.evidence)
+                github_observation = observe(
+                    cfg["shared_root"], initial_ticket, args.milestone, args.evidence
+                )
             except ProgressError as exc:
                 raise SprintError(str(exc)) from exc
     with locked(path):
         state = load(path)
         ticket = state["tickets"].get(key)
-        if not ticket or ticket["state"] not in {"running", "needs_repair", "recoverable"}:
+        if not ticket or ticket["state"] not in {
+            "running",
+            "needs_repair",
+            "recoverable",
+        }:
             current = ticket["state"] if ticket else "missing"
-            raise SprintError(f"ticket {key} cannot record progress from state {current}")
+            raise SprintError(
+                f"ticket {key} cannot record progress from state {current}"
+            )
         require_attempt(ticket, args.attempt_token)
         if initial_ticket is not None and ticket != initial_ticket:
-            raise SprintError("ticket changed during progress verification; retry with the current attempt")
+            raise SprintError(
+                "ticket changed during progress verification; retry with the current attempt"
+            )
         verified = False
         fingerprint = args.evidence.strip()
         if args.milestone == "implementation_commit":
             evidence = args.evidence.strip()
             baseline = (ticket.get("launch_evidence") or {}).get("base_commit", "")
-            if not re.fullmatch(r"[0-9a-f]{40,64}", evidence) or not baseline or evidence == baseline:
-                raise SprintError("implementation progress requires a new full commit SHA after launch")
-            ancestor = subprocess.run(["git", "merge-base", "--is-ancestor", baseline, evidence],
-                                      cwd=cfg["shared_root"], capture_output=True)
-            changed = subprocess.run(["git", "diff", "--quiet", baseline, evidence, "--"],
-                                     cwd=cfg["shared_root"], capture_output=True)
+            if (
+                not re.fullmatch(r"[0-9a-f]{40,64}", evidence)
+                or not baseline
+                or evidence == baseline
+            ):
+                raise SprintError(
+                    "implementation progress requires a new full commit SHA after launch"
+                )
+            ancestor = subprocess.run(
+                ["git", "merge-base", "--is-ancestor", baseline, evidence],
+                cwd=cfg["shared_root"],
+                capture_output=True,
+            )
+            changed = subprocess.run(
+                ["git", "diff", "--quiet", baseline, evidence, "--"],
+                cwd=cfg["shared_root"],
+                capture_output=True,
+            )
             if ancestor.returncode != 0 or changed.returncode != 1:
-                raise SprintError("progress commit must descend from launch HEAD and change its tree")
-            fingerprint = subprocess.check_output(["git", "rev-parse", evidence + "^{tree}"],
-                                                  cwd=cfg["shared_root"], text=True).strip()
+                raise SprintError(
+                    "progress commit must descend from launch HEAD and change its tree"
+                )
+            fingerprint = subprocess.check_output(
+                ["git", "rev-parse", evidence + "^{tree}"],
+                cwd=cfg["shared_root"],
+                text=True,
+            ).strip()
             ticket.setdefault("verified_commits", {})[evidence] = fingerprint
             verified = True
         if args.milestone == "design_passed":
             review = progress_review_ledger(cfg, key, args.evidence.strip())
             rounds = (review.get("design") or {}).get("rounds", [])
             result = rounds[-1].get("result", {}) if rounds else {}
-            if (not rounds or rounds[-1].get("verdict") != "PASS"
-                    or not result.get("phase_permit")
-                    or not any(permit.get("token") == result["phase_permit"]
-                               and permit.get("receipt_consumed_at")
-                               for permit in review.get("review_permits", []))):
-                raise SprintError("design progress requires a consumed PASS receipt for this ticket")
+            if (
+                not rounds
+                or rounds[-1].get("verdict") != "PASS"
+                or not result.get("phase_permit")
+                or not any(
+                    permit.get("token") == result["phase_permit"]
+                    and permit.get("receipt_consumed_at")
+                    for permit in review.get("review_permits", [])
+                )
+            ):
+                raise SprintError(
+                    "design progress requires a consumed PASS receipt for this ticket"
+                )
             fingerprint = str(result["phase_permit"])
             UsageLedger(cfg["shared_root"]).transfer_design_budget(
-                key, budgets_from_config(load_yaml(cfg["config"])), fingerprint)
+                key, budgets_from_config(load_yaml(cfg["config"])), fingerprint
+            )
             verified = True
         if args.milestone == "review_finding_closed":
             try:
                 evidence = json.loads(args.evidence)
                 ledger_file, finding = evidence["ledger"], evidence["finding"]
-                if not isinstance(ledger_file, str) or not isinstance(finding, str) or not finding:
+                if (
+                    not isinstance(ledger_file, str)
+                    or not isinstance(finding, str)
+                    or not finding
+                ):
                     raise ValueError()
             except (ValueError, TypeError, KeyError) as exc:
-                raise SprintError('finding progress requires JSON with "ledger" and "finding"') from exc
+                raise SprintError(
+                    'finding progress requires JSON with "ledger" and "finding"'
+                ) from exc
             review = progress_review_ledger(cfg, key, ledger_file)
             component = review.get("components", {}).get(finding, {})
-            finalized = any(attempt.get("claims_finalized_at") and attempt.get("completed_at")
-                            and finding in attempt.get("closed", [])
-                            for attempt in review.get("repair_attempts", []))
+            finalized = any(
+                attempt.get("claims_finalized_at")
+                and attempt.get("completed_at")
+                and finding in attempt.get("closed", [])
+                for attempt in review.get("repair_attempts", [])
+            )
             claims = component.get("claims") or {}
-            if (not finalized or component.get("status") != "resolved" or not claims
-                    or any(claim.get("status") != "resolved" for claim in claims.values())
-                    or review.get("repair_pending_review")):
-                raise SprintError("finding must be closed by finalized independent review, with no open gate claims")
+            if (
+                not finalized
+                or component.get("status") != "resolved"
+                or not claims
+                or any(claim.get("status") != "resolved" for claim in claims.values())
+                or review.get("repair_pending_review")
+            ):
+                raise SprintError(
+                    "finding must be closed by finalized independent review, with no open gate claims"
+                )
             fingerprint = finding
             verified = True
         if github_observation is not None:
@@ -1815,14 +2228,31 @@ def record_progress(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             fingerprint = github_observation["fingerprint"]
             receipt = github_observation["receipt"]
             ticket["pr"], ticket["branch"] = receipt["url"], receipt["branch"]
+            if args.milestone == "pr_opened":
+                identity = ticket.get("worker_identity") or {}
+                ticket["recovery_binding"] = {
+                    "at": now(),
+                    "attempt": int(ticket.get("attempts") or 0),
+                    "invocation_id": str(identity.get("invocation_id") or ""),
+                    "branch": receipt["branch"],
+                    "pr": receipt["url"],
+                    "head": receipt["head"],
+                    "tree": receipt["tree"],
+                }
             if "ci_highest" in github_observation:
-                ticket.setdefault("ci_progress", {})[receipt["tree"]] = github_observation["ci_highest"]
+                ticket.setdefault("ci_progress", {})[receipt["tree"]] = (
+                    github_observation["ci_highest"]
+                )
         if test_observation is not None:
             verified = test_observation["verified"]
             fingerprint = test_observation["fingerprint"]
-            ticket.setdefault("test_progress", {})[test_observation["definition"]] = test_observation["cases"]
+            ticket.setdefault("test_progress", {})[test_observation["definition"]] = (
+                test_observation["cases"]
+            )
         spent = usage_snapshots(cfg).get(key, {}).get("spent_usd", 0.0)
-        event = {"verified": verified, "fingerprint": fingerprint,
+        event = {
+            "verified": verified,
+            "fingerprint": fingerprint,
             "at": now(),
             "attempt": int(ticket.get("attempts") or 0),
             "milestone": args.milestone,
@@ -1833,13 +2263,25 @@ def record_progress(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             event["receipt"] = github_observation["receipt"]
         if test_observation is not None:
             event["receipt"] = test_observation["receipt"]
-        previous = next((item for item in ticket.get("progress", [])
-                         if item.get("milestone") == event["milestone"]
-                         and item.get("fingerprint", item.get("evidence")) == fingerprint), None)
+        previous = next(
+            (
+                item
+                for item in ticket.get("progress", [])
+                if item.get("milestone") == event["milestone"]
+                and item.get("fingerprint", item.get("evidence")) == fingerprint
+            ),
+            None,
+        )
         if previous:
             save(path, state)
-            emit({"ticket": key, "state": ticket["state"], "progress": previous,
-                  "duplicate": True})
+            emit(
+                {
+                    "ticket": key,
+                    "state": ticket["state"],
+                    "progress": previous,
+                    "duplicate": True,
+                }
+            )
             return
         ticket.setdefault("progress", []).append(event)
         ticket["history"].append({"at": event["at"], "event": "progress", **event})
@@ -1864,9 +2306,17 @@ def legacy_reconciliation(state):
             action = "classify_preserved_outcome"
         else:
             action = "verify_jira_readiness"
-        result.append({"key": key, "state": ticket["state"], "reason": reason,
-                       "next_action": action, "pr": ticket.get("pr"),
-                       "children": ticket.get("subtasks", []), "dependencies": ticket.get("dependencies", [])})
+        result.append(
+            {
+                "key": key,
+                "state": ticket["state"],
+                "reason": reason,
+                "next_action": action,
+                "pr": ticket.get("pr"),
+                "children": ticket.get("subtasks", []),
+                "dependencies": ticket.get("dependencies", []),
+            }
+        )
     return result
 
 
@@ -1878,16 +2328,25 @@ def reconcile_legacy(args, cfg):
         state = load(path)
         ticket = state["tickets"].get(key)
         if not ticket or ticket["state"] not in {"blocked", "user_action"}:
-            raise SprintError("legacy reconciliation requires a blocked or user_action ticket")
+            raise SprintError(
+                "legacy reconciliation requires a blocked or user_action ticket"
+            )
         if args.classification not in {"operator_decision", "external_blocked"}:
             raise SprintError("legacy classification cannot authorize launches")
         if not args.reason.strip():
             raise SprintError("legacy reconciliation requires an evidence-based reason")
         # Only non-launching classifications are accepted here. Restart/recovery
         # or authenticated decomposition bindings remain separate transitions.
-        ticket.setdefault("history", []).append({"at": now(), "event": "legacy-classified",
-            "previous_state": ticket["state"], "previous_reason": ticket.get("reason", ""),
-            "state": args.classification, "reason": args.reason})
+        ticket.setdefault("history", []).append(
+            {
+                "at": now(),
+                "event": "legacy-classified",
+                "previous_state": ticket["state"],
+                "previous_reason": ticket.get("reason", ""),
+                "state": args.classification,
+                "reason": args.reason,
+            }
+        )
         ticket["state"], ticket["reason"] = args.classification, args.reason
         save(path, state)
     emit({"ticket": key, "state": ticket["state"]})
@@ -1895,7 +2354,9 @@ def reconcile_legacy(args, cfg):
 
 def progress_spending(ticket, cfg, spent):
     milestones = [item for item in ticket.get("progress", []) if item.get("verified")]
-    baseline = max((float(item.get("spent_usd", 0)) for item in milestones), default=0.0)
+    baseline = max(
+        (float(item.get("spent_usd", 0)) for item in milestones), default=0.0
+    )
     grant = authorized_restart_grant(cfg["shared_root"], ticket["key"])
     if grant and ticket.get("restart_grant_id") == grant["grant_id"]:
         baseline = max(baseline, float(grant["allowances"]["progress_baseline_usd"]))
@@ -1905,7 +2366,10 @@ def progress_spending(ticket, cfg, spent):
 def spending_admission_reason(ticket, cfg, spend):
     if spend.get("state") == "operator_action":
         return "ticket spending or execution-count ceiling requires operator action"
-    if progress_spending(ticket, cfg, spend.get("spent_usd", 0)) >= cfg["max_usd_without_progress"]:
+    if (
+        progress_spending(ticket, cfg, spend.get("spent_usd", 0))
+        >= cfg["max_usd_without_progress"]
+    ):
         return "max_usd_without_progress: verified progress or a root-issued restart allowance is required"
     return None
 
@@ -1922,9 +2386,191 @@ def runtime_admission(cfg, role="sprint-worker"):
             else {"provider": route["provider"], "role": role, **status}
         )
     if not route.get("model"):
-        return {"provider": route["provider"], "state": "unconfigured", "reason": "explicit role model required"}
-    status = ProviderHealth(cfg["shared_root"]).status(route["provider"], route_identity(route))
-    return {"provider": route["provider"], "role": role, **status} if status["state"] != "healthy" else None
+        return {
+            "provider": route["provider"],
+            "state": "unconfigured",
+            "reason": "explicit role model required",
+        }
+    status = ProviderHealth(cfg["shared_root"]).status(
+        route["provider"], route_identity(route)
+    )
+    return (
+        {"provider": route["provider"], "role": role, **status}
+        if status["state"] != "healthy"
+        else None
+    )
+
+
+def preserved_pr_reconciliation_candidate(ticket, cfg, spend):
+    """Identify a stopped PR that can be proven and resumed as bounded repair."""
+    return bool(
+        cfg.get("preserved_pr_auto_recovery")
+        and ticket.get("state") == "recoverable"
+        and ticket.get("pr")
+        and ticket.get("branch")
+        and int(ticket.get("attempts") or 0) > 0
+        and not spend.get("reserved_usd", 0)
+        and (
+            ticket.get("verified_commits")
+            or any(
+                item.get("verified")
+                and item.get("milestone") == "implementation_commit"
+                for item in ticket.get("progress", [])
+            )
+        )
+    )
+
+
+def branch_worktree(root: Path, branch: str, configured_base: str) -> Path:
+    try:
+        result = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise SprintError("cannot enumerate preserved worktrees") from exc
+    records = result.stdout.strip().split("\n\n") if result.stdout.strip() else []
+    matches = []
+    for record in records:
+        fields = {}
+        for line in record.splitlines():
+            name, _, value = line.partition(" ")
+            fields[name] = value
+        if fields.get("branch") == f"refs/heads/{branch}" and fields.get("worktree"):
+            matches.append(Path(fields["worktree"]).resolve())
+    if len(matches) != 1:
+        raise SprintError("preserved PR branch must identify exactly one worktree")
+    base = Path(configured_base)
+    base = (base if base.is_absolute() else root / base).resolve()
+    try:
+        matches[0].relative_to(base)
+    except ValueError as exc:
+        raise SprintError(
+            "preserved PR worktree is outside the configured worktree root"
+        ) from exc
+    return matches[0]
+
+
+def worktree_is_quiescent(path: Path) -> bool:
+    """Require a clean Linux worktree with no process cwd or open fd beneath it."""
+    if not sys.platform.startswith("linux") or not Path("/proc").is_dir():
+        return False
+    try:
+        status = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            cwd=path,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if status.stdout.strip():
+        return False
+    prefix = str(path) + os.sep
+    for process in Path("/proc").glob("[0-9]*"):
+        if process.name == str(os.getpid()):
+            continue
+        candidates = [process / "cwd"]
+        try:
+            candidates.extend((process / "fd").iterdir())
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            pass
+        for candidate in candidates:
+            try:
+                target = str(candidate.resolve(strict=True))
+            except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+                continue
+            if target == str(path) or target.startswith(prefix):
+                return False
+    return True
+
+
+def reconcile_preserved_pr(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
+    """Convert a mechanically verified stopped PR into a bounded repair continuation."""
+    path = state_path(cfg["state_dir"], str(args.sprint))
+    key = normalize_key(args.ticket)
+    with locked(path):
+        state = load(path)
+        ticket = state["tickets"].get(key)
+        spend = usage_snapshots(cfg).get(key, {})
+        if not ticket or not preserved_pr_reconciliation_candidate(ticket, cfg, spend):
+            raise SprintError(
+                f"ticket {key} is not eligible for preserved PR reconciliation"
+            )
+        snapshot = json.loads(json.dumps(ticket))
+    from github_progress import ProgressError, observe
+
+    try:
+        observation = observe(
+            cfg["shared_root"], snapshot, "pr_opened", str(snapshot["pr"])
+        )
+    except ProgressError as exc:
+        raise SprintError(str(exc)) from exc
+    configured_base = config_scalar(cfg["config"], "worktree_base", ".claude/worktrees")
+    worktree = branch_worktree(
+        cfg["shared_root"], str(snapshot["branch"]), configured_base
+    )
+    if not worktree_is_quiescent(worktree):
+        raise SprintError(
+            "preserved PR worktree is dirty, active, or cannot be proven quiescent"
+        )
+    identity = snapshot.get("worker_identity")
+    if (
+        isinstance(identity, dict)
+        and identity.get("kind") == "execution_unit"
+        and execution_unit_status(identity) == "live"
+    ):
+        raise SprintError("preserved PR execution unit is still live")
+    with locked(path):
+        state = load(path)
+        ticket = state["tickets"].get(key)
+        if ticket != snapshot:
+            raise SprintError("ticket changed during preserved PR verification; retry")
+        ticket["state"] = "pending"
+        ticket["reason"] = (
+            "preserved PR and clean quiescent worktree verified for bounded repair"
+        )
+        ticket["next_launch_continuation"] = True
+        ticket["run_ref"] = ""
+        ticket["attempt_token"] = ""
+        ticket["attempt_capability"] = {}
+        ticket["worker_identity"] = ""
+        ticket["attach_capability"] = ""
+        ticket["attached_at"] = ""
+        ticket["launch_evidence"] = {}
+        ticket["recovery_binding"] = {
+            "at": now(),
+            "attempt": int(ticket.get("attempts") or 0),
+            "invocation_id": str(
+                (ticket.get("last_terminal") or {}).get("invocation_id") or ""
+            ),
+            "worktree": str(worktree),
+            "branch": observation["receipt"]["branch"],
+            "pr": observation["receipt"]["url"],
+            "head": observation["receipt"]["head"],
+            "tree": observation["receipt"]["tree"],
+        }
+        ticket.setdefault("history", []).append(
+            {
+                "at": now(),
+                "event": "preserved-pr-reconciled",
+                "binding": ticket["recovery_binding"],
+            }
+        )
+        save(path, state)
+    emit(
+        {
+            "ticket": key,
+            "state": "needs_repair",
+            "recovery_binding": ticket["recovery_binding"],
+        }
+    )
 
 
 def health_check(args, cfg):
@@ -1934,11 +2580,17 @@ def health_check(args, cfg):
 def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
     runtime_hold = runtime_admission(cfg)
     scope_hold = runtime_admission(cfg, "ticket-scoper")
-    health_probes = [dict(provider=hold["provider"], role=hold.get("role", "sprint-worker"),
-                         retry_at=max(hold.get("retry_at",0),hold.get("probe_until",0)))
-                     for hold in (runtime_hold, scope_hold) if hold
-                     and hold["state"] in {"unverified", "rate_limited", "transport"}
-                     and hold.get("probe_count",0)<3]
+    health_probes = [
+        dict(
+            provider=hold["provider"],
+            role=hold.get("role", "sprint-worker"),
+            retry_at=max(hold.get("retry_at", 0), hold.get("probe_until", 0)),
+        )
+        for hold in (runtime_hold, scope_hold)
+        if hold
+        and hold["state"] in {"unverified", "rate_limited", "transport"}
+        and hold.get("probe_count", 0) < 3
+    ]
     spend = usage_snapshots(cfg)
     cycles = find_cycles(state["tickets"])
     running = sorted(
@@ -1950,7 +2602,15 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
             set(
                 blockers(state, ticket["key"], cfg, cycles)
                 + ([reason] if (reason := attempt_limit_reason(ticket, cfg)) else [])
-                + ([reason] if (reason := spending_admission_reason(ticket, cfg, spend.get(ticket["key"], {}))) else [])
+                + (
+                    [reason]
+                    if (
+                        reason := spending_admission_reason(
+                            ticket, cfg, spend.get(ticket["key"], {})
+                        )
+                    )
+                    else []
+                )
             )
         )
         for ticket in ordered
@@ -1987,19 +2647,42 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
         if ticket["state"] == "pending" and admission_reasons[ticket["key"]]
     ]
     decomposition, repair, recovery = [], [], []
+    pr_reconciliation = sorted(
+        ticket["key"]
+        for ticket in ordered
+        if preserved_pr_reconciliation_candidate(
+            ticket, cfg, spend.get(ticket["key"], {})
+        )
+    )
+    pr_reconciliation_set = set(pr_reconciliation)
     recovery_waiting = []
     retry_waiting = []
     decisions = []
     for ticket in ordered:
         key, status = ticket["key"], ticket["state"]
-        failure = current_startup_failure(ticket, cfg) if status == "recoverable" else None
+        if key in pr_reconciliation_set:
+            continue
+        failure = (
+            current_startup_failure(ticket, cfg) if status == "recoverable" else None
+        )
         if failure:
             try:
-                retry_at = datetime.fromisoformat(failure["finished_at"].replace("Z", "+00:00")).timestamp() + 30
+                retry_at = (
+                    datetime.fromisoformat(
+                        failure["finished_at"].replace("Z", "+00:00")
+                    ).timestamp()
+                    + 30
+                )
             except (ValueError, TypeError):
                 retry_at = 0
             if time.time() < retry_at and attempt_limit_reason(ticket, cfg) is None:
-                retry_waiting.append({"key": key, "retry_at": retry_at, "reason": "provider startup cooldown"})
+                retry_waiting.append(
+                    {
+                        "key": key,
+                        "retry_at": retry_at,
+                        "reason": "provider startup cooldown",
+                    }
+                )
                 continue
         if status in {"completed", "decomposed", "running"}:
             continue
@@ -2009,7 +2692,12 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
         if status in {"pending", "recoverable", "needs_repair"}:
             if reason := attempt_limit_reason(ticket, cfg):
                 reasons.append(reason)
-        if status in {"operator_decision", "user_action", "blocked", "external_blocked"}:
+        if status in {
+            "operator_decision",
+            "user_action",
+            "blocked",
+            "external_blocked",
+        }:
             reasons.append(ticket.get("reason") or status)
         if status == "needs_decomposition" and not cfg["auto_decompose_large_tickets"]:
             reasons.append("automatic decomposition is disabled by repository policy")
@@ -2018,7 +2706,8 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
             identity = ticket.get("worker_identity")
             unit_status = (
                 execution_unit_status(identity)
-                if isinstance(identity, dict) and identity.get("kind") == "execution_unit"
+                if isinstance(identity, dict)
+                and identity.get("kind") == "execution_unit"
                 else "unknown"
             )
             if unit_status == "live":
@@ -2031,7 +2720,9 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
             elif not automatic_recovery_available(ticket, cfg, unit_status):
                 reasons.append("recovery requires external execution-unit authority")
         if reasons:
-            decisions.append({"key": key, "state": status, "reasons": sorted(set(reasons))})
+            decisions.append(
+                {"key": key, "state": status, "reasons": sorted(set(reasons))}
+            )
         elif status == "needs_decomposition":
             decomposition.append(key)
         elif status == "needs_repair":
@@ -2044,8 +2735,7 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
     unfinished_prs = sorted(
         ticket["key"]
         for ticket in ordered
-        if ticket.get("pr")
-        and ticket["state"] not in {"completed", "decomposed"}
+        if ticket.get("pr") and ticket["state"] not in {"completed", "decomposed"}
     )
     active_unfinished_prs = sorted(
         ticket["key"]
@@ -2053,25 +2743,31 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
         if ticket.get("pr")
         and (
             ticket["state"] in {"running", "needs_repair", "recoverable"}
-            or (
-                ticket["state"] == "pending"
-                and ticket.get("next_launch_continuation")
-            )
+            or (ticket["state"] == "pending" and ticket.get("next_launch_continuation"))
         )
     )
     available = max(0, cfg["concurrency_max"] - occupied)
-    finish_first = bool(repair or recovery)
+    finish_first = bool(repair or recovery or pr_reconciliation)
     wip_limited = len(active_unfinished_prs) >= int(
         cfg.get("max_unmerged_prs", cfg["concurrency_max"])
     )
     continuation_ready = [
         key for key in ready if state["tickets"][key].get("next_launch_continuation")
     ]
-    fresh_ready = [key for key in ready if key not in continuation_ready]
+    pr_ready = [
+        key
+        for key in ready
+        if cfg.get("pr_drain_first")
+        and key not in continuation_ready
+        and state["tickets"][key].get("pr")
+    ]
+    fresh_ready = [
+        key for key in ready if key not in continuation_ready and key not in pr_ready
+    ]
     if finish_first:
         launch = []
     else:
-        launch = continuation_ready[:available]
+        launch = (continuation_ready + pr_ready)[:available]
         if not wip_limited and len(launch) < available:
             launch.extend(fresh_ready[: available - len(launch)])
     stalled = []
@@ -2086,7 +2782,9 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
                     "key": key,
                     "usd_since_progress": round(delta, 6),
                     "threshold_usd": cfg["max_usd_without_progress"],
-                    "last_milestone": progress[-1].get("milestone") if progress else None,
+                    "last_milestone": progress[-1].get("milestone")
+                    if progress
+                    else None,
                 }
             )
     needed_roles = set()
@@ -2108,7 +2806,9 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
             "reason": (
                 "finish existing repair or recovery work first"
                 if finish_first
-                else "unfinished PR limit reached" if wip_limited else ""
+                else "unfinished PR limit reached"
+                if wip_limited
+                else ""
             ),
         },
         "running": running,
@@ -2120,6 +2820,7 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
         "decomposition": decomposition,
         "repair": [] if runtime_hold else repair,
         "recovery": [] if runtime_hold else recovery,
+        "pr_reconciliation": pr_reconciliation,
         "recovery_waiting": recovery_waiting,
         "retry_waiting": retry_waiting,
         "legacy_reconciliation": legacy_reconciliation(state),
@@ -2127,7 +2828,16 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
         "stalled": stalled,
         "waiting": waiting,
         "autonomous_work_remaining": bool(
-            health_probes or running or (launch and not runtime_hold) or scope or decomposition or (repair and not runtime_hold) or (recovery and not runtime_hold) or recovery_waiting or (retry_waiting and not runtime_hold)
+            health_probes
+            or running
+            or (launch and not runtime_hold)
+            or scope
+            or decomposition
+            or (repair and not runtime_hold)
+            or (recovery and not runtime_hold)
+            or pr_reconciliation
+            or recovery_waiting
+            or (retry_waiting and not runtime_hold)
         ),
         "over_capacity": max(0, occupied - cfg["concurrency_max"]),
         "spend": spend,
@@ -2159,11 +2869,19 @@ def prepare_batch(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
     if provider not in {"anthropic", "openai"}:
         raise SprintError("batch provider must be anthropic or openai")
 
-    route = llm_route_from_config(cfg["config"], "sprint-worker") if cfg.get("runtime_admission") else None
+    route = (
+        llm_route_from_config(cfg["config"], "sprint-worker")
+        if cfg.get("runtime_admission")
+        else None
+    )
     if route and (route["execution"] != "api" or route["provider"] != provider):
-        raise SprintError("batch provider must match the configured API sprint-worker route")
+        raise SprintError(
+            "batch provider must match the configured API sprint-worker route"
+        )
     if hold := runtime_admission(cfg):
-        raise SprintError("provider admission held: " + json.dumps(hold, sort_keys=True))
+        raise SprintError(
+            "provider admission held: " + json.dumps(hold, sort_keys=True)
+        )
     jobs: dict[str, dict[str, Any]] = {}
     for job in raw_jobs:
         if not isinstance(job, dict):
@@ -2480,10 +3198,16 @@ def submit_batch(
             "legacy batch is fenced; run inspect-batch for operator recovery"
         )
     if cfg.get("runtime_admission"):
-        if marker.get("reserved_route") != llm_route_from_config(cfg["config"], "sprint-worker"):
-            raise SprintError("batch route changed after preparation; reconcile before submission")
+        if marker.get("reserved_route") != llm_route_from_config(
+            cfg["config"], "sprint-worker"
+        ):
+            raise SprintError(
+                "batch route changed after preparation; reconcile before submission"
+            )
         if hold := runtime_admission(cfg):
-            raise SprintError("provider admission held: " + json.dumps(hold, sort_keys=True))
+            raise SprintError(
+                "provider admission held: " + json.dumps(hold, sort_keys=True)
+            )
     receipt = run_batch_adapter(
         "submit", marker_path, cfg, in_process_runner=in_process_runner
     )
@@ -2775,7 +3499,9 @@ def reserve(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
     if not args.run_ref.strip():
         raise SprintError("run reference must not be empty")
     if hold := runtime_admission(cfg):
-        raise SprintError("provider admission held: " + json.dumps(hold, sort_keys=True))
+        raise SprintError(
+            "provider admission held: " + json.dumps(hold, sort_keys=True)
+        )
     with locked(path):
         state = load(path)
         if key not in state["tickets"]:
@@ -2785,14 +3511,19 @@ def reserve(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             raise SprintError(
                 f"ticket {key} cannot be reserved from state {ticket['state']}"
             )
-        if cfg.get("runtime_admission") and (ticket.get("scope_assessment") or {}).get("verdict") != "ready":
+        if (
+            cfg.get("runtime_admission")
+            and (ticket.get("scope_assessment") or {}).get("verdict") != "ready"
+        ):
             raise SprintError("ticket requires bounded pre-implementation scoping")
         reasons = blockers(state, key, cfg)
         if reasons:
             raise SprintError(f"ticket {key} is blocked: {'; '.join(reasons)}")
         running = sum(
-            1 for value in state["tickets"].values()
-            if value["state"] == "running" or (
+            1
+            for value in state["tickets"].values()
+            if value["state"] == "running"
+            or (
                 value["state"] in {"recoverable", "needs_repair"}
                 and isinstance(value.get("worker_identity"), dict)
                 and value["worker_identity"].get("kind") == "execution_unit"
@@ -2819,7 +3550,9 @@ def reserve(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         limit_reason = attempt_limit_reason(ticket, cfg)
         if limit_reason:
             raise SprintError(f"ticket {key} is blocked: {limit_reason}")
-        if reason := spending_admission_reason(ticket, cfg, usage_snapshots(cfg).get(key, {})):
+        if reason := spending_admission_reason(
+            ticket, cfg, usage_snapshots(cfg).get(key, {})
+        ):
             raise SprintError(f"ticket {key} is blocked: {reason}")
         current_plan = plan_value(state, cfg)
         if key not in current_plan["launch"]:
@@ -2828,21 +3561,23 @@ def reserve(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
                 "finish repair, recovery, continuation, or WIP work first"
             )
         if cfg.get("runtime_admission"):
-            ticket["reserved_route"] = llm_route_from_config(cfg["config"], "sprint-worker")
+            ticket["reserved_route"] = llm_route_from_config(
+                cfg["config"], "sprint-worker"
+            )
         ticket["state"] = "running"
         ticket["reason"] = ""
         ticket["run_ref"] = args.run_ref
         requested_continuation = bool(ticket.pop("next_launch_continuation", False))
-        continuation = requested_continuation and int(ticket.get("continuations") or 0) < int(
-            cfg.get("max_worker_continuations", 6)
-        )
+        continuation = requested_continuation and int(
+            ticket.get("continuations") or 0
+        ) < int(cfg.get("max_worker_continuations", 6))
         ticket["attempts"] += 1
         if continuation:
             ticket["continuations"] = int(ticket.get("continuations") or 0) + 1
         else:
-            ticket["charged_attempts"] = int(
-                ticket.get("charged_attempts", ticket["attempts"] - 1) or 0
-            ) + 1
+            ticket["charged_attempts"] = (
+                int(ticket.get("charged_attempts", ticket["attempts"] - 1) or 0) + 1
+            )
         ticket["attempt_token"] = "attempt_" + uuid.uuid4().hex
         capability_run_id = args.run_id or args.run_ref
         capability = {
@@ -3020,34 +3755,63 @@ def supervise_local(args: argparse.Namespace, _cfg: dict[str, Any]) -> None:
         if subscription_route:
             route = llm_route_from_config(_cfg["config"], "sprint-worker")
             if not model_less_desktop_route(route):
-                raise SprintError("subscription launch no longer matches repository policy")
+                raise SprintError(
+                    "subscription launch no longer matches repository policy"
+                )
             command = subscription_launch_command(command, route)
             child_env = subscription_child_environment(
                 child_env, str(route["provider"])
             )
         elif Path(command[0]).name == "claude":
-            from native_gateway import NativeGateway, claude_child_environment, claude_launch_arguments
+            from native_gateway import (
+                NativeGateway,
+                claude_child_environment,
+                claude_launch_arguments,
+            )
+
             load_orchestration_env(_cfg["config"])
             if not os.environ.get("ANTHROPIC_API_KEY"):
-                raise SprintError("native Claude budget enforcement requires ANTHROPIC_API_KEY")
-            gateway = NativeGateway(_cfg["shared_root"], load_yaml(_cfg["config"]),
-                                    args.ticket, args.sprint, args.invocation_id)
+                raise SprintError(
+                    "native Claude budget enforcement requires ANTHROPIC_API_KEY"
+                )
+            gateway = NativeGateway(
+                _cfg["shared_root"],
+                load_yaml(_cfg["config"]),
+                args.ticket,
+                args.sprint,
+                args.invocation_id,
+            )
             endpoint = gateway.start()
             child_env = claude_child_environment(child_env, gateway.token, endpoint)
             command = claude_launch_arguments(command, gateway.token, endpoint)
         elif Path(command[0]).name == "codex":
-            from codex_gateway import CodexGateway, child_environment, install_launcher, launch_arguments
+            from codex_gateway import (
+                CodexGateway,
+                child_environment,
+                install_launcher,
+                launch_arguments,
+            )
+
             load_orchestration_env(_cfg["config"])
             if not os.environ.get("OPENAI_API_KEY"):
-                raise SprintError("native Codex budget enforcement requires OPENAI_API_KEY")
+                raise SprintError(
+                    "native Codex budget enforcement requires OPENAI_API_KEY"
+                )
             executable = shutil.which(command[0])
             if not executable:
                 raise SprintError("native Codex executable was not found")
-            gateway = CodexGateway(_cfg["shared_root"], load_yaml(_cfg["config"]),
-                                   args.ticket, args.sprint, args.invocation_id)
+            gateway = CodexGateway(
+                _cfg["shared_root"],
+                load_yaml(_cfg["config"]),
+                args.ticket,
+                args.sprint,
+                args.invocation_id,
+            )
             endpoint = gateway.start()
             child_env = child_environment(child_env, gateway.token, endpoint)
-            install_launcher(ready_path.parent / (args.invocation_id + ".bin"), executable, child_env)
+            install_launcher(
+                ready_path.parent / (args.invocation_id + ".bin"), executable, child_env
+            )
             command = launch_arguments([executable, *command[1:]], endpoint)
         if args.stdin_file:
             input_handle = Path(args.stdin_file).open("rb")
@@ -3079,13 +3843,18 @@ def supervise_local(args: argparse.Namespace, _cfg: dict[str, Any]) -> None:
                     lane = snapshot.get("tickets", {}).get(args.ticket, {})
                     if lane_invocation_matches(lane, args.invocation_id):
                         progress_count = sum(
-                            1 for item in lane.get("progress", []) if item.get("verified")
+                            1
+                            for item in lane.get("progress", [])
+                            if item.get("verified")
                         )
                         if progress_count > last_progress_count:
                             last_progress_count = progress_count
                             last_activity = time.monotonic()
                         spend = usage_snapshots(_cfg).get(args.ticket, {})
-                        if progress_spending(lane, _cfg, spend.get("spent_usd", 0)) >= _cfg["max_usd_without_progress"]:
+                        if (
+                            progress_spending(lane, _cfg, spend.get("spent_usd", 0))
+                            >= _cfg["max_usd_without_progress"]
+                        ):
                             stop_reason = "max_usd_without_progress"
                 if time.monotonic() - started >= max_lifetime_seconds:
                     stop_reason = lifetime_reason
@@ -3172,17 +3941,33 @@ def supervise_local(args: argparse.Namespace, _cfg: dict[str, Any]) -> None:
         with locked(checkpoint):
             state = load(checkpoint)
             lane = state.get("tickets", {}).get(args.ticket, {})
-            if (lane_invocation_matches(lane, args.invocation_id)
-                    and lane.get("state") == "running"):
+            if (
+                lane_invocation_matches(lane, args.invocation_id)
+                and lane.get("state") == "running"
+            ):
                 terminal["attempt"] = int(lane.get("attempts") or 0)
                 # Shared admission pressure can disappear when another lane's
                 # reservation is released. Keep it in automatic recovery; the
                 # ledger rechecks capacity before any subsequent paid request.
-                shared_pressure = stop_reason.startswith("max_usd_per_sprint would be exceeded:")
-                lane["state"] = "operator_decision" if not shared_pressure and ("budget" in stop_reason or "usd" in stop_reason) else "recoverable"
+                shared_pressure = stop_reason.startswith(
+                    "max_usd_per_sprint would be exceeded:"
+                )
+                lane["state"] = (
+                    "operator_decision"
+                    if not shared_pressure
+                    and ("budget" in stop_reason or "usd" in stop_reason)
+                    else "recoverable"
+                )
                 lane["reason"] = stop_reason
                 lane["last_terminal"] = terminal
-                lane.setdefault("history", []).append({"at": now(), "event": "supervisor-stopped", "state": lane["state"], "reason": stop_reason})
+                lane.setdefault("history", []).append(
+                    {
+                        "at": now(),
+                        "event": "supervisor-stopped",
+                        "state": lane["state"],
+                        "reason": stop_reason,
+                    }
+                )
                 save(checkpoint, state)
 
 
@@ -3258,9 +4043,13 @@ def launch_local(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         if cfg.get("runtime_admission"):
             route = llm_route_from_config(cfg["config"], "sprint-worker")
             if ticket.get("reserved_route") != route:
-                raise SprintError("reservation route is missing or changed; reconcile before launch")
+                raise SprintError(
+                    "reservation route is missing or changed; reconcile before launch"
+                )
             if hold := runtime_admission(cfg):
-                raise SprintError("provider admission held: " + json.dumps(hold, sort_keys=True))
+                raise SprintError(
+                    "provider admission held: " + json.dumps(hold, sort_keys=True)
+                )
             command = validate_native_command(command, route)
         invocation_id = uuid.uuid4().hex
         runtime_prefix = cfg["state_dir"] / f"execution-{invocation_id}"
@@ -3280,8 +4069,12 @@ def launch_local(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             "ack_path": str(ack_path),
             "tombstone_path": str(tombstone_path),
             "created_at": now(),
-            "base_commit": subprocess.run(["git", "rev-parse", "--verify", "HEAD"],
-                                           cwd=cfg["shared_root"], capture_output=True, text=True).stdout.strip(),
+            "base_commit": subprocess.run(
+                ["git", "rev-parse", "--verify", "HEAD"],
+                cwd=cfg["shared_root"],
+                capture_output=True,
+                text=True,
+            ).stdout.strip(),
         }
         # Persist the launch intent first. A controller crash can then fence the
         # lane for reconciliation instead of allowing a duplicate launch.
@@ -3294,8 +4087,10 @@ def launch_local(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             "--config",
             str(cfg["config"]),
             "supervise-local",
-            "--ticket", key,
-            "--sprint", str(args.sprint),
+            "--ticket",
+            key,
+            "--sprint",
+            str(args.sprint),
             "--invocation-id",
             invocation_id,
             "--ready",
@@ -3328,7 +4123,9 @@ def launch_local(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             ]
         elif os.environ.get("ORCHESTRATION_TEST_MODE") == "1":
             containment = "test-supervisor"
-        evidence["cooperative_auto_recovery"] = cfg.get("cooperative_auto_recovery", False)
+        evidence["cooperative_auto_recovery"] = cfg.get(
+            "cooperative_auto_recovery", False
+        )
         evidence["containment"] = containment
         evidence["unit_name"] = unit_name
         ticket["launch_evidence"] = evidence
@@ -3502,9 +4299,13 @@ def requeue(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             and terminal.get("invocation_id")
             and terminal.get("invocation_id") == identity.get("invocation_id")
         )
-        stop_reason = str(terminal.get("stop_reason") or "") if terminal_matches_attempt else ""
+        stop_reason = (
+            str(terminal.get("stop_reason") or "") if terminal_matches_attempt else ""
+        )
         ticket["next_launch_continuation"] = bool(
-            made_progress and stop_reason in {
+            made_progress
+            and stop_reason
+            in {
                 "max_worker_idle_seconds",
                 "max_worker_lifetime_seconds",
                 "max_worker_seconds",
@@ -3540,19 +4341,37 @@ def restart_ticket(args, cfg):
             raise SprintError("restart requires an existing stopped, incomplete ticket")
         identity = ticket.get("worker_identity")
         if identity and not automatic_recovery_available(ticket, cfg):
-            raise SprintError("restart requires verified stopped execution evidence; recover legacy identity first")
+            raise SprintError(
+                "restart requires verified stopped execution evidence; recover legacy identity first"
+            )
         if not identity and ticket.get("attempts"):
             events = [item.get("event") for item in ticket.get("history", [])]
-            recoveries = [i for i, event in enumerate(events) if event in {"requeued", "terminal-recovered", "legacy-recovered"}]
-            launches = [i for i, event in enumerate(events) if event in {"reserved", "worker-launched"}]
+            recoveries = [
+                i
+                for i, event in enumerate(events)
+                if event in {"requeued", "terminal-recovered", "legacy-recovered"}
+            ]
+            launches = [
+                i
+                for i, event in enumerate(events)
+                if event in {"reserved", "worker-launched"}
+            ]
             if not recoveries or max(recoveries) <= max(launches, default=-1):
-                raise SprintError("restart requires recovery of the previous unverified attempt")
+                raise SprintError(
+                    "restart requires recovery of the previous unverified attempt"
+                )
         usage = usage_snapshots(cfg).get(key, {})
         if usage.get("reserved_usd", 0):
-            raise SprintError("restart requires reconciliation of outstanding provider reservations")
+            raise SprintError(
+                "restart requires reconciliation of outstanding provider reservations"
+            )
         try:
             token = operator_capability(args)
-            grant = authorized_restart_grant(cfg["shared_root"], key, token) if token else authorized_restart_grant(cfg["shared_root"], key)
+            grant = (
+                authorized_restart_grant(cfg["shared_root"], key, token)
+                if token
+                else authorized_restart_grant(cfg["shared_root"], key)
+            )
         except AuthorityError as exc:
             raise SprintError(str(exc)) from exc
         if not grant:
@@ -3560,25 +4379,51 @@ def restart_ticket(args, cfg):
         if ticket.get("restart_grant_id") == grant["grant_id"]:
             emit({"ticket": key, "already_applied": True, "state": ticket["state"]})
             return
-        if float(grant["allowances"]["progress_baseline_usd"]) > float(usage.get("spent_usd", 0)):
+        if float(grant["allowances"]["progress_baseline_usd"]) > float(
+            usage.get("spent_usd", 0)
+        ):
             raise SprintError("restart baseline exceeds recorded spending")
         old_state, old_reason = ticket["state"], ticket.get("reason", "")
-        ticket["state"], ticket["reason"] = initial_state(ticket.get("raw_status", ""), cfg)
-        if ticket["state"] == "pending" and ticket.get("scope_assessment", {}).get("verdict") == "decompose":
+        ticket["state"], ticket["reason"] = initial_state(
+            ticket.get("raw_status", ""), cfg
+        )
+        if (
+            ticket["state"] == "pending"
+            and ticket.get("scope_assessment", {}).get("verdict") == "decompose"
+        ):
             ticket["state"] = "needs_decomposition"
-        legacy_classification = next((item for item in reversed(ticket.get("history", []))
-            if item.get("event") == "legacy-classified"), {})
-        if (old_state == "operator_decision"
-                and legacy_classification.get("state") == "operator_decision"):
+        legacy_classification = next(
+            (
+                item
+                for item in reversed(ticket.get("history", []))
+                if item.get("event") == "legacy-classified"
+            ),
+            {},
+        )
+        if (
+            old_state == "operator_decision"
+            and legacy_classification.get("state") == "operator_decision"
+        ):
             ticket["state"], ticket["reason"] = old_state, old_reason
         elif ticket.get("scope_assessment", {}).get("verdict") == "operator_decision":
             ticket["state"] = "operator_decision"
-            ticket["reason"] = "restart allowance does not resolve the preserved product/scoping decision"
+            ticket["reason"] = (
+                "restart allowance does not resolve the preserved product/scoping decision"
+            )
         if ticket["state"] == "pending" and ticket.get("pr"):
             ticket["state"] = "needs_repair"
         ticket["restart_grant_id"] = grant["grant_id"]
-        ticket.setdefault("history", []).append({"at": now(), "event": "operator-restart", "grant_id": grant["grant_id"],
-            "previous_state": old_state, "previous_reason": old_reason, "reason": grant["reason"], "allowances": grant["allowances"]})
+        ticket.setdefault("history", []).append(
+            {
+                "at": now(),
+                "event": "operator-restart",
+                "grant_id": grant["grant_id"],
+                "previous_state": old_state,
+                "previous_reason": old_reason,
+                "reason": grant["reason"],
+                "allowances": grant["allowances"],
+            }
+        )
         # Execution fences, prior work, scope decisions and findings remain intact.
         save(path, state)
     emit({"ticket": key, "state": ticket["state"], "grant_id": grant["grant_id"]})
@@ -3593,9 +4438,13 @@ def grant_budget(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         ticket = state["tickets"].get(key)
         if not ticket or ticket["state"] == "completed":
             current = ticket["state"] if ticket else "missing"
-            raise SprintError(f"ticket {key} cannot receive a budget grant from state {current}")
+            raise SprintError(
+                f"ticket {key} cannot receive a budget grant from state {current}"
+            )
         try:
-            ceiling = activate_budget(cfg["shared_root"], key, operator_capability(args))
+            ceiling = activate_budget(
+                cfg["shared_root"], key, operator_capability(args)
+            )
         except AuthorityError as exc:
             raise SprintError(str(exc)) from exc
         ticket["history"].append(
@@ -3654,7 +4503,9 @@ def recover_terminal(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             "user_action",
         }:
             current = ticket.get("state") if ticket else "missing"
-            raise SprintError(f"ticket {key} cannot be terminal-recovered from state {current}")
+            raise SprintError(
+                f"ticket {key} cannot be terminal-recovered from state {current}"
+            )
         try:
             consume_recovery(
                 cfg["shared_root"],
@@ -3731,18 +4582,28 @@ def automatic_recovery_available(ticket, cfg, status=None):
     if identity.get("containment") in {"cgroup-v2-systemd-scope", "test-supervisor"}:
         return True
     launch = ticket.get("launch_evidence") or {}
-    if (identity.get("containment") != "cooperative-session"
-            or not cfg.get("cooperative_auto_recovery") or not launch.get("cooperative_auto_recovery")
-            or launch.get("invocation_id") != identity.get("invocation_id")):
+    if (
+        identity.get("containment") != "cooperative-session"
+        or not cfg.get("cooperative_auto_recovery")
+        or not launch.get("cooperative_auto_recovery")
+        or launch.get("invocation_id") != identity.get("invocation_id")
+    ):
         return False
     try:
-        receipt = read_json(Path(identity["tombstone_path"]), label="cooperative cleanup receipt")
+        receipt = read_json(
+            Path(identity["tombstone_path"]), label="cooperative cleanup receipt"
+        )
         cleanup = receipt.get("cooperative_cleanup", {})
         pgid = cleanup.get("worker_pgid")
-        if (receipt.get("phase") != "terminal" or receipt.get("error")
-                or receipt.get("invocation_id") != identity["invocation_id"]
-                or cleanup.get("gateway_closed") is not True
-                or not isinstance(pgid, int) or isinstance(pgid, bool) or pgid <= 1):
+        if (
+            receipt.get("phase") != "terminal"
+            or receipt.get("error")
+            or receipt.get("invocation_id") != identity["invocation_id"]
+            or cleanup.get("gateway_closed") is not True
+            or not isinstance(pgid, int)
+            or isinstance(pgid, bool)
+            or pgid <= 1
+        ):
             return False
         os.killpg(pgid, 0)
     except ProcessLookupError:
@@ -3967,9 +4828,13 @@ def summary_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
                     item["reason"] = "ready but not launched"
                 result["user_action"].append(item)
     plan = plan_value(state, cfg)
-    result["finished"] = not plan["autonomous_work_remaining"]  # compatibility: controller drained
+    result["finished"] = not plan[
+        "autonomous_work_remaining"
+    ]  # compatibility: controller drained
     result["autonomous_work_exhausted"] = result["finished"]
-    result["sprint_complete"] = bool(state["tickets"]) and all(dependency_complete(state, key, cfg) for key in state["tickets"])
+    result["sprint_complete"] = bool(state["tickets"]) and all(
+        dependency_complete(state, key, cfg) for key in state["tickets"]
+    )
     result["decision_queue"] = plan["decision_queue"]
     result["legacy_reconciliation"] = plan["legacy_reconciliation"]
     result["provider_holds"] = plan["provider_holds"]
@@ -3977,6 +4842,7 @@ def summary_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
     result["retry_waiting"] = plan["retry_waiting"]
     result["spend"] = spend
     from sprint_metrics import summarize
+
     result["outcome_metrics"] = summarize(state, spend)
     return result
 
@@ -3989,28 +4855,41 @@ def summary(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
 
 def report_outcomes(args, cfg):
     from sprint_metrics import summarize, verify_merges
+
     path = state_path(cfg["state_dir"], str(args.sprint))
     with locked(path):
         state = load(path)
     metrics = summarize(state, usage_snapshots(cfg))
     if args.verify_merges:
         from github_progress import ProgressError
+
         try:
             metrics = verify_merges(cfg["shared_root"], state, metrics)
         except ProgressError as exc:
             raise SprintError(str(exc)) from exc
     repeated = {}
-    directory = cfg["shared_root"] / str(load_yaml(cfg["config"]).get("review_ledger_dir", ".orchestration/.review-ledger"))
+    directory = cfg["shared_root"] / str(
+        load_yaml(cfg["config"]).get(
+            "review_ledger_dir", ".orchestration/.review-ledger"
+        )
+    )
     for ledger in directory.glob("*.json"):
         with locked(ledger):
             review = read_json(ledger, label="review outcome ledger")
         subject = review.get("work_subject") or {}
         key = subject.get("id")
-        if key in state["tickets"] and subject.get("repository") == str(cfg["shared_root"].resolve()):
-            repeated.setdefault(key, []).extend(dict(finding=name, strikes=item.get("strikes", 0))
-                for name, item in review.get("components", {}).items() if item.get("strikes", 0) > 1)
+        if key in state["tickets"] and subject.get("repository") == str(
+            cfg["shared_root"].resolve()
+        ):
+            repeated.setdefault(key, []).extend(
+                dict(finding=name, strikes=item.get("strikes", 0))
+                for name, item in review.get("components", {}).items()
+                if item.get("strikes", 0) > 1
+            )
     metrics["repeated_findings"] = repeated
-    metrics["review_coverage"] = "Only matching canonical review ledgers are included; absent tickets have unknown coverage."
+    metrics["review_coverage"] = (
+        "Only matching canonical review ledgers are included; absent tickets have unknown coverage."
+    )
     emit(metrics)
 
 
@@ -4022,7 +4901,10 @@ def parser() -> argparse.ArgumentParser:
     )
     result.add_argument("--state-dir", help="checkpoint directory override")
     commands = result.add_subparsers(dest="command", required=True)
-    outcomes = commands.add_parser("report-outcomes", help="report completion, blocking, and verified merge metrics")
+    outcomes = commands.add_parser(
+        "report-outcomes",
+        help="report completion, blocking, and verified merge metrics",
+    )
     outcomes.add_argument("--sprint", required=True)
     outcomes.add_argument("--verify-merges", action="store_true")
     outcomes.set_defaults(func=report_outcomes)
@@ -4133,9 +5015,14 @@ def parser() -> argparse.ArgumentParser:
     )
     progress_parser.add_argument("--sprint", required=True)
     progress_parser.add_argument("--ticket", required=True)
-    progress_parser.add_argument("--milestone", required=True, choices=sorted(PROGRESS_MILESTONES))
-    progress_parser.add_argument("--evidence", required=True,
-        help="PR/CI: positive PR number or canonical URL; other milestones: documented artifact/receipt")
+    progress_parser.add_argument(
+        "--milestone", required=True, choices=sorted(PROGRESS_MILESTONES)
+    )
+    progress_parser.add_argument(
+        "--evidence",
+        required=True,
+        help="PR/CI: positive PR number or canonical URL; other milestones: documented artifact/receipt",
+    )
     progress_parser.add_argument("--attempt-token", required=True)
     progress_parser.set_defaults(func=record_progress)
     requeue_parser = commands.add_parser("requeue")
@@ -4148,13 +5035,21 @@ def parser() -> argparse.ArgumentParser:
         "--worker-stopped", action="store_true", help=argparse.SUPPRESS
     )
     requeue_parser.set_defaults(func=requeue)
-    legacy_parser = commands.add_parser("reconcile-legacy", help="classify an opaque legacy hold without launching work")
+    legacy_parser = commands.add_parser(
+        "reconcile-legacy", help="classify an opaque legacy hold without launching work"
+    )
     legacy_parser.add_argument("--sprint", required=True)
     legacy_parser.add_argument("--ticket", required=True)
-    legacy_parser.add_argument("--classification", choices=("operator_decision", "external_blocked"), required=True)
+    legacy_parser.add_argument(
+        "--classification",
+        choices=("operator_decision", "external_blocked"),
+        required=True,
+    )
     legacy_parser.add_argument("--reason", required=True)
     legacy_parser.set_defaults(func=reconcile_legacy)
-    restart_parser = commands.add_parser("restart-ticket", help="apply a bounded root-issued restart allowance")
+    restart_parser = commands.add_parser(
+        "restart-ticket", help="apply a bounded root-issued restart allowance"
+    )
     restart_parser.add_argument("--sprint", required=True)
     restart_parser.add_argument("--ticket", required=True)
     restart_parser.add_argument("--operator-capability", default="")
@@ -4178,7 +5073,9 @@ def parser() -> argparse.ArgumentParser:
     terminal_recovery_parser.add_argument("--sprint", required=True)
     terminal_recovery_parser.add_argument("--ticket", required=True)
     terminal_recovery_parser.add_argument("--reason", required=True)
-    terminal_capability = terminal_recovery_parser.add_mutually_exclusive_group(required=True)
+    terminal_capability = terminal_recovery_parser.add_mutually_exclusive_group(
+        required=True
+    )
     terminal_capability.add_argument("--operator-capability")
     terminal_capability.add_argument("--operator-capability-stdin", action="store_true")
     terminal_recovery_parser.set_defaults(func=recover_terminal)
@@ -4188,6 +5085,13 @@ def parser() -> argparse.ArgumentParser:
     recover_parser.add_argument("--reason", required=True)
     recover_parser.add_argument("--operator-capability", default="")
     recover_parser.set_defaults(func=recover_legacy)
+    preserved_pr_parser = commands.add_parser(
+        "reconcile-preserved-pr",
+        help="verify and resume one stopped preserved PR as bounded repair",
+    )
+    preserved_pr_parser.add_argument("--sprint", required=True)
+    preserved_pr_parser.add_argument("--ticket", required=True)
+    preserved_pr_parser.set_defaults(func=reconcile_preserved_pr)
     health_parser = commands.add_parser("health-check")
     health_parser.add_argument("--role", default="sprint-worker")
     health_parser.add_argument("--after-repair", action="store_true")

@@ -121,6 +121,10 @@ contains_contract "progress-aware sprint watchdog" 'record-progress' \
   commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
 contains_contract "recoverable sprint queues" 'plan\.recovery' \
   commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
+contains_contract "verified preserved PR recovery" 'reconcile-preserved-pr' \
+  commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
+contains_contract "repository decision reuse" 'sprint_decisions' \
+  commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
 contains_contract "operator capability stdin hygiene" 'operator-capability-stdin' \
   commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
 

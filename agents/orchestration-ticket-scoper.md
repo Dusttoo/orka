@@ -22,6 +22,11 @@ and test scope—not estimated lines of code.
 - Return `operator_decision` only when proceeding would require choosing product
   behavior, weakening an invariant, authorizing an external operation, or
   resolving genuinely contradictory requirements.
+- Reuse an applicable entry from `resolved_decisions` in the supplied scope
+  context. Do not return `operator_decision` for a question that repository
+  policy already answers. When a new decision is genuinely required, provide a
+  stable generic `decision_key` and the exact `decision_question` so a reviewed
+  repository decision can resolve every matching ticket consistently.
 
 Return exactly one JSON object and no prose:
 
@@ -33,6 +38,8 @@ Return exactly one JSON object and no prose:
   "complexity_score": 0,
   "prerequisites": [],
   "children": [],
+  "decision_key": "",
+  "decision_question": "",
   "reasons": ["evidence-based reason"],
   "slices": [
     {
@@ -42,6 +49,7 @@ Return exactly one JSON object and no prose:
       "acceptance_criteria": ["testable outcome"],
       "migration_owner": "none",
       "test_plan": ["specific regression test and expected result"],
+      "contracts": {},
       "depends_on": []
     }
   ]
@@ -57,6 +65,13 @@ acyclic. Never invent missing business behavior; classify that gap as
 Each slice must include `migration_owner` (the owning slice ID, or `none` when
 no migration is needed) and a nonempty `test_plan`. These fields are validated
 and copied into the Jira child description.
+
+The supplied scope context includes `required_slice_contracts`. Every
+decomposition slice must include a nonempty `contracts` entry for each required
+name. These are repository-defined delivery contracts, not product choices to
+invent. If the ticket and `resolved_decisions` do not provide enough evidence
+to fill a required contract, return one `operator_decision` instead of creating
+an incomplete child.
 
 Before returning `ready`, enumerate every prerequisite found in the ticket text in
 `prerequisites` (an array of ticket keys, empty only when none exist). Compare them

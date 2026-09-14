@@ -361,6 +361,9 @@ sprint_decomposition:
   max_auto_slices: 6
   jira_child_issue_type: Sub-task
   jira_subtask_decomposition_mode: sibling
+  # Optional repository-defined contracts every generated slice must carry
+  # before Jira creation or transition to Ready.
+  required_slice_contracts: []
   # Optional ordered destination statuses when newly created children cannot
   # transition directly to a configured sprint_ready_status. Every step must
   # be available without missing required fields; the last item must be one of
@@ -368,6 +371,15 @@ sprint_decomposition:
   # jira_ready_transition_path:
   #   - Scoping
   #   - Ready
+# Reviewed product decisions are reusable scoping inputs. Keys are generic,
+# stable identifiers emitted by the ticket scoper. Keep project-specific
+# answers in the consuming repository, never in the reusable plugin. Omit the
+# registry until a decision is approved; for example:
+# sprint_decisions:
+#   delivery.failure_policy:
+#     status: approved
+#     answer: Fail the isolated operation and preserve prior durable state.
+#     rationale: Prevent partial cross-boundary updates.
 # The independent local supervisor stops a lane that spends this much without
 # verified progress. Repeated evidence does not reset this spending baseline.
 # Other tickets continue within their own budgets.
@@ -385,6 +397,8 @@ sprint_status_heartbeat_minutes: 30
 concurrency_max: 2
 # Finish repair/recovery work first and pause fresh launches at this PR count.
 max_unmerged_prs: 2
+# Within otherwise-launchable work, finish preserved PRs before opening new work.
+pr_drain_first: true
 # Host-local heavy commands (builds, full test suites, browser suites) use this
 # smaller admission limit even when more model lanes are active.
 max_heavy_processes: 2
@@ -538,3 +552,6 @@ rules_docs:
 # Opt in only for cooperative workers that do not daemonize or escape sessions.
 # Requires a normal supervisor cleanup receipt and an absent worker process group.
 cooperative_auto_recovery: false
+# Opt in to ticket-scoped recovery of an existing open PR only after Orka
+# verifies its GitHub head, commit tree, clean worktree, and process quiescence.
+preserved_pr_auto_recovery: false

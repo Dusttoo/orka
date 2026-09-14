@@ -47,6 +47,10 @@ The controller atomically writes under `sprint_checkpoint_dir` (default
 - `sprint_decomposition.complexity_threshold` (default `70`)
 - `sprint_decomposition.max_auto_slices` (default `6`, hard maximum `10`)
 - `sprint_decomposition.jira_subtask_decomposition_mode` (default `sibling`)
+- `sprint_decomposition.required_slice_contracts` (default `[]`)
+- `sprint_decisions` (approved repository-owned decision registry; default `{}`)
+- `pr_drain_first` (default `true`)
+- `preserved_pr_auto_recovery` (default `false`)
 - `max_usd_without_progress` (default `$5`, hard maximum `$10`)
 
 The host reads `ticket.kind`, `ticket.project`, `sprint_id`, `jira_base_url`,
@@ -156,7 +160,16 @@ repository config. Caller environment and CLI values cannot replace that policy.
    recover accepted-but-timed-out creates and checks dependency links
    idempotently. Never auto-decompose a product decision or exceed the configured
    slice cap. An `operator_decision` result is the only scoping outcome that
-   requires the user.
+   requires the user. It should carry a stable `decision_key` and exact question
+   when the decision is reusable. Never invent the answer. If that key exists as
+   approved in repository `sprint_decisions`, the controller supplies it in
+   `scope-context` and requires a fresh scoping pass under that policy.
+
+   Every slice must provide all names configured in
+   `required_slice_contracts`; an incomplete contract remains an operator
+   decision and must not create Jira children. After Jira creation, require the
+   adapter's verified dependency receipts and a fresh authenticated inventory;
+   `record-decomposition` will fail closed if any expected edge is absent.
 
    If a previously blocked or user-action ticket becomes safe to retry, requeue
    it explicitly with the evidence in `--reason`; completed tickets cannot be
@@ -303,9 +316,15 @@ Before launching, resolve the executable because non-interactive SSH shells may 
    preserve reservations and allow independent work on healthy routes to
    continue. Bounded retries remain owned by `api_agent.py`.
 
-   Drain `plan.recovery`, `plan.repair`, and `plan.decomposition`, and continue
+   Drain `plan.pr_reconciliation`, `plan.recovery`, `plan.repair`, and
+   `plan.decomposition`, and continue
    independent `plan.launch` work around external blockers before asking the
-   user. Recovery/repair queues contain only mechanically eligible actions:
+   user. For each `plan.pr_reconciliation` entry, invoke
+   `sprint-controller.py reconcile-preserved-pr --sprint <id> --ticket <key>`;
+   obey the next plan and reuse its preserved PR, branch, worktree, and ledgers.
+   This queue exists only when repository policy opted in and Orka mechanically
+   verified authenticated PR identity plus one clean, quiescent worktree.
+   Recovery/repair queues contain only mechanically eligible actions:
    requeue them with the current attempt token, then obey the next plan. Resume
    their preserved branch, PR, and review ledger instead of starting design over.
    `plan.recovery_waiting` retains a lane until its execution unit exits; reconcile

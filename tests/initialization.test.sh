@@ -62,6 +62,12 @@ check "template bounds model and reviewer run counts" \
   rg -q '^[[:space:]]+max_reviewer_runs_per_ticket:' "$ROOT/templates/config.yaml"
 check "template bounds lane relaunches" \
   grep -Eq '^max_lane_relaunches:[[:space:]]*[0-9]+' "$ROOT/templates/config.yaml"
+check "template drains preserved PR work before fresh tickets" \
+  grep -Eq '^pr_drain_first:[[:space:]]*true([[:space:]]|$)' "$ROOT/templates/config.yaml"
+check "template keeps automatic preserved PR recovery opt-in" \
+  grep -Eq '^preserved_pr_auto_recovery:[[:space:]]*false([[:space:]]|$)' "$ROOT/templates/config.yaml"
+check "template exposes optional slice contracts without project policy" \
+  grep -Eq '^[[:space:]]+required_slice_contracts:[[:space:]]*\[\]([[:space:]]|$)' "$ROOT/templates/config.yaml"
 check "template requires explicit model pricing" \
   rg -q '^[[:space:]]+pricing:' "$ROOT/templates/config.yaml"
 check "template configures an active Jira sprint by default" \

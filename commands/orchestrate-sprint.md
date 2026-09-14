@@ -99,6 +99,12 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    idempotent `jira_decomposition.py --apply` adapter, sync Jira again, and bind
    the returned children with `record-decomposition`. Routine technical slicing
    is autonomous; only product/security choices become `operator_decision`.
+   Every slice must carry all repository-configured `required_slice_contracts`,
+   and its expected Jira dependency edges must be verified after creation and
+   again by fresh inventory. A reusable operator decision should carry a stable
+   `decision_key`; when that key is approved in repository `sprint_decisions`,
+   re-scope under the supplied policy instead of asking again. Never invent an
+   answer or create children from an incomplete contract.
 
 5. For each key in `plan.launch` — already ordered by `(priority, key)`, so
    launch in that order and never reprioritize locally — first create a unique
@@ -173,7 +179,8 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    `max_heavy_processes`. If the API ledger shows sustained throttling for one
    provider, pause new admissions to that provider while preserving reservations
    and letting healthy routes continue; `api_agent.py` owns bounded retries.
-   Drain `plan.recovery`, `plan.repair`, and `plan.decomposition`, and continue
+   Drain `plan.pr_reconciliation`, `plan.recovery`, `plan.repair`, and
+   `plan.decomposition`, and continue
    independent work around external blockers. Treat `spend.state:
    operator_action` and model/post-implementation-reviewer run-count errors as
    user actions, never reasons to relaunch. A human may extend a ticket pause
@@ -203,7 +210,11 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    most one compact heartbeat per `sprint_status_heartbeat_minutes` (30 by
    default; 0 disables it). A direct status request always runs `summary`.
 
-   `plan.recovery` and `plan.repair` contain mechanically eligible work. Requeue
+   `plan.pr_reconciliation` contains only repository-opted-in open PRs whose
+   authenticated identity and exact head/tree match one clean, quiescent
+   worktree. Run `reconcile-preserved-pr --sprint <id> --ticket <key>`, re-plan,
+   and reuse its branch, PR, worktree, and review ledger. `plan.recovery` and
+   `plan.repair` contain mechanically eligible work. Requeue
    with the current attempt token, re-plan, and resume the preserved branch, PR,
    and review ledger. Keep `plan.recovery_waiting` units reserved until they exit.
    Collect `plan.decision_queue` for the final report and keep launching independent
