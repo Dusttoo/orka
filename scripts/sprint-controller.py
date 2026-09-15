@@ -4586,7 +4586,13 @@ def attach(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         ticket["worker_identity"] = identity
         ticket["attached_at"] = now()
         ticket["attach_capability"] = ""
-        ticket["launch_evidence"] = {}
+        # Consume only the bearer token.  The attempt-scoped launch record is
+        # still required after attach to bind cooperative terminal cleanup,
+        # recovery policy, and the implementation baseline to this invocation.
+        # `attached_at` makes the transition one-use; requeue/reserve clear the
+        # complete record before a later attempt begins.
+        evidence["token"] = ""
+        ticket["launch_evidence"] = evidence
         ticket["history"].append(
             {"at": now(), "event": "attached", "worker_identity": identity}
         )
@@ -4737,7 +4743,7 @@ def restart_ticket(args, cfg):
         jira_state, jira_reason = initial_state(ticket.get("raw_status", ""), cfg)
         if jira_state in {"completed", "blocked"}:
             ticket["state"], ticket["reason"] = jira_state, jira_reason
-        elif ticket.get("pr"):
+        elif ticket.get("pr") and ticket.get("attempt_token"):
             ticket["state"] = "needs_repair"
             ticket["reason"] = "operator restart resumes the preserved pull request"
         elif ticket.get("scope_assessment", {}).get("verdict") == "decompose":
@@ -4874,8 +4880,8 @@ def recover_terminal(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         ticket["reason"] = args.reason.strip()
         ticket["run_ref"] = ""
         # The terminal execution identity is gone, but its durable work is not.
-        # Preserve branch/PR bindings so restart-ticket can route an existing PR
-        # to repair instead of manufacturing a fresh implementation attempt.
+        # Preserve branch/PR bindings while leaving the ticket pending; reserve
+        # will mint the only valid token for the next repair attempt.
         ticket["attempt_token"] = ""
         ticket["attempt_capability"] = {}
         ticket["worker_identity"] = ""

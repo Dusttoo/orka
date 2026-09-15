@@ -195,6 +195,91 @@ def save(path: Path, state: dict[str, Any]) -> None:
             os.unlink(temp_name)
 
 
+def _timestamp(value: Any, *, label: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError) as exc:
+        raise LedgerError(f"{label} has an invalid timestamp") from exc
+    if parsed.tzinfo is None:
+        raise LedgerError(f"{label} timestamp must include a timezone")
+    return parsed
+
+
+def _migrate_legacy_repair_generations(value: dict[str, Any]) -> None:
+    """Bind pre-generation review rows to their repair chronology.
+
+    Older ledgers used `round` as a call sequence.  Treating that sequence as a
+    modern logical generation can make an old round collide with a newly
+    repaired head.  A repair artifact is durably recorded before reviewers may
+    inspect that head, so its timestamp is an unambiguous generation boundary.
+    """
+    legacy_rounds = [
+        entry for entry in value.get("rounds", []) if "generation" not in entry
+    ]
+    explicit_repairs = [
+        attempt
+        for attempt in value.get("repair_attempts", [])
+        if not attempt.get("legacy")
+    ]
+    if not legacy_rounds or not explicit_repairs:
+        return
+
+    repair_times = [
+        _timestamp(attempt.get("recorded_at"), label="repair attempt")
+        for attempt in explicit_repairs
+    ]
+    if repair_times != sorted(repair_times):
+        raise LedgerError("repair attempt timestamps are not monotonic")
+    current_generation = int(value.get("review_generation", 1))
+    migrated = []
+    for entry in legacy_rounds:
+        recorded_at = _timestamp(entry.get("recorded_at"), label="review result")
+        generation = 1 + sum(boundary <= recorded_at for boundary in repair_times)
+        if generation < 1 or generation > current_generation:
+            raise LedgerError("legacy review result maps outside the active generation")
+        entry["generation"] = generation
+        migrated.append(int(entry.get("round", 0)))
+
+    # A repair may already have been recorded by the affected runtime.  Until
+    # any new reviewer consumes it, repair its gate snapshot from the now-bound
+    # predecessor generation.  Never rewrite a partially reviewed attempt.
+    if value.get("repair_pending_review") and value.get("repair_attempts"):
+        attempt = value["repair_attempts"][-1]
+        if attempt.get("reviewed_gates") or attempt.get("gate_claims"):
+            raise LedgerError(
+                "legacy repair generation migration requires an unreviewed pending repair"
+            )
+        predecessor = current_generation - 1
+        required = {
+            str(entry.get("gate"))
+            for entry in value.get("rounds", [])
+            if int(entry.get("generation", 1)) == predecessor and entry.get("gate")
+        }
+        required.update(
+            ROLE_GATES[permit["role"]]
+            for permit in value.get("review_permits", [])
+            if permit.get("role") in ROLE_GATES
+            and int(permit.get("review_generation", 1)) == predecessor
+            and not permit.get("cancelled_at")
+        )
+        required.update(attempt.get("required_gates", []))
+        if len(value["repair_attempts"]) > 1:
+            required.update(value["repair_attempts"][-2].get("required_gates", []))
+        if not required:
+            raise LedgerError(
+                "legacy repair generation migration cannot derive the required gates"
+            )
+        attempt["required_gates"] = sorted(required)
+
+    value.setdefault("migrations", []).append(
+        {
+            "kind": "legacy-repair-generations-v1",
+            "migrated_at": now(),
+            "rounds": migrated,
+        }
+    )
+
+
 def load(path: Path) -> dict[str, Any]:
     if not path.exists():
         raise LedgerError(f"no review ledger at {path}; run `open` first")
@@ -204,6 +289,7 @@ def load(path: Path) -> dict[str, Any]:
         raise LedgerError(f"cannot read review ledger {path}: {exc}") from exc
     if value.get("schema_version") != SCHEMA_VERSION:
         raise LedgerError(f"unsupported review ledger schema in {path}")
+    _migrate_legacy_repair_generations(value)
     # v0.7 counted failed gate passes because it had no explicit repair artifact.
     # Preserve that spent budget as synthetic attempts instead of silently
     # resetting a live PR when v0.8 first writes it.
@@ -1131,6 +1217,10 @@ def cmd_record_repair(args: argparse.Namespace) -> None:
     with locked(path):
         state = load(path)
         state.setdefault("review_generation", 1)
+        if any("generation" not in entry for entry in state.get("rounds", [])):
+            raise LedgerError(
+                "legacy review results require migrate-concurrent-review before repair"
+            )
         plan = decide(state)
         if state.get("repair_pending_review"):
             raise LedgerError(
@@ -1153,7 +1243,13 @@ def cmd_record_repair(args: argparse.Namespace) -> None:
             raise LedgerError(
                 f"repair report must cover the exact open set; missing={missing}, extra={extra}"
             )
-        gate_verdicts = decide(state)["gate_verdicts"]
+        review_plan = decide(state)
+        gate_verdicts = review_plan["gate_verdicts"]
+        required_gates = set(gate_verdicts) | set(review_plan["required_gates"])
+        if state.get("repair_attempts"):
+            required_gates.update(
+                state["repair_attempts"][-1].get("required_gates", [])
+            )
         attempt = {
             "attempt": len(state.setdefault("repair_attempts", [])) + 1,
             "recorded_at": now(),
@@ -1163,7 +1259,7 @@ def cmd_record_repair(args: argparse.Namespace) -> None:
                 for item in report["findings"]
             ],
             "open_before": sorted(open_keys),
-            "required_gates": sorted(gate_verdicts) or ["code-review"],
+            "required_gates": sorted(required_gates) or ["code-review"],
             "reviewed_gates": [],
         }
         state["repair_attempts"].append(attempt)
