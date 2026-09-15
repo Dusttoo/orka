@@ -28,7 +28,7 @@
 //   BLANK_MIN_CHARS(optional) min body innerText length to not count as blank, default 40
 
 import { chromium } from 'playwright';
-import { isExpectedPrefetchAbort } from './vqa-network.mjs';
+import { classifyRequestFailures, snapshotRequest } from './vqa-network.mjs';
 import { mkdirSync, writeFileSync, existsSync } from 'node:fs';
 
 const baseUrl = (process.env.BASE_URL || 'http://localhost:3000').replace(/\/$/, '');
@@ -98,6 +98,7 @@ for (const route of routes) {
     consoleErrors: [],
     pageErrors: [],
     failedRequests: [],
+    ignoredRequestFailures: [],
     hardFail: false,
     reasons: [],
   };
@@ -108,6 +109,11 @@ for (const route of routes) {
       ...(storageState ? { storageState } : {}),
     });
     const page = await ctx.newPage();
+    const pageErrorsAtStart = entry.pageErrors.length;
+    const rawFailedRequests = [];
+    const completedRequests = [];
+    const completedRequestTasks = [];
+    let requestOrder = 0;
 
     page.on('console', (msg) => {
       if (msg.type() !== 'error') return;
@@ -121,8 +127,17 @@ for (const route of routes) {
       // Only count same-origin failures; third-party analytics noise is ignored.
       if (!failingUrl.startsWith(baseUrl)) return;
       if (isInfraNoise(failingUrl)) return;
-      if (isExpectedPrefetchAbort(req)) return;
-      entry.failedRequests.push(`${req.method()} ${failingUrl} (${req.failure()?.errorText || 'failed'})`);
+      rawFailedRequests.push(snapshotRequest(req, ++requestOrder));
+    });
+    page.on('requestfinished', (req) => {
+      if (!req.url().startsWith(baseUrl)) return;
+      const order = ++requestOrder;
+      const task = req.response()
+        .then((response) => {
+          if (response) completedRequests.push(snapshotRequest(req, order, response.status()));
+        })
+        .catch(() => {});
+      completedRequestTasks.push(task);
     });
 
     const shot = { width: w, name, file: null, status: null, blank: null, timedOut: false };
@@ -141,6 +156,21 @@ for (const route of routes) {
       shot.timedOut = true;
       entry.reasons.push(`${name}: navigation failed/timed out -- ${e.message}`);
     } finally {
+      await Promise.all(completedRequestTasks);
+      const pageErrors = entry.pageErrors.slice(pageErrorsAtStart);
+      const classified = classifyRequestFailures(rawFailedRequests, completedRequests, {
+        expectedStateReached: !shot.timedOut && (shot.status == null || shot.status < 400) && shot.blank === false,
+        pageErrors,
+      });
+      entry.failedRequests.push(...classified.failures.map((req) =>
+        `${req.method} ${req.url} (${req.errorText || 'failed'})`,
+      ));
+      entry.ignoredRequestFailures.push(...classified.ignored.map((req) => ({
+        viewport: name,
+        method: req.method,
+        url: req.url,
+        error: req.errorText || 'failed',
+      })));
       await ctx.close();
     }
     entry.shots.push(shot);
