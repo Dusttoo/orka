@@ -1525,6 +1525,25 @@ def sync(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
                             for event in previous.get("history", [])
                         )
                     )
+                    restart_status_refresh = bool(
+                        authoritative_ready
+                        and previous["state"] == "user_action"
+                        and previous.get("reason", "") == previous_initial[1]
+                        and any(
+                            event.get("event") == "operator-restart"
+                            for event in previous.get("history", [])
+                        )
+                        and previous.get("scope_assessment", {}).get("verdict")
+                        != "operator_decision"
+                    )
+                    stale_decomposition_hold = bool(
+                        cfg.get("auto_decompose_large_tickets")
+                        and previous["state"] in {"user_action", "operator_decision"}
+                        and previous.get("reason", "")
+                        == "automatic decomposition is disabled by repository policy"
+                        and previous.get("scope_assessment", {}).get("verdict")
+                        == "decompose"
+                    )
                     for field in (
                         "state",
                         "reason",
@@ -1555,11 +1574,37 @@ def sync(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
                         "ci_progress",
                         "test_progress",
                     ):
-                        if refresh_readiness and field in {"state", "reason"}:
+                        if (
+                            refresh_readiness
+                            or restart_status_refresh
+                            or stale_decomposition_hold
+                        ) and field in {"state", "reason"}:
                             continue
                         if field in previous:
                             fresh[field] = previous[field]
-                    if reconcile_legacy_readiness:
+                    if stale_decomposition_hold:
+                        fresh["state"] = "needs_decomposition"
+                        fresh["reason"] = (
+                            "repository policy now authorizes automatic decomposition"
+                        )
+                        fresh["history"].append(
+                            {
+                                "at": now(),
+                                "event": "decomposition-policy-enabled",
+                            }
+                        )
+                    elif restart_status_refresh:
+                        fresh["state"] = "pending"
+                        fresh["reason"] = ""
+                        fresh["history"].append(
+                            {
+                                "at": now(),
+                                "event": "jira-status-refreshed",
+                                "status": fresh["raw_status"],
+                                "source": "post-restart-authoritative-sync",
+                            }
+                        )
+                    elif reconcile_legacy_readiness:
                         fresh["state"] = "pending"
                         fresh["reason"] = ""
                         fresh["history"].append(
@@ -3968,6 +4013,9 @@ def supervise_local(args: argparse.Namespace, _cfg: dict[str, Any]) -> None:
     child: subprocess.Popen[Any] | None = None
     gateway = None
     stop_reason = ""
+    supervisor_error = ""
+    returncode: int | None = None
+    gateway_closed = False
     child_env = dict(os.environ)
     # Older internal callers and recovery fixtures construct the supervisor
     # namespace directly, so absence means the existing metered desktop path.
@@ -4135,19 +4183,9 @@ def supervise_local(args: argparse.Namespace, _cfg: dict[str, Any]) -> None:
         ContextError,
         HealthError,
         SprintError,
+        AuthorityError,
     ) as exc:
-        terminal = {
-            "invocation_id": args.invocation_id,
-            "phase": "terminal",
-            "spawned": child is not None,
-            "error": str(exc),
-        }
-        write_json(tombstone_path, terminal)
-        write_json(
-            ready_path,
-            {**terminal, "identity": identity, "worker_pid": child.pid if child else 0},
-        )
-        return
+        supervisor_error = str(exc)
     finally:
         # A supervisor exception must never leave an unmonitored paid worker.
         # Also collect children that outlived a normally exiting parent.
@@ -4158,8 +4196,22 @@ def supervise_local(args: argparse.Namespace, _cfg: dict[str, Any]) -> None:
             except subprocess.TimeoutExpired:
                 pass
             signal_process_group(child, signal.SIGKILL)
+            try:
+                returncode = child.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
         if gateway:
-            gateway.close()
+            try:
+                gateway.close()
+                gateway_closed = True
+            except (
+                OSError,
+                subprocess.SubprocessError,
+                AgentError,
+                AuthorityError,
+            ) as exc:
+                if not supervisor_error:
+                    supervisor_error = f"gateway cleanup failed: {exc}"
         if args.stdin_file and input_handle is not subprocess.DEVNULL:
             input_handle.close()
     # A native client can exit before the polling loop observes its gateway.
@@ -4169,19 +4221,26 @@ def supervise_local(args: argparse.Namespace, _cfg: dict[str, Any]) -> None:
     terminal = {
         "invocation_id": args.invocation_id,
         "phase": "terminal",
-        "spawned": True,
+        "spawned": child is not None,
         "returncode": returncode,
         "stop_reason": stop_reason,
         "startup_retryable": bool(gateway and gateway.startup_retryable()),
         "finished_at": now(),
-        "cooperative_cleanup": {"worker_pgid": child.pid, "gateway_closed": True},
+        "cooperative_cleanup": {
+            "worker_pgid": child.pid if child else 0,
+            "gateway_closed": gateway_closed if gateway else True,
+        },
     }
+    if supervisor_error:
+        terminal["error"] = supervisor_error
     write_json(tombstone_path, terminal)
     write_json(
         ready_path,
         {**terminal, "identity": identity, "worker_pid": child.pid if child else 0},
     )
-    if stop_reason and checkpoint.is_file():
+    if (
+        stop_reason or (supervisor_error and child is not None)
+    ) and checkpoint.is_file():
         with locked(checkpoint):
             state = load(checkpoint)
             lane = state.get("tickets", {}).get(args.ticket, {})
@@ -4202,14 +4261,14 @@ def supervise_local(args: argparse.Namespace, _cfg: dict[str, Any]) -> None:
                     and ("budget" in stop_reason or "usd" in stop_reason)
                     else "recoverable"
                 )
-                lane["reason"] = stop_reason
+                lane["reason"] = stop_reason or supervisor_error
                 lane["last_terminal"] = terminal
                 lane.setdefault("history", []).append(
                     {
                         "at": now(),
                         "event": "supervisor-stopped",
                         "state": lane["state"],
-                        "reason": stop_reason,
+                        "reason": stop_reason or supervisor_error,
                     }
                 )
                 save(checkpoint, state)
@@ -4675,14 +4734,21 @@ def restart_ticket(args, cfg):
         ):
             raise SprintError("restart baseline exceeds recorded spending")
         old_state, old_reason = ticket["state"], ticket.get("reason", "")
-        ticket["state"], ticket["reason"] = initial_state(
-            ticket.get("raw_status", ""), cfg
-        )
-        if (
-            ticket["state"] == "pending"
-            and ticket.get("scope_assessment", {}).get("verdict") == "decompose"
-        ):
+        jira_state, jira_reason = initial_state(ticket.get("raw_status", ""), cfg)
+        if jira_state in {"completed", "blocked"}:
+            ticket["state"], ticket["reason"] = jira_state, jira_reason
+        elif ticket.get("pr"):
+            ticket["state"] = "needs_repair"
+            ticket["reason"] = "operator restart resumes the preserved pull request"
+        elif ticket.get("scope_assessment", {}).get("verdict") == "decompose":
             ticket["state"] = "needs_decomposition"
+            ticket["reason"] = "operator restart resumes approved decomposition"
+        else:
+            # Jira workflow states such as In Progress are orchestration-owned
+            # while a recovered attempt is being resumed. A root-issued restart
+            # must not turn them into an unrelated readiness decision.
+            ticket["state"] = "pending"
+            ticket["reason"] = "operator restart resumes preserved ticket work"
         legacy_classification = next(
             (
                 item
@@ -4701,8 +4767,6 @@ def restart_ticket(args, cfg):
             ticket["reason"] = (
                 "restart allowance does not resolve the preserved product/scoping decision"
             )
-        if ticket["state"] == "pending" and ticket.get("pr"):
-            ticket["state"] = "needs_repair"
         ticket["restart_grant_id"] = grant["grant_id"]
         ticket.setdefault("history", []).append(
             {
@@ -4809,8 +4873,9 @@ def recover_terminal(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         ticket["state"] = "pending"
         ticket["reason"] = args.reason.strip()
         ticket["run_ref"] = ""
-        ticket["branch"] = ""
-        ticket["pr"] = ""
+        # The terminal execution identity is gone, but its durable work is not.
+        # Preserve branch/PR bindings so restart-ticket can route an existing PR
+        # to repair instead of manufacturing a fresh implementation attempt.
         ticket["attempt_token"] = ""
         ticket["attempt_capability"] = {}
         ticket["worker_identity"] = ""
@@ -4888,7 +4953,13 @@ def automatic_recovery_available(ticket, cfg, status=None):
         pgid = cleanup.get("worker_pgid")
         if (
             receipt.get("phase") != "terminal"
-            or receipt.get("error")
+            or (
+                receipt.get("error")
+                and (
+                    not isinstance(receipt.get("returncode"), int)
+                    or isinstance(receipt.get("returncode"), bool)
+                )
+            )
             or receipt.get("invocation_id") != identity["invocation_id"]
             or cleanup.get("gateway_closed") is not True
             or not isinstance(pgid, int)
