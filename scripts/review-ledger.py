@@ -231,12 +231,64 @@ def _migrate_legacy_repair_generations(value: dict[str, Any]) -> None:
     if repair_times != sorted(repair_times):
         raise LedgerError("repair attempt timestamps are not monotonic")
     current_generation = int(value.get("review_generation", 1))
-    migrated = []
+    mapped: list[tuple[dict[str, Any], int]] = []
     for entry in legacy_rounds:
         recorded_at = _timestamp(entry.get("recorded_at"), label="review result")
         generation = 1 + sum(boundary <= recorded_at for boundary in repair_times)
         if generation < 1 or generation > current_generation:
             raise LedgerError("legacy review result maps outside the active generation")
+        mapped.append((entry, generation))
+
+    # Do not let the chronology migration bypass the older concurrent-review
+    # safety checks. Every historical result must still be backed by exactly one
+    # consumed permit for the same gate, generation, and head. A legacy FAIL
+    # that was demoted by the old ordering bug needs the explicit blocker-
+    # restoring migration, not a generation-only rewrite.
+    for generation in sorted({generation for _, generation in mapped}):
+        entries = [entry for entry, item_generation in mapped if item_generation == generation]
+        gates = [str(entry.get("gate") or "") for entry in entries]
+        if not all(gates) or len(gates) != len(set(gates)):
+            raise LedgerError(
+                "legacy repair generation has duplicate or missing gate results"
+            )
+        generation_heads: set[str] = set()
+        for entry in entries:
+            gate = str(entry["gate"])
+            role = next((role for role, value_gate in ROLE_GATES.items() if value_gate == gate), "")
+            permits = [
+                permit
+                for permit in value.get("review_permits", [])
+                if permit.get("role") == role
+                and int(permit.get("review_generation", 1)) == generation
+                and permit.get("receipt_consumed_at")
+                and not permit.get("cancelled_at")
+            ]
+            if len(permits) != 1:
+                raise LedgerError(
+                    f"legacy repair generation lacks one consumed {gate} permit"
+                )
+            entry_head = str(entry.get("head") or "").lower()
+            permit_head = str(permits[0].get("head") or "").lower()
+            if not entry_head or entry_head != permit_head:
+                raise LedgerError(
+                    f"legacy {gate} result does not match its consumed permit head"
+                )
+            generation_heads.add(entry_head)
+            if (
+                entry.get("claimed_verdict") == "FAIL"
+                and entry.get("effective_verdict") != "FAIL"
+            ):
+                raise LedgerError(
+                    "legacy demoted FAIL requires blocker-restoring review migration"
+                )
+        if len(generation_heads) != 1:
+            raise LedgerError(
+                "legacy repair generation does not share one exact review head"
+            )
+
+    migrated = []
+    for entry, generation in mapped:
+        entry["legacy_result_sequence"] = int(entry.get("round", 0))
         entry["generation"] = generation
         migrated.append(int(entry.get("round", 0)))
 

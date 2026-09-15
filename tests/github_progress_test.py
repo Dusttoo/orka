@@ -155,7 +155,9 @@ class GitHubProgressTests(unittest.TestCase):
         self.git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "implementation")
         first = self.git("rev-parse", "HEAD")
         self.ticket["progress"] = []
-        self.ticket["launch_evidence"] = dict(base_commit=base)
+        self.ticket["launch_evidence"] = dict(
+            base_commit=base, worker_cwd=str(self.root)
+        )
         cfg, path, args = self.checkpoint()
         args.milestone, args.evidence = "implementation_commit", first
         with patch.object(controller, "usage_snapshots", return_value={}), contextlib.redirect_stdout(io.StringIO()):
@@ -189,7 +191,10 @@ class GitHubProgressTests(unittest.TestCase):
         self.git('add', '.')
         self.git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'failing test')
         first = self.git('rev-parse', 'HEAD')
-        self.ticket.update(progress=[], launch_evidence=dict(base_commit=self.sha))
+        self.ticket.update(
+            progress=[],
+            launch_evidence=dict(base_commit=self.sha, worker_cwd=str(self.root)),
+        )
         cfg, path, args = self.checkpoint()
         cfg['ready'], cfg['blocked'], cfg['done'] = {'ready'}, {'blocked'}, {'done'}
         cfg['config'] = self.root / 'config.yaml'
@@ -228,6 +233,32 @@ class GitHubProgressTests(unittest.TestCase):
             controller.record_progress(args, cfg)
         repairs = [p for p in controller.load(path)['tickets']['T-1']['progress'] if p['milestone'] == 'tests_repaired']
         self.assertTrue(repairs[0]['verified'])
+
+    def test_implementation_progress_rejects_descendant_that_is_not_worker_head(self):
+        base = self.sha
+        (self.root / "code").write_text("first")
+        self.git("add", "code")
+        self.git(
+            "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+            "commit", "-qm", "first descendant",
+        )
+        unrelated = self.git("rev-parse", "HEAD")
+        (self.root / "code").write_text("worker head")
+        self.git("add", "code")
+        self.git(
+            "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+            "commit", "-qm", "actual worker head",
+        )
+        self.ticket["progress"] = []
+        self.ticket["launch_evidence"] = dict(
+            base_commit=base, worker_cwd=str(self.root)
+        )
+        cfg, _, args = self.checkpoint()
+        args.milestone, args.evidence = "implementation_commit", unrelated
+        with self.assertRaisesRegex(
+            controller.SprintError, "authenticated worker checkout HEAD"
+        ):
+            controller.record_progress(args, cfg)
 
     def test_network_observation_releases_lock_and_fences_attempt_change(self):
         cfg, path, args = self.checkpoint()

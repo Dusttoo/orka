@@ -199,12 +199,21 @@ class RestartTests(unittest.TestCase):
                     "reviewed_gates": [],
                 },
             ],
-            "review_permits": [],
+            "review_permits": [
+                {
+                    "role": role,
+                    "review_generation": generation,
+                    "head": f"head-{generation}",
+                    "receipt_consumed_at": "done",
+                }
+                for generation in (1, 2)
+                for role in ("code-reviewer", "security-reviewer")
+            ],
             "rounds": [
-                {"round": 1, "gate": "code-review", "recorded_at": "2026-09-15T09:00:00+00:00", "effective_verdict": "FAIL"},
-                {"round": 2, "gate": "security-review", "recorded_at": "2026-09-15T09:01:00+00:00", "effective_verdict": "PASS"},
-                {"round": 3, "gate": "code-review", "recorded_at": "2026-09-15T11:00:00+00:00", "effective_verdict": "FAIL"},
-                {"round": 4, "gate": "security-review", "recorded_at": "2026-09-15T11:01:00+00:00", "effective_verdict": "PASS"},
+                {"round": 1, "gate": "code-review", "head": "head-1", "recorded_at": "2026-09-15T09:00:00+00:00", "claimed_verdict": "FAIL", "effective_verdict": "FAIL"},
+                {"round": 2, "gate": "security-review", "head": "head-1", "recorded_at": "2026-09-15T09:01:00+00:00", "claimed_verdict": "PASS", "effective_verdict": "PASS"},
+                {"round": 3, "gate": "code-review", "head": "head-2", "recorded_at": "2026-09-15T11:00:00+00:00", "claimed_verdict": "FAIL", "effective_verdict": "FAIL"},
+                {"round": 4, "gate": "security-review", "head": "head-2", "recorded_at": "2026-09-15T11:01:00+00:00", "claimed_verdict": "PASS", "effective_verdict": "PASS"},
             ],
         }
         review._migrate_legacy_repair_generations(state)
@@ -221,6 +230,38 @@ class RestartTests(unittest.TestCase):
             any(entry["generation"] == 3 for entry in state["rounds"])
         )
         self.assertEqual(state["rounds"][2]["effective_verdict"], "FAIL")
+
+    def test_legacy_demoted_fail_is_not_silently_generation_migrated(self):
+        state = {
+            "review_generation": 2,
+            "repair_attempts": [
+                {
+                    "recorded_at": "2026-09-15T10:00:00+00:00",
+                    "required_gates": ["code-review"],
+                }
+            ],
+            "review_permits": [
+                {
+                    "role": "code-reviewer",
+                    "review_generation": 1,
+                    "head": "head-1",
+                    "receipt_consumed_at": "done",
+                }
+            ],
+            "rounds": [
+                {
+                    "round": 1,
+                    "gate": "code-review",
+                    "head": "head-1",
+                    "recorded_at": "2026-09-15T09:00:00+00:00",
+                    "claimed_verdict": "FAIL",
+                    "effective_verdict": "PASS",
+                }
+            ],
+        }
+        with self.assertRaisesRegex(review.LedgerError, "blocker-restoring"):
+            review._migrate_legacy_repair_generations(state)
+        self.assertNotIn("generation", state["rounds"][0])
 
     def test_api_restart_relaxes_phase_and_count_but_not_shared_run_limits(self):
         ledger = api_agent.UsageLedger(self.root)

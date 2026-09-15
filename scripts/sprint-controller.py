@@ -2182,23 +2182,54 @@ def record_progress(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         fingerprint = args.evidence.strip()
         if args.milestone == "implementation_commit":
             evidence = args.evidence.strip()
-            baseline = (ticket.get("launch_evidence") or {}).get("base_commit", "")
+            launch = ticket.get("launch_evidence") or {}
+            baseline = launch.get("base_commit", "")
+            worker_cwd_raw = str(launch.get("worker_cwd") or "")
             if (
                 not re.fullmatch(r"[0-9a-f]{40,64}", evidence)
                 or not baseline
+                or not worker_cwd_raw
                 or evidence == baseline
             ):
                 raise SprintError(
-                    "implementation progress requires a new full commit SHA after launch"
+                    "implementation progress requires a worker-bound new full commit SHA after launch"
+                )
+            worker_cwd = Path(worker_cwd_raw).resolve()
+            try:
+                shared_common = subprocess.check_output(
+                    ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                    cwd=cfg["shared_root"],
+                    text=True,
+                ).strip()
+                worker_common = subprocess.check_output(
+                    ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                    cwd=worker_cwd,
+                    text=True,
+                ).strip()
+                worker_head = subprocess.check_output(
+                    ["git", "rev-parse", "--verify", "HEAD"],
+                    cwd=worker_cwd,
+                    text=True,
+                ).strip()
+            except (OSError, subprocess.CalledProcessError) as exc:
+                raise SprintError(
+                    "implementation progress requires the authenticated worker checkout"
+                ) from exc
+            if (
+                Path(shared_common).resolve() != Path(worker_common).resolve()
+                or worker_head != evidence
+            ):
+                raise SprintError(
+                    "progress commit must be the authenticated worker checkout HEAD"
                 )
             ancestor = subprocess.run(
                 ["git", "merge-base", "--is-ancestor", baseline, evidence],
-                cwd=cfg["shared_root"],
+                cwd=worker_cwd,
                 capture_output=True,
             )
             changed = subprocess.run(
                 ["git", "diff", "--quiet", baseline, evidence, "--"],
-                cwd=cfg["shared_root"],
+                cwd=worker_cwd,
                 capture_output=True,
             )
             if ancestor.returncode != 0 or changed.returncode != 1:
@@ -2207,7 +2238,7 @@ def record_progress(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
                 )
             fingerprint = subprocess.check_output(
                 ["git", "rev-parse", evidence + "^{tree}"],
-                cwd=cfg["shared_root"],
+                cwd=worker_cwd,
                 text=True,
             ).strip()
             ticket.setdefault("verified_commits", {})[evidence] = fingerprint
