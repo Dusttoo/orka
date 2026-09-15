@@ -28,7 +28,12 @@
 //   BLANK_MIN_CHARS(optional) min body innerText length to not count as blank, default 40
 
 import { chromium } from 'playwright';
-import { classifyRequestFailures, snapshotRequest } from './vqa-network.mjs';
+import {
+  applyViewportRequestEvidence,
+  completeCaptureManifest,
+  observeCaptureRequests,
+  recordCompletedRoute,
+} from './vqa-capture-state.mjs';
 import { mkdirSync, writeFileSync, existsSync } from 'node:fs';
 
 const baseUrl = (process.env.BASE_URL || 'http://localhost:3000').replace(/\/$/, '');
@@ -110,10 +115,7 @@ for (const route of routes) {
     });
     const page = await ctx.newPage();
     const pageErrorsAtStart = entry.pageErrors.length;
-    const rawFailedRequests = [];
-    const completedRequests = [];
-    const completedRequestTasks = [];
-    let requestOrder = 0;
+    const observedRequests = observeCaptureRequests(page, { baseUrl, isInfraNoise });
 
     page.on('console', (msg) => {
       if (msg.type() !== 'error') return;
@@ -122,24 +124,6 @@ for (const route of routes) {
       entry.consoleErrors.push(text);
     });
     page.on('pageerror', (err) => entry.pageErrors.push(String(err?.message || err)));
-    page.on('requestfailed', (req) => {
-      const failingUrl = req.url();
-      // Only count same-origin failures; third-party analytics noise is ignored.
-      if (!failingUrl.startsWith(baseUrl)) return;
-      if (isInfraNoise(failingUrl)) return;
-      rawFailedRequests.push(snapshotRequest(req, ++requestOrder));
-    });
-    page.on('requestfinished', (req) => {
-      if (!req.url().startsWith(baseUrl)) return;
-      const order = ++requestOrder;
-      const task = req.response()
-        .then((response) => {
-          if (response) completedRequests.push(snapshotRequest(req, order, response.status()));
-        })
-        .catch(() => {});
-      completedRequestTasks.push(task);
-    });
-
     const shot = { width: w, name, file: null, status: null, blank: null, timedOut: false };
     try {
       const resp = await page.goto(url, { waitUntil: 'networkidle', timeout: navTimeout });
@@ -156,60 +140,26 @@ for (const route of routes) {
       shot.timedOut = true;
       entry.reasons.push(`${name}: navigation failed/timed out -- ${e.message}`);
     } finally {
-      await Promise.all(completedRequestTasks);
       const pageErrors = entry.pageErrors.slice(pageErrorsAtStart);
-      const classified = classifyRequestFailures(rawFailedRequests, completedRequests, {
+      await applyViewportRequestEvidence(entry, observedRequests, {
+        viewport: name,
         expectedStateReached: !shot.timedOut && (shot.status == null || shot.status < 400) && shot.blank === false,
         pageErrors,
       });
-      entry.failedRequests.push(...classified.failures.map((req) =>
-        `${req.method} ${req.url} (${req.errorText || 'failed'})`,
-      ));
-      entry.ignoredRequestFailures.push(...classified.ignored.map((req) => ({
-        viewport: name,
-        method: req.method,
-        url: req.url,
-        error: req.errorText || 'failed',
-      })));
       await ctx.close();
     }
     entry.shots.push(shot);
   }
 
   // --- Deterministic hard-fail rules ---------------------------------------
-  for (const s of entry.shots) {
-    if (s.timedOut) entry.hardFail = true;
-    if (s.status != null && s.status >= 400) {
-      entry.hardFail = true;
-      entry.reasons.push(`${s.name}: HTTP ${s.status}`);
-    }
-    if (s.blank) {
-      entry.hardFail = true;
-      entry.reasons.push(`${s.name}: blank or error-boundary render`);
-    }
-  }
-  if (entry.pageErrors.length) {
-    entry.hardFail = true;
-    entry.reasons.push(`uncaught page error(s): ${entry.pageErrors.length}`);
-  }
-  if (entry.consoleErrors.length) {
-    entry.hardFail = true;
-    entry.reasons.push(`console error(s): ${entry.consoleErrors.length}`);
-  }
-  if (entry.failedRequests.length) {
-    entry.hardFail = true;
-    entry.reasons.push(`failed same-origin request(s): ${entry.failedRequests.length}`);
-  }
-
-  if (entry.hardFail) manifest.summary.hardFailures += 1;
-  manifest.routes.push(entry);
+  recordCompletedRoute(manifest, entry);
   const tag = entry.hardFail ? 'HARD-FAIL' : 'ok';
   console.log(`[${tag}] ${route} -> status ${entry.shots.map((s) => s.status ?? 'ERR').join('/')}${entry.reasons.length ? '  (' + entry.reasons.join('; ') + ')' : ''}`);
 }
 
 await browser.close();
 
-manifest.summary.verdict = manifest.summary.hardFailures > 0 ? 'FAIL' : 'PASS';
+completeCaptureManifest(manifest);
 writeFileSync(`${out}/manifest.json`, JSON.stringify(manifest, null, 2));
 
 console.log(`\nmanifest: ${out}/manifest.json`);

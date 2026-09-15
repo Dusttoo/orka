@@ -62,7 +62,7 @@ export function isExpectedRscRetryAbort(
     if (completed.order <= failed.order) return false;
     if (completed.method !== failed.method) return false;
     if (completed.headers?.rsc !== '1') return false;
-    if (completed.status == null || completed.status >= 400) return false;
+    if (completed.status == null || completed.status < 200 || completed.status >= 300) return false;
     const completedUrl = urlIdentity(completed.url);
     return Boolean(
       completedUrl?.rsc &&

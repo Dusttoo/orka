@@ -48,9 +48,9 @@ ticket's acceptance criteria and its `Reachable via:` click-path.
    Custom Playwright click-path capture must defer failed-request classification
    until the navigation step settles and use `classifyRequestFailures` plus
    `snapshotRequest` from `scripts/vqa-network.mjs`. An aborted RSC request is
-   ignored only when a later same-origin, same-path RSC request finishes
-   successfully in that step and the expected page state is reached without a
-   page error. Preserve the ignored request evidence in the manifest.
+   ignored only when a later-started same-origin, same-path RSC request finishes
+   with a 2xx response in that step and the expected page state is reached
+   without a page error. Preserve the ignored request evidence in the manifest.
 4. **Read `manifest.json` first.** Its `summary.verdict` is the deterministic
    floor: when it is `FAIL`, a route 4xx/5xx'd, threw, errored in console, or
    rendered blank, and the script already exited non-zero. Report FAIL with the
