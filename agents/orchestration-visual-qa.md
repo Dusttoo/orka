@@ -25,7 +25,7 @@ ticket's acceptance criteria and its `Reachable via:` click-path.
 1. Check out the PR branch in the worktree the orchestrator gives you
    (`gh pr checkout <pr>`).
 2. Start the app (its own process) and wait until `BASE_URL` answers.
-3. Capture the exact click-path with `scripts/run-visual-qa.sh`. It shoots each
+3. Capture the exact click-path. `scripts/run-visual-qa.sh` directly loads each
    route at desktop (1280) and mobile (390) widths full page AND collects
    deterministic signals (HTTP status, console errors, uncaught page errors,
    failed same-origin requests, blank/error-boundary render) into a
@@ -38,6 +38,19 @@ ticket's acceptance criteria and its `Reachable via:` click-path.
    For an authenticated surface, pass `AUTH=1` with `VQA_EMAIL` / `VQA_PASSWORD`
    (and `LOGIN_PATH` / selectors if the form differs). The script logs in through
    the real UI once, saves a `storageState`, and captures every route authed.
+   Direct route capture is valid only when that URL is meant to be reachable in
+   the configured visibility/authentication state. For a private, unlisted, or
+   entry-gated surface, follow the ticket's authorized entry path and capture the
+   destination after the client navigation. A fail-closed 404 from loading a
+   private destination directly is expected access behavior, not a feature
+   regression; do not include that destination in the direct-routes check unless
+   the repository supplies the visibility settings that make it reachable.
+   Custom Playwright click-path capture must defer failed-request classification
+   until the navigation step settles and use `classifyRequestFailures` plus
+   `snapshotRequest` from `scripts/vqa-network.mjs`. An aborted RSC request is
+   ignored only when a later-started same-origin, same-path RSC request finishes
+   with a 2xx response in that step and the expected page state is reached
+   without a page error. Preserve the ignored request evidence in the manifest.
 4. **Read `manifest.json` first.** Its `summary.verdict` is the deterministic
    floor: when it is `FAIL`, a route 4xx/5xx'd, threw, errored in console, or
    rendered blank, and the script already exited non-zero. Report FAIL with the
