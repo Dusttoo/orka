@@ -56,11 +56,63 @@ class RestartTests(unittest.TestCase):
         self.path = controller.state_path(self.cfg['state_dir'], '1')
         controller.save(self.path, self.state)
 
-    def test_supervisor_remains_bound_after_attach_consumes_launch_evidence(self):
+    def test_supervisor_remains_bound_after_attach_consumes_launch_token(self):
         ticket = {"worker_identity": {"invocation_id": "new"}, "launch_evidence": {}}
         self.assertTrue(controller.lane_invocation_matches(ticket, "new"))
         self.assertFalse(controller.lane_invocation_matches(ticket, "old"))
         self.assertFalse(controller.lane_invocation_matches(ticket, ""))
+
+    def test_attach_preserves_attempt_scoped_evidence_for_cooperative_recovery(self):
+        tombstone = self.root / "terminal.json"
+        identity = {
+            "pid": "123",
+            "start_identity": "start",
+            "invocation_id": "invocation",
+            "containment": "cooperative-session",
+            "tombstone_path": str(tombstone),
+        }
+        self.ticket.update(
+            state="running",
+            attempts=3,
+            attached_at="",
+            attach_capability="attach",
+            launch_evidence={
+                "token": "launch",
+                "status": "launched",
+                "repository": str(self.root),
+                "sprint": "1",
+                "ticket": "T-1",
+                "attempt": 3,
+                "attempt_token": "old-token",
+                "invocation_id": "invocation",
+                "containment": "cooperative-session",
+                "tombstone_path": str(tombstone),
+                "cooperative_auto_recovery": True,
+                "base_commit": "abc123",
+                "identity": identity,
+            },
+        )
+        controller.save(self.path, self.state)
+        args = argparse.Namespace(sprint="1", ticket="T-1", launch_evidence="launch")
+        with patch.object(controller, "execution_unit_status", return_value="live"), contextlib.redirect_stdout(io.StringIO()):
+            controller.attach(args, self.cfg)
+        attached = controller.load(self.path)["tickets"]["T-1"]
+        self.assertEqual(attached["launch_evidence"]["token"], "")
+        self.assertEqual(attached["launch_evidence"]["invocation_id"], "invocation")
+        self.assertEqual(attached["launch_evidence"]["base_commit"], "abc123")
+        with patch.object(controller, "execution_unit_status", return_value="live"), self.assertRaises(controller.SprintError):
+            controller.attach(args, self.cfg)
+
+        tombstone.write_text(json.dumps({
+            "phase": "terminal",
+            "invocation_id": "invocation",
+            "cooperative_cleanup": {"worker_pgid": 43210, "gateway_closed": True},
+        }))
+        self.cfg["cooperative_auto_recovery"] = True
+        with patch.object(controller.os, "killpg", side_effect=ProcessLookupError):
+            self.assertTrue(
+                controller.automatic_recovery_available(attached, self.cfg, "absent")
+            )
 
     def test_watchdog_admission_and_authorized_baseline(self):
         with patch.object(controller, 'authorized_restart_grant', return_value=None):
@@ -128,6 +180,100 @@ class RestartTests(unittest.TestCase):
                 self.assertEqual(review._design_plan(state)['next_action'], review.ACTION_ESCALATE)
                 self.assertEqual(review.decide(state)['max_rounds'], 3)
         self.assertEqual(state, before)
+
+    def test_legacy_review_sequence_is_bound_to_repair_generations(self):
+        state = {
+            "review_generation": 3,
+            "repair_pending_review": True,
+            "repair_attempts": [
+                {
+                    "attempt": 1,
+                    "recorded_at": "2026-09-15T10:00:00+00:00",
+                    "required_gates": ["code-review", "security-review"],
+                    "reviewed_gates": ["code-review", "security-review"],
+                },
+                {
+                    "attempt": 2,
+                    "recorded_at": "2026-09-15T12:00:00+00:00",
+                    "required_gates": ["code-review"],
+                    "reviewed_gates": [],
+                },
+            ],
+            "review_permits": [
+                {
+                    "role": role,
+                    "review_generation": generation,
+                    "head": f"head-{generation}",
+                    "receipt_consumed_at": "done",
+                }
+                for generation in (1, 2)
+                for role in ("code-reviewer", "security-reviewer")
+            ],
+            "rounds": [
+                {"round": 1, "gate": "code-review", "recorded_at": "2026-09-15T09:00:00+00:00", "claimed_verdict": "FAIL", "effective_verdict": "FAIL"},
+                {"round": 2, "gate": "security-review", "recorded_at": "2026-09-15T09:01:00+00:00", "claimed_verdict": "PASS", "effective_verdict": "PASS"},
+                {"round": 3, "gate": "code-review", "recorded_at": "2026-09-15T11:00:00+00:00", "claimed_verdict": "FAIL", "effective_verdict": "FAIL"},
+                {"round": 4, "gate": "security-review", "recorded_at": "2026-09-15T11:01:00+00:00", "claimed_verdict": "PASS", "effective_verdict": "PASS"},
+            ],
+        }
+        review._migrate_legacy_repair_generations(state)
+        self.assertEqual(
+            [entry["generation"] for entry in state["rounds"]],
+            [1, 1, 2, 2],
+        )
+        self.assertEqual([entry["round"] for entry in state["rounds"]], [1, 2, 3, 4])
+        self.assertEqual(
+            [entry["head"] for entry in state["rounds"]],
+            ["head-1", "head-1", "head-2", "head-2"],
+        )
+        self.assertEqual(
+            state["repair_attempts"][-1]["required_gates"],
+            ["code-review", "security-review"],
+        )
+        self.assertFalse(
+            any(entry["generation"] == 3 for entry in state["rounds"])
+        )
+        self.assertEqual(state["rounds"][2]["effective_verdict"], "FAIL")
+
+    def test_legacy_demoted_fail_is_not_silently_generation_migrated(self):
+        state = {
+            "review_generation": 2,
+            "repair_attempts": [
+                {
+                    "recorded_at": "2026-09-15T10:00:00+00:00",
+                    "required_gates": ["code-review"],
+                }
+            ],
+            "review_permits": [
+                {
+                    "role": "code-reviewer",
+                    "review_generation": 1,
+                    "head": "head-1",
+                    "receipt_consumed_at": "done",
+                }
+            ],
+            "rounds": [
+                {
+                    "round": 1,
+                    "gate": "code-review",
+                    "head": "head-1",
+                    "recorded_at": "2026-09-15T09:00:00+00:00",
+                    "claimed_verdict": "FAIL",
+                    "effective_verdict": "FAIL",
+                }
+            ],
+            "advisories": [
+                {
+                    "round": 1,
+                    "gate": "code-review",
+                    "reason": "out-of-scope-in-frozen-round",
+                    "key": "src/a.ts:hidden",
+                }
+            ],
+        }
+        with self.assertRaisesRegex(review.LedgerError, "blocker-restoring"):
+            review._migrate_legacy_repair_generations(state)
+        self.assertNotIn("generation", state["rounds"][0])
 
     def test_api_restart_relaxes_phase_and_count_but_not_shared_run_limits(self):
         ledger = api_agent.UsageLedger(self.root)

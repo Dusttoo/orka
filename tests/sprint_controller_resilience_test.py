@@ -1240,7 +1240,7 @@ class ResilienceTests(unittest.TestCase):
             stored["history"][-1]["event"], "decomposition-policy-enabled"
         )
 
-    def test_terminal_recovery_preserves_pr_and_restart_routes_to_repair(self):
+    def test_terminal_recovery_preserves_pr_and_restart_mints_token_on_reserve(self):
         self.ticket(
             "PROJ-1",
             "user_action",
@@ -1288,8 +1288,29 @@ class ResilienceTests(unittest.TestCase):
         ):
             controller.restart_ticket(restart_args, self.cfg)
         restarted = controller.load(path)["tickets"]["PROJ-1"]
-        self.assertEqual(restarted["state"], "needs_repair")
+        self.assertEqual(restarted["state"], "pending")
+        self.assertEqual(restarted["attempt_token"], "")
+        self.assertEqual(restarted["attempts"], 1)
         self.assertEqual(restarted["pr"], "https://example.test/pull/40")
+        self.assertIn("PROJ-1", controller.plan_value(controller.load(path), self.cfg)["launch"])
+
+        reserve_args = argparse.Namespace(
+            sprint="1",
+            ticket="PROJ-1",
+            run_ref="repair-2",
+            run_id="repair-2",
+            role="sprint-worker",
+            worker_ref="repair-2",
+        )
+        with (
+            patch.object(controller, "usage_snapshots", return_value={}),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            controller.reserve(reserve_args, self.cfg)
+        reserved = controller.load(path)["tickets"]["PROJ-1"]
+        self.assertEqual(reserved["state"], "running")
+        self.assertEqual(reserved["attempts"], 2)
+        self.assertTrue(reserved["attempt_token"].startswith("attempt_"))
 
     def test_supervisor_error_records_exit_before_terminal_receipt(self):
         root = self.cfg["shared_root"]

@@ -2182,23 +2182,54 @@ def record_progress(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         fingerprint = args.evidence.strip()
         if args.milestone == "implementation_commit":
             evidence = args.evidence.strip()
-            baseline = (ticket.get("launch_evidence") or {}).get("base_commit", "")
+            launch = ticket.get("launch_evidence") or {}
+            baseline = launch.get("base_commit", "")
+            worker_cwd_raw = str(launch.get("worker_cwd") or "")
             if (
                 not re.fullmatch(r"[0-9a-f]{40,64}", evidence)
                 or not baseline
+                or not worker_cwd_raw
                 or evidence == baseline
             ):
                 raise SprintError(
-                    "implementation progress requires a new full commit SHA after launch"
+                    "implementation progress requires a worker-bound new full commit SHA after launch"
+                )
+            worker_cwd = Path(worker_cwd_raw).resolve()
+            try:
+                shared_common = subprocess.check_output(
+                    ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                    cwd=cfg["shared_root"],
+                    text=True,
+                ).strip()
+                worker_common = subprocess.check_output(
+                    ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                    cwd=worker_cwd,
+                    text=True,
+                ).strip()
+                worker_head = subprocess.check_output(
+                    ["git", "rev-parse", "--verify", "HEAD"],
+                    cwd=worker_cwd,
+                    text=True,
+                ).strip()
+            except (OSError, subprocess.CalledProcessError) as exc:
+                raise SprintError(
+                    "implementation progress requires the authenticated worker checkout"
+                ) from exc
+            if (
+                Path(shared_common).resolve() != Path(worker_common).resolve()
+                or worker_head != evidence
+            ):
+                raise SprintError(
+                    "progress commit must be the authenticated worker checkout HEAD"
                 )
             ancestor = subprocess.run(
                 ["git", "merge-base", "--is-ancestor", baseline, evidence],
-                cwd=cfg["shared_root"],
+                cwd=worker_cwd,
                 capture_output=True,
             )
             changed = subprocess.run(
                 ["git", "diff", "--quiet", baseline, evidence, "--"],
-                cwd=cfg["shared_root"],
+                cwd=worker_cwd,
                 capture_output=True,
             )
             if ancestor.returncode != 0 or changed.returncode != 1:
@@ -2207,7 +2238,7 @@ def record_progress(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
                 )
             fingerprint = subprocess.check_output(
                 ["git", "rev-parse", evidence + "^{tree}"],
-                cwd=cfg["shared_root"],
+                cwd=worker_cwd,
                 text=True,
             ).strip()
             ticket.setdefault("verified_commits", {})[evidence] = fingerprint
@@ -4393,7 +4424,7 @@ def launch_local(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             "created_at": now(),
             "base_commit": subprocess.run(
                 ["git", "rev-parse", "--verify", "HEAD"],
-                cwd=cfg["shared_root"],
+                cwd=worker_cwd,
                 capture_output=True,
                 text=True,
             ).stdout.strip(),
@@ -4586,7 +4617,13 @@ def attach(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         ticket["worker_identity"] = identity
         ticket["attached_at"] = now()
         ticket["attach_capability"] = ""
-        ticket["launch_evidence"] = {}
+        # Consume only the bearer token.  The attempt-scoped launch record is
+        # still required after attach to bind cooperative terminal cleanup,
+        # recovery policy, and the implementation baseline to this invocation.
+        # `attached_at` makes the transition one-use; requeue/reserve clear the
+        # complete record before a later attempt begins.
+        evidence["token"] = ""
+        ticket["launch_evidence"] = evidence
         ticket["history"].append(
             {"at": now(), "event": "attached", "worker_identity": identity}
         )
@@ -4737,7 +4774,7 @@ def restart_ticket(args, cfg):
         jira_state, jira_reason = initial_state(ticket.get("raw_status", ""), cfg)
         if jira_state in {"completed", "blocked"}:
             ticket["state"], ticket["reason"] = jira_state, jira_reason
-        elif ticket.get("pr"):
+        elif ticket.get("pr") and ticket.get("attempt_token"):
             ticket["state"] = "needs_repair"
             ticket["reason"] = "operator restart resumes the preserved pull request"
         elif ticket.get("scope_assessment", {}).get("verdict") == "decompose":
@@ -4874,8 +4911,8 @@ def recover_terminal(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         ticket["reason"] = args.reason.strip()
         ticket["run_ref"] = ""
         # The terminal execution identity is gone, but its durable work is not.
-        # Preserve branch/PR bindings so restart-ticket can route an existing PR
-        # to repair instead of manufacturing a fresh implementation attempt.
+        # Preserve branch/PR bindings while leaving the ticket pending; reserve
+        # will mint the only valid token for the next repair attempt.
         ticket["attempt_token"] = ""
         ticket["attempt_capability"] = {}
         ticket["worker_identity"] = ""

@@ -151,7 +151,9 @@ llm:
         self.assertEqual(self.led('complete-repair-review','1')['next_action'],'gates-clear')
         state = controller.load(self.path)
         lane = state['tickets']['PROJ-1']
-        lane['launch_evidence'] = dict(base_commit=baseline)
+        lane['launch_evidence'] = dict(
+            base_commit=baseline, worker_cwd=str(self.root)
+        )
         controller.save(self.path,state)
         args = argparse.Namespace(sprint='1',ticket='PROJ-1',attempt_token=token,milestone='implementation_commit',evidence=repaired)
         pr = dict(number=1,state='open',base=dict(repo=dict(id=7)),head=dict(sha=repaired,ref='codex/PROJ-1'))

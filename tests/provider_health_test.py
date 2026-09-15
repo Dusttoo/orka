@@ -654,7 +654,9 @@ class AdmissionTests(unittest.TestCase):
         self.reserve()
         state = self.c.load(self.path)
         ticket = state["tickets"]["T-1"]
-        binding = {"kind": "preserved_pr", "worktree": str(self.root)}
+        preserved = self.root / "preserved-worktree"
+        preserved.mkdir()
+        binding = {"kind": "preserved_pr", "worktree": str(preserved)}
         ticket["recovery_binding"] = binding
         self.c.save(self.path, state)
         args = self.N(
@@ -677,9 +679,12 @@ class AdmissionTests(unittest.TestCase):
             self.assertTrue(Path(snapshot["tickets"]["T-1"]["launch_evidence"]["ack_path"]).exists())
             return {"phase": "launched", "worker_pid": 23456}
 
+        def git_head(_argv, *, cwd, **_kwargs):
+            return Mock(stdout=("b" if Path(cwd) == preserved else "a") * 40)
+
         with patch.object(self.c, "verify_recovery_binding", return_value=binding), patch.object(
             self.c, "linux_systemd_scope_available", return_value=False
-        ), patch.object(self.c.subprocess, "run", return_value=Mock(stdout="a" * 40)), patch.object(
+        ), patch.object(self.c.subprocess, "run", side_effect=git_head), patch.object(
             self.c.subprocess, "Popen", return_value=supervisor
         ), patch.object(
             self.c, "wait_for_runtime_record", side_effect=runtime_record
@@ -689,7 +694,10 @@ class AdmissionTests(unittest.TestCase):
             ("supervisor readiness", binding),
             ("worker launch", binding),
         ])
-        self.assertEqual(self.c.load(self.path)["tickets"]["T-1"]["recovery_binding"], {})
+        launched = self.c.load(self.path)["tickets"]["T-1"]
+        self.assertEqual(launched["recovery_binding"], {})
+        self.assertEqual(launched["launch_evidence"]["worker_cwd"], str(preserved))
+        self.assertEqual(launched["launch_evidence"]["base_commit"], "b" * 40)
 
     def test_subscription_route_drift_writes_terminal_without_spawning(self):
         config = Path(self.cfg["config"])
