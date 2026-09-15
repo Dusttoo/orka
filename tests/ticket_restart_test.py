@@ -210,10 +210,10 @@ class RestartTests(unittest.TestCase):
                 for role in ("code-reviewer", "security-reviewer")
             ],
             "rounds": [
-                {"round": 1, "gate": "code-review", "head": "head-1", "recorded_at": "2026-09-15T09:00:00+00:00", "claimed_verdict": "FAIL", "effective_verdict": "FAIL"},
-                {"round": 2, "gate": "security-review", "head": "head-1", "recorded_at": "2026-09-15T09:01:00+00:00", "claimed_verdict": "PASS", "effective_verdict": "PASS"},
-                {"round": 3, "gate": "code-review", "head": "head-2", "recorded_at": "2026-09-15T11:00:00+00:00", "claimed_verdict": "FAIL", "effective_verdict": "FAIL"},
-                {"round": 4, "gate": "security-review", "head": "head-2", "recorded_at": "2026-09-15T11:01:00+00:00", "claimed_verdict": "PASS", "effective_verdict": "PASS"},
+                {"round": 1, "gate": "code-review", "recorded_at": "2026-09-15T09:00:00+00:00", "claimed_verdict": "FAIL", "effective_verdict": "FAIL"},
+                {"round": 2, "gate": "security-review", "recorded_at": "2026-09-15T09:01:00+00:00", "claimed_verdict": "PASS", "effective_verdict": "PASS"},
+                {"round": 3, "gate": "code-review", "recorded_at": "2026-09-15T11:00:00+00:00", "claimed_verdict": "FAIL", "effective_verdict": "FAIL"},
+                {"round": 4, "gate": "security-review", "recorded_at": "2026-09-15T11:01:00+00:00", "claimed_verdict": "PASS", "effective_verdict": "PASS"},
             ],
         }
         review._migrate_legacy_repair_generations(state)
@@ -222,6 +222,10 @@ class RestartTests(unittest.TestCase):
             [1, 1, 2, 2],
         )
         self.assertEqual([entry["round"] for entry in state["rounds"]], [1, 2, 3, 4])
+        self.assertEqual(
+            [entry["head"] for entry in state["rounds"]],
+            ["head-1", "head-1", "head-2", "head-2"],
+        )
         self.assertEqual(
             state["repair_attempts"][-1]["required_gates"],
             ["code-review", "security-review"],
@@ -255,7 +259,15 @@ class RestartTests(unittest.TestCase):
                     "head": "head-1",
                     "recorded_at": "2026-09-15T09:00:00+00:00",
                     "claimed_verdict": "FAIL",
-                    "effective_verdict": "PASS",
+                    "effective_verdict": "FAIL",
+                }
+            ],
+            "advisories": [
+                {
+                    "round": 1,
+                    "gate": "code-review",
+                    "reason": "out-of-scope-in-frozen-round",
+                    "key": "src/a.ts:hidden",
                 }
             ],
         }

@@ -244,6 +244,20 @@ def _migrate_legacy_repair_generations(value: dict[str, Any]) -> None:
     # consumed permit for the same gate, generation, and head. A legacy FAIL
     # that was demoted by the old ordering bug needs the explicit blocker-
     # restoring migration, not a generation-only rewrite.
+    legacy_markers = {
+        (int(entry.get("round", 0)), str(entry.get("gate") or ""))
+        for entry, _ in mapped
+    }
+    if any(
+        advisory.get("reason") == "out-of-scope-in-frozen-round"
+        and (int(advisory.get("round", 0)), str(advisory.get("gate") or ""))
+        in legacy_markers
+        for advisory in value.get("advisories", [])
+    ):
+        raise LedgerError(
+            "legacy demoted blocker requires blocker-restoring review migration"
+        )
+    migrated_heads: dict[int, str] = {}
     for generation in sorted({generation for _, generation in mapped}):
         entries = [entry for entry, item_generation in mapped if item_generation == generation]
         gates = [str(entry.get("gate") or "") for entry in entries]
@@ -269,11 +283,12 @@ def _migrate_legacy_repair_generations(value: dict[str, Any]) -> None:
                 )
             entry_head = str(entry.get("head") or "").lower()
             permit_head = str(permits[0].get("head") or "").lower()
-            if not entry_head or entry_head != permit_head:
+            if not permit_head or (entry_head and entry_head != permit_head):
                 raise LedgerError(
                     f"legacy {gate} result does not match its consumed permit head"
                 )
-            generation_heads.add(entry_head)
+            migrated_heads[id(entry)] = entry_head or permit_head
+            generation_heads.add(entry_head or permit_head)
             if (
                 entry.get("claimed_verdict") == "FAIL"
                 and entry.get("effective_verdict") != "FAIL"
@@ -290,6 +305,7 @@ def _migrate_legacy_repair_generations(value: dict[str, Any]) -> None:
     for entry, generation in mapped:
         entry["legacy_result_sequence"] = int(entry.get("round", 0))
         entry["generation"] = generation
+        entry["head"] = migrated_heads[id(entry)]
         migrated.append(int(entry.get("round", 0)))
 
     # A repair may already have been recorded by the affected runtime.  Until

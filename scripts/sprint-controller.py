@@ -4424,7 +4424,7 @@ def launch_local(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             "created_at": now(),
             "base_commit": subprocess.run(
                 ["git", "rev-parse", "--verify", "HEAD"],
-                cwd=cfg["shared_root"],
+                cwd=worker_cwd,
                 capture_output=True,
                 text=True,
             ).stdout.strip(),
