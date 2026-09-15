@@ -66,7 +66,9 @@ completion receipt after successful provider output.
    compaction,
    normalizes component keys so a repeated defect actually accumulates strikes,
    and decides when the loop stops. Paste the `brief` output verbatim into every
-   reviewer pass this round: it carries the round number, the scope mode, the
+   reviewer pass this round. A round is the ledger's shared review generation
+   for one exact head, never the arrival order of individual gate responses. It
+   carries the round number, the scope mode, the
    round-aware uncertainty rule, and the open component keys to reuse. Without it
    a reviewer assumes round 1 and reviews with full blocking authority.
 3. Launch the code-review gate and any required security-review gate concurrently
@@ -97,7 +99,10 @@ completion receipt after successful provider output.
    alike: `review-ledger.py record <pr> --gate code-review --result
    .orchestration/.review-results/code-review.json --head <exact-sha>
    --phase-permit <token>`. The validated JSON carries
-   disposition, severity, regression, and explanation. The ledger increments strikes, auto-resolves components this gate
+   disposition, severity, regression, and explanation. Both concurrent results
+   retain the same generation and scope mode regardless of which is recorded
+   first. A partial generation cannot return `gates-clear`; every issued gate
+   must be recorded. The ledger increments strikes, auto-resolves components this gate
    no longer reports, demotes out-of-scope new findings in a frozen round, and
    returns `next_action`. Its `effective_verdict` governs, not the claimed one.
 6. Act on `next_action`. Never merge while a blocking component is open.

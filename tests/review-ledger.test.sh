@@ -114,20 +114,31 @@ led open 2 >/dev/null
 out="$(led record 2 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' --blocking 'src/b.ts:bar')"
 eq "round 1 accepts every blocking finding" "src/a.ts:foo,src/b.ts:bar" "$(printf '%s' "$out" | field accepted_blocking)"
 eq "round 1 is recorded as full-authority scope" "full-authority" "$(printf '%s' "$out" | field scope_mode)"
-eq "the next round is announced as scope-frozen" "scope-frozen" "$(printf '%s' "$out" | field next_scope_mode)"
+eq "the initial generation remains full-authority until a repair is recorded" \
+  "full-authority" "$(printf '%s' "$out" | field next_scope_mode)"
 
 # --- the scope freeze ---------------------------------------------------------
-out="$(led record 2 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' --blocking 'src/new.ts:nit')"
+cat > "$TMP/scope-repair.json" <<'JSON'
+{"schema_version":1,"head":"abcdef2","findings":[{"component":"src/a.ts:foo","status":"closed","root_cause":"wrong branch","change":"corrected branch","verification":"named regression passes"},{"component":"src/b.ts:bar","status":"closed","root_cause":"missing guard","change":"added guard","verification":"guard regression passes"}]}
+JSON
+led record-repair 2 --report "$TMP/scope-repair.json" >/dev/null
+out="$(led record 2 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' --blocking 'src/new.ts:nit' --head abcdef2)"
 eq "a new non-regression finding is demoted in a frozen round" "src/new.ts:nit" "$(printf '%s' "$out" | field demoted_to_advisory)"
 eq "a known component still blocks in a frozen round" "src/a.ts:foo" "$(printf '%s' "$out" | field accepted_blocking)"
-eq "a component the gate stopped reporting auto-resolves" "src/b.ts:bar" "$(printf '%s' "$out" | field resolved_this_round)"
-eq "the blocking set shrank" "src/a.ts:foo" "$(printf '%s' "$out" | field open_blocking)"
+led complete-repair-review 2 >/dev/null
+eq "a component the repaired generation stopped reporting auto-resolves" "resolved" \
+  "$(led status 2 | python3 -c 'import json,sys; print(json.load(sys.stdin)["components"]["src/b.ts:bar"]["status"])')"
+eq "the blocking set shrank" "src/a.ts:foo" "$(led status 2 | field open_blocking)"
 
 led open 3 >/dev/null
 led record 3 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' >/dev/null
+cat > "$TMP/regression-repair.json" <<'JSON'
+{"schema_version":1,"head":"abcdef3","findings":[{"component":"src/a.ts:foo","status":"closed","root_cause":"wrong branch","change":"corrected branch","verification":"named regression passes"}]}
+JSON
+led record-repair 3 --report "$TMP/regression-repair.json" >/dev/null
 eq "a declared regression keeps blocking authority in a frozen round" \
   "src/a.ts:foo,src/broke.ts:oops" \
-  "$(led record 3 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' --blocking 'src/broke.ts:oops' --regression 'src/broke.ts:oops' | field accepted_blocking)"
+  "$(led record 3 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' --blocking 'src/broke.ts:oops' --regression 'src/broke.ts:oops' --head abcdef3 | field accepted_blocking)"
 
 # --- the security gate is never scope-frozen ----------------------------------
 led open 4 >/dev/null
@@ -178,6 +189,53 @@ if led complete-review concurrent-permits --role security-reviewer --phase-permi
 else
   bad "concurrent gate permits remain completable and recordable in either order"
 fi
+CONCURRENT_LEDGER="$(led open concurrent-permits | field ledger)"
+eq "concurrent gates share one logical review round" "1" \
+  "$(python3 -c 'import json,sys; print(len({r["round"] for r in json.load(open(sys.argv[1]))["rounds"]}))' "$CONCURRENT_LEDGER")"
+
+led open concurrent-fail-order >/dev/null
+FAIL_ORDER_CODE_PERMIT="$(led permit-review concurrent-fail-order --role code-reviewer --head "$HEAD_CONCURRENT" | field review_phase_permit)"
+FAIL_ORDER_SEC_PERMIT="$(led permit-review concurrent-fail-order --role security-reviewer --head "$HEAD_CONCURRENT" | field review_phase_permit)"
+cat > "$TMP/concurrent-code-fail.json" <<'JSON'
+{"schema_version":1,"gate":"code-review","verdict":"FAIL","checks":[{"name":"review","status":"fail"}],"findings":[{"component":"tests/flow.test.ts:cold-hot-reset","disposition":"blocking","severity":"high","title":"Flow coverage missing","explanation":"The cold, hot, and reset sequence has no end-to-end regression assertion.","regression":false},{"component":"tests/copy.test.ts:misconception-scan","disposition":"blocking","severity":"high","title":"Misconception scan missing","explanation":"The shipped copy is not checked for the prohibited misconception vocabulary.","regression":false}]}
+JSON
+led complete-review concurrent-fail-order --role security-reviewer --phase-permit "$FAIL_ORDER_SEC_PERMIT" --result "$TMP/concurrent-security.json" >/dev/null
+first_gate="$(led record concurrent-fail-order --gate security-review --result "$TMP/concurrent-security.json" --head "$HEAD_CONCURRENT" --phase-permit "$FAIL_ORDER_SEC_PERMIT")"
+eq "one completed concurrent gate cannot clear the generation" "code-review" \
+  "$(printf '%s' "$first_gate" | field missing_gates)"
+led complete-review concurrent-fail-order --role code-reviewer --phase-permit "$FAIL_ORDER_CODE_PERMIT" --result "$TMP/concurrent-code-fail.json" >/dev/null
+second_gate="$(led record concurrent-fail-order --gate code-review --result "$TMP/concurrent-code-fail.json" --head "$HEAD_CONCURRENT" --phase-permit "$FAIL_ORDER_CODE_PERMIT")"
+eq "a failing initial gate recorded second retains full authority" "full-authority" \
+  "$(printf '%s' "$second_gate" | field scope_mode)"
+eq "a failing initial gate recorded second keeps every blocker" \
+  "tests/copy.test.ts:misconception-scan,tests/flow.test.ts:cold-hot-reset" \
+  "$(printf '%s' "$second_gate" | field accepted_blocking)"
+eq "concurrent gate responses do not consume repair cycles" "0" \
+  "$(printf '%s' "$second_gate" | field fix_cycles)"
+
+# Recreate the exact legacy corruption: security PASS was stored as round one,
+# then code FAIL was scope-frozen as round two and its blocker became advisory.
+LEGACY_LEDGER="$CONCURRENT_LEDGER"
+python3 - "$LEGACY_LEDGER" <<'PY'
+import json,sys
+path=sys.argv[1]
+state=json.load(open(path))
+security=next(r for r in state["rounds"] if r["gate"]=="security-review")
+code=next(r for r in state["rounds"] if r["gate"]=="code-review")
+for entry in (security,code):
+    entry.pop("generation",None); entry.pop("head",None)
+security.update(round=1,scope_mode="full-authority")
+key="tests/legacy.test.ts:cold-hot-reset"
+code.update(round=2,scope_mode="scope-frozen",claimed_verdict="FAIL",effective_verdict="PASS",blocking=[],advisory=[key])
+state.setdefault("advisories",[]).append({"key":key,"display":key,"reason":"out-of-scope-in-frozen-round","round":2,"gate":"code-review","finding":{"component":key,"disposition":"blocking","severity":"high","title":"Flow coverage missing","explanation":"The initial full-authority reviewer required the missing flow assertion.","regression":False}})
+json.dump(state,open(path,"w"),indent=2,sort_keys=True)
+open(path,"a").write("\n")
+PY
+migrated="$(led migrate-concurrent-review concurrent-permits --reason 'restore blockers hidden by legacy gate completion ordering')"
+eq "legacy concurrent-review migration restores hidden blockers" \
+  "tests/legacy.test.ts:cold-hot-reset" "$(printf '%s' "$migrated" | field open_blocking)"
+eq "legacy concurrent-review migration preserves one logical round" "1" \
+  "$(python3 -c 'import json,sys; print(len({r["round"] for r in json.load(open(sys.argv[1]))["rounds"]}))' "$LEGACY_LEDGER")"
 
 # A provider-side pre-ack cancellation is terminal, not a reusable permit.
 led open cancelled-permit >/dev/null
