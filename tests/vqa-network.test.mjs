@@ -19,7 +19,7 @@ assert.equal(
   isExpectedPrefetchAbort(
     request({ url: 'https://example.test/dashboard?_rsc=abc' }),
   ),
-  true,
+  false,
 );
 assert.equal(
   isExpectedPrefetchAbort(request({ headers: { 'next-router-prefetch': '1' } })),

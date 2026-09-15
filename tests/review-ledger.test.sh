@@ -212,6 +212,19 @@ eq "a failing initial gate recorded second keeps every blocker" \
   "$(printf '%s' "$second_gate" | field accepted_blocking)"
 eq "concurrent gate responses do not consume repair cycles" "0" \
   "$(printf '%s' "$second_gate" | field fix_cycles)"
+if led permit-review concurrent-fail-order --role code-reviewer --head "$HEAD_CONCURRENT" >/dev/null 2>&1; then
+  bad "a completed gate cannot receive another permit in the same generation"
+else ok "a completed gate cannot receive another permit in the same generation"; fi
+
+led open generation-head-binding >/dev/null
+BOUND_HEAD="$(git -C "$TMP" rev-parse HEAD)"
+led permit-review generation-head-binding --role code-reviewer --head "$BOUND_HEAD" >/dev/null
+git -C "$TMP" -c user.name=Test -c user.email=test@example.com commit --allow-empty -qm moved-head
+MOVED_HEAD="$(git -C "$TMP" rev-parse HEAD)"
+if led permit-review generation-head-binding --role security-reviewer --head "$MOVED_HEAD" >/dev/null 2>&1; then
+  bad "one generation cannot combine review permits from different heads"
+else ok "one generation cannot combine review permits from different heads"; fi
+git -C "$TMP" reset --hard -q "$BOUND_HEAD"
 
 # Recreate the exact legacy corruption: security PASS was stored as round one,
 # then code FAIL was scope-frozen as round two and its blocker became advisory.
@@ -255,10 +268,10 @@ else ok "cancelled permit cannot complete"; fi
 
 # --- explicit repairs, redesign, and the cap ----------------------------------
 led open 5 --max-rounds 2 >/dev/null
-led record 5 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' --head abcdef1 >/dev/null
-led repair-brief 5 | grep -q 'stable finding ID' && ok "repair brief carries stable IDs" || bad "repair brief carries stable IDs"
 STALE_HEAD="$(git -C "$TMP" rev-parse HEAD)"
 STALE_PERMIT="$(led permit-review 5 --role code-reviewer --head "$STALE_HEAD" | field review_phase_permit)"
+led record 5 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' --head abcdef1 >/dev/null
+led repair-brief 5 | grep -q 'stable finding ID' && ok "repair brief carries stable IDs" || bad "repair brief carries stable IDs"
 cat > "$TMP/repair-1.json" <<'JSON'
 {"schema_version":1,"head":"abcdef1","findings":[{"component":"src/a.ts:foo","status":"closed","root_cause":"wrong branch","change":"corrected branch","verification":"named regression passes"}]}
 JSON
@@ -290,9 +303,12 @@ led handoff 5 2>/dev/null | grep -q "Still blocking" && ok "handoff renders the 
 led open 9 --max-rounds 2 >/dev/null
 led record 9 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' >/dev/null
 record_pass 9 security >/dev/null
-record_pass 9 code >/dev/null
 eq "review passes do not spend a repair cycle" "0" "$(led status 9 | field fix_cycles)"
-eq "three passes without a repair can still clear" "gates-clear" "$(led status 9 | field next_action)"
+if record_pass 9 code >/dev/null 2>&1; then
+  bad "a second same-generation gate result cannot erase its prior failure"
+else ok "a second same-generation gate result cannot erase its prior failure"; fi
+eq "the original blocker survives until a repair is recorded" "src/a.ts:foo" \
+  "$(led status 9 | field open_blocking)"
 
 # --- the clean path -----------------------------------------------------------
 led open 6 >/dev/null

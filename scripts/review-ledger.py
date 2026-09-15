@@ -477,6 +477,53 @@ def restart_limits(state):
     return grant["allowances"] if grant else {}
 
 
+def _current_generation_permits(state: dict[str, Any]) -> list[dict[str, Any]]:
+    generation = int(state.get("review_generation", 1))
+    return [
+        permit
+        for permit in state.get("review_permits", [])
+        if int(permit.get("review_generation", 1)) == generation
+        and not permit.get("cancelled_at")
+        and not permit.get("superseded_at")
+    ]
+
+
+def _round_is_authoritative(
+    state: dict[str, Any], entry: dict[str, Any]
+) -> bool:
+    if entry.get("authoritative") is True:
+        return True
+    role = {
+        "code-review": "code-reviewer",
+        "security-review": "security-reviewer",
+    }.get(entry.get("gate"))
+    if not role or not entry.get("head"):
+        return False
+    return any(
+        permit.get("role") == role
+        and permit.get("head") == entry["head"]
+        and permit.get("receipt_consumed_at")
+        for permit in _current_generation_permits(state)
+    )
+
+
+def _current_generation_heads(state: dict[str, Any]) -> set[str]:
+    generation = int(state.get("review_generation", 1))
+    heads = {
+        str(permit.get("head") or "").lower()
+        for permit in _current_generation_permits(state)
+        if permit.get("head")
+    }
+    heads.update(
+        str(entry.get("head") or "").lower()
+        for entry in state.get("rounds", [])
+        if int(entry.get("generation", entry.get("round", 1))) == generation
+        and entry.get("head")
+        and _round_is_authoritative(state, entry)
+    )
+    return heads
+
+
 def decide(state: dict[str, Any]) -> dict[str, Any]:
     """Derive the loop's next action. Precedence: clear > escalate > redesign > review."""
     recorded = len(state["rounds"])
@@ -507,6 +554,11 @@ def decide(state: dict[str, Any]) -> dict[str, Any]:
     gate_verdicts = {
         entry["gate"]: entry["effective_verdict"] for entry in current_entries
     }
+    gate_authority = {
+        entry["gate"]: _round_is_authoritative(state, entry)
+        for entry in current_entries
+    }
+    generation_heads = _current_generation_heads(state)
     required_gates = {
         ROLE_GATES[item["role"]]
         for item in state.get("review_permits", [])
@@ -523,6 +575,8 @@ def decide(state: dict[str, Any]) -> dict[str, Any]:
         and not missing_gates
         and not blocking
         and all(verdict == "PASS" for verdict in gate_verdicts.values())
+        and all(gate_authority.values())
+        and len(generation_heads) == 1
     )
 
     cap_reached = not pending_review and fix_cycles >= max_rounds and bool(blocking)
@@ -549,6 +603,10 @@ def decide(state: dict[str, Any]) -> dict[str, Any]:
         "open_blocking": blocking,
         "redesign_required": pending,
         "gate_verdicts": gate_verdicts,
+        "generation_head": next(iter(generation_heads), "")
+        if len(generation_heads) == 1
+        else "",
+        "generation_head_conflict": len(generation_heads) > 1,
         "review_generation": generation,
         "required_gates": sorted(required_gates),
         "missing_gates": missing_gates,
@@ -968,6 +1026,7 @@ def cmd_record(args: argparse.Namespace) -> None:
                 "blocking": sorted(accepted_keys),
                 "advisory": sorted({item["key"] for item in advisories}),
                 "resolved": sorted(resolved),
+                "authoritative": bool(args.result),
             }
         )
         if state.get("repair_pending_review") and state.get("repair_attempts"):
@@ -1742,6 +1801,21 @@ def cmd_permit_review(args: argparse.Namespace) -> None:
                 )
         elif decide(state)["next_action"] != ACTION_REVIEW:
             raise LedgerError("review ledger phase does not permit another reviewer")
+        generation_heads = _current_generation_heads(state)
+        if generation_heads and actual_head not in generation_heads:
+            raise LedgerError(
+                "the current review generation is already bound to another exact head"
+            )
+        gate = ROLE_GATES.get(args.role)
+        if gate and any(
+            entry.get("gate") == gate
+            and int(entry.get("generation", entry.get("round", 1)))
+            == int(state.get("review_generation", 1))
+            for entry in state.get("rounds", [])
+        ):
+            raise LedgerError(
+                "the current gate already recorded a result for this review generation"
+            )
         active = [
             item
             for item in state.get("review_permits", [])

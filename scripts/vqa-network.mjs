@@ -5,14 +5,7 @@ export function isExpectedPrefetchAbort(request) {
 
   const headers = request.headers();
   const purpose = `${headers.purpose || ''} ${headers['sec-purpose'] || ''}`;
-  let hasRscQuery = false;
-  try {
-    hasRscQuery = new URL(request.url()).searchParams.has('_rsc');
-  } catch {
-    return false;
-  }
   return (
-    hasRscQuery ||
     headers['next-router-prefetch'] === '1' ||
     /\bprefetch\b/i.test(purpose)
   );
