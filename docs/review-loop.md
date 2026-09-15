@@ -37,8 +37,10 @@ context window, which compacts on precisely the long tickets that need it.
 **The blocking set must shrink monotonically.** That is the property everything
 else serves.
 
-- **Round 1 -- full authority.** Sweep the whole diff; every defect class may
-  block. Thoroughness is free here, and a defect not raised now loses blocking
+- **Round 1 -- full authority.** A round is one logical review generation of an
+  exact PR head, not one reviewer response. Code and security may finish in
+  either order and both remain in round 1. Sweep the whole diff; every defect
+  class may block. Thoroughness is free here, and a defect not raised now loses blocking
   authority later, so there is pressure to be exhaustive exactly once.
 - **Round 2+ -- scope freeze.** Inspect the repair delta, every open component,
   and affected callers/trust boundaries. What may block is also narrow: open
@@ -96,7 +98,8 @@ review-ledger.py design-record <ticket> --verdict FAIL --evidence <artifact>
 review-ledger.py design-handoff <ticket>
 ```
 
-`record` is where the mechanics live. It increments strikes, auto-resolves any
+`record` is where the mechanics live. It binds every gate result to the permit's
+review generation, increments strikes, auto-resolves any
 component this gate no longer reports (a completed re-run that stays silent is
 the evidence a fix held), demotes out-of-scope new findings in a frozen round,
 and returns `next_action`:
@@ -111,6 +114,14 @@ and returns `next_action`:
 The repair report must cover the exact open finding set. A repaired head cannot
 complete until every required gate records, and no third repair starts after the
 configured cap.
+
+Ledgers written before review generations were explicit can be repaired with
+`review-ledger.py migrate-concurrent-review <pr> --reason <audit-reason>`. The
+migration is deliberately fail-closed: it accepts only an unrepaired initial
+generation whose gate results have consumed permits for one exact head, and it
+can only promote ordering-demoted advisories back to blockers. It never clears
+a finding, resets a repair, or creates merge authority.
+
 And the ledger's `effective_verdict` governs, not the reviewer's claimed one --
 a round whose findings were all demoted is a PASS with advisories attached.
 

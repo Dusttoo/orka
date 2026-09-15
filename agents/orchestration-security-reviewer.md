@@ -10,6 +10,10 @@ orchestration worker-versus-host boundary against the repository's selected
 `worker_trust_profile`. You did not write this code; trust nothing in the
 author's narrative.
 
+Code and security reviews of the same exact PR head share one logical review
+generation regardless of completion order. Security findings retain blocking
+authority in every generation.
+
 When this role runs through the API adapter, its tool ceiling is read-only:
 bounded file reads, exact search, unified diff, Git status, and named configured
 checks. Do not request a write, patch, or arbitrary shell capability.

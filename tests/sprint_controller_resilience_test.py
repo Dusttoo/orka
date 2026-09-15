@@ -1195,6 +1195,158 @@ class ResilienceTests(unittest.TestCase):
             self.sync_fixture(fresh)
             self.assertEqual(self.state["tickets"]["PROJ-1"]["state"], ticket["state"])
 
+    def test_authoritative_sync_clears_restart_status_misclassification(self):
+        state, reason = controller.initial_state("In Progress", self.cfg)
+        self.assertEqual(state, "user_action")
+        self.ticket(
+            "PROJ-1",
+            state,
+            raw_status="In Progress",
+            reason=reason,
+            attempts=1,
+            history=[{"event": "operator-restart"}],
+            scope_assessment={},
+        )
+        controller.save(controller.state_path(self.cfg["state_dir"], "1"), self.state)
+        fresh = copy.deepcopy(self.state)
+        fresh_ticket = fresh["tickets"]["PROJ-1"]
+        fresh_ticket["state"] = "pending"
+        fresh_ticket["reason"] = ""
+        fresh_ticket["raw_status"] = "Ready"
+        fresh_ticket["history"] = []
+        self.sync_fixture(fresh)
+        stored = self.state["tickets"]["PROJ-1"]
+        self.assertEqual((stored["state"], stored["reason"]), ("pending", ""))
+        self.assertEqual(stored["history"][-1]["event"], "jira-status-refreshed")
+
+    def test_enabling_decomposition_releases_only_matching_stale_policy_hold(self):
+        self.cfg["auto_decompose_large_tickets"] = True
+        self.ticket(
+            "PROJ-1",
+            "user_action",
+            raw_status="Ready",
+            reason="automatic decomposition is disabled by repository policy",
+            scope_assessment={"verdict": "decompose", "slices": [{"id": "one"}]},
+        )
+        controller.save(controller.state_path(self.cfg["state_dir"], "1"), self.state)
+        fresh = copy.deepcopy(self.state)
+        fresh["tickets"]["PROJ-1"]["state"] = "pending"
+        fresh["tickets"]["PROJ-1"]["reason"] = ""
+        fresh["tickets"]["PROJ-1"]["history"] = []
+        self.sync_fixture(fresh)
+        stored = self.state["tickets"]["PROJ-1"]
+        self.assertEqual(stored["state"], "needs_decomposition")
+        self.assertEqual(
+            stored["history"][-1]["event"], "decomposition-policy-enabled"
+        )
+
+    def test_terminal_recovery_preserves_pr_and_restart_routes_to_repair(self):
+        self.ticket(
+            "PROJ-1",
+            "user_action",
+            raw_status="In Progress",
+            attempts=1,
+            branch="feat/proj-1",
+            pr="https://example.test/pull/40",
+            attempt_token="",
+            worker_identity="",
+            history=[{"event": "worker-launched"}],
+        )
+        path = controller.state_path(self.cfg["state_dir"], "1")
+        controller.save(path, self.state)
+        recovery_args = argparse.Namespace(
+            sprint="1",
+            ticket="PROJ-1",
+            reason="verified terminal recovery",
+            operator_capability="recovery",
+            operator_capability_stdin=False,
+        )
+        with (
+            patch.object(controller, "consume_recovery"),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            controller.recover_terminal(recovery_args, self.cfg)
+        recovered = controller.load(path)["tickets"]["PROJ-1"]
+        self.assertEqual(recovered["branch"], "feat/proj-1")
+        self.assertEqual(recovered["pr"], "https://example.test/pull/40")
+
+        restart_args = argparse.Namespace(
+            sprint="1",
+            ticket="PROJ-1",
+            operator_capability="restart",
+            operator_capability_stdin=False,
+        )
+        grant = {
+            "grant_id": "grant-1",
+            "reason": "resume preserved PR",
+            "allowances": {"progress_baseline_usd": 0},
+        }
+        with (
+            patch.object(controller, "usage_snapshots", return_value={}),
+            patch.object(controller, "authorized_restart_grant", return_value=grant),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            controller.restart_ticket(restart_args, self.cfg)
+        restarted = controller.load(path)["tickets"]["PROJ-1"]
+        self.assertEqual(restarted["state"], "needs_repair")
+        self.assertEqual(restarted["pr"], "https://example.test/pull/40")
+
+    def test_supervisor_error_records_exit_before_terminal_receipt(self):
+        root = self.cfg["shared_root"]
+        self.cfg["config"] = root / "config.yaml"
+        self.cfg["config"].write_text("llm: {}\n")
+        checkpoint = controller.state_path(self.cfg["state_dir"], "1")
+        self.ticket(
+            "PROJ-1",
+            "running",
+            run_ref="launch-1",
+            worker_identity="",
+            launch_evidence={"invocation_id": "launch-1"},
+        )
+        controller.save(checkpoint, self.state)
+        ready = root / "ready.json"
+        ack = root / "ack"
+        tombstone = root / "terminal.json"
+        output = root / "output.log"
+        ack.touch()
+        args = argparse.Namespace(
+            command=["/bin/sh", "-c", "sleep 30"],
+            ready=str(ready),
+            ack=str(ack),
+            tombstone=str(tombstone),
+            output=str(output),
+            invocation_id="launch-1",
+            ticket="PROJ-1",
+            sprint="1",
+            stdin_file=None,
+            subscription_route=False,
+        )
+        with patch.object(
+            controller,
+            "usage_snapshots",
+            side_effect=controller.AuthorityError("operator authority timed out"),
+        ):
+            controller.supervise_local(args, self.cfg)
+        receipt = controller.read_json(tombstone, label="terminal")
+        self.assertTrue(receipt["spawned"])
+        self.assertIsInstance(receipt["returncode"], int)
+        self.assertIn("operator authority timed out", receipt["error"])
+        self.assertTrue(receipt["cooperative_cleanup"]["gateway_closed"])
+
+        ticket = controller.load(checkpoint)["tickets"]["PROJ-1"]
+        ticket["worker_identity"] = {
+            "kind": "execution_unit",
+            "containment": "cooperative-session",
+            "invocation_id": "launch-1",
+            "tombstone_path": str(tombstone),
+        }
+        ticket["launch_evidence"]["cooperative_auto_recovery"] = True
+        self.cfg["cooperative_auto_recovery"] = True
+        with patch.object(controller.os, "killpg", side_effect=ProcessLookupError):
+            self.assertTrue(
+                controller.automatic_recovery_available(ticket, self.cfg, "absent")
+            )
+
     def test_jira_refresh_does_not_erase_started_work_or_scope_decisions(self):
         for status, extra in (
             ("blocked", {"attempts": 1}),

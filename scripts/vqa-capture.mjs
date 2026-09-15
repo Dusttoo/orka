@@ -28,6 +28,7 @@
 //   BLANK_MIN_CHARS(optional) min body innerText length to not count as blank, default 40
 
 import { chromium } from 'playwright';
+import { isExpectedPrefetchAbort } from './vqa-network.mjs';
 import { mkdirSync, writeFileSync, existsSync } from 'node:fs';
 
 const baseUrl = (process.env.BASE_URL || 'http://localhost:3000').replace(/\/$/, '');
@@ -120,6 +121,7 @@ for (const route of routes) {
       // Only count same-origin failures; third-party analytics noise is ignored.
       if (!failingUrl.startsWith(baseUrl)) return;
       if (isInfraNoise(failingUrl)) return;
+      if (isExpectedPrefetchAbort(req)) return;
       entry.failedRequests.push(`${req.method()} ${failingUrl} (${req.failure()?.errorText || 'failed'})`);
     });
 

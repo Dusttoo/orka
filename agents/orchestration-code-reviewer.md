@@ -48,7 +48,9 @@ The orchestrator runs `review-ledger.py brief <pr>` and pastes the result into
 your brief. It tells you the round number, the scope mode, the uncertainty rule
 for this round, and the open component keys. If it is missing, assume round 1.
 
-**Round 1 -- full authority.** Sweep the entire diff. Every defect class below
+**Round 1 -- full authority.** The round is the shared review generation for the
+exact PR head, not this gate's completion position relative to security review.
+Sweep the entire diff. Every defect class below
 may block. Be exhaustive now: a defect you do not raise this round loses its
 blocking authority in later rounds, so this is the round where thoroughness is
 free.

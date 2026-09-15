@@ -51,6 +51,10 @@ DEFAULT_MAX_REPAIR_CYCLES = 2
 DEFAULT_MAX_DESIGN_ROUNDS = 5
 DEFAULT_LEDGER_DIR = ".orchestration/.review-ledger"
 SEVERITIES = ("blocking", "advisory")
+ROLE_GATES = {
+    "code-reviewer": "code-review",
+    "security-reviewer": "security-review",
+}
 
 # Round 1 sweeps the whole diff with full authority to block. Later rounds still
 # sweep the whole diff, but only ledger findings and regressions in the delta may
@@ -473,10 +477,61 @@ def restart_limits(state):
     return grant["allowances"] if grant else {}
 
 
+def _current_generation_permits(state: dict[str, Any]) -> list[dict[str, Any]]:
+    generation = int(state.get("review_generation", 1))
+    return [
+        permit
+        for permit in state.get("review_permits", [])
+        if int(permit.get("review_generation", 1)) == generation
+        and not permit.get("cancelled_at")
+        and not permit.get("superseded_at")
+    ]
+
+
+def _round_is_authoritative(
+    state: dict[str, Any], entry: dict[str, Any]
+) -> bool:
+    if entry.get("authoritative") is True:
+        return True
+    role = {
+        "code-review": "code-reviewer",
+        "security-review": "security-reviewer",
+    }.get(entry.get("gate"))
+    if not role or not entry.get("head"):
+        return False
+    return any(
+        permit.get("role") == role
+        and permit.get("head") == entry["head"]
+        and permit.get("receipt_consumed_at")
+        for permit in _current_generation_permits(state)
+    )
+
+
+def _current_generation_heads(state: dict[str, Any]) -> set[str]:
+    generation = int(state.get("review_generation", 1))
+    heads = {
+        str(permit.get("head") or "").lower()
+        for permit in _current_generation_permits(state)
+        if permit.get("head")
+    }
+    heads.update(
+        str(entry.get("head") or "").lower()
+        for entry in state.get("rounds", [])
+        if int(entry.get("generation", entry.get("round", 1))) == generation
+        and entry.get("head")
+        and _round_is_authoritative(state, entry)
+    )
+    return heads
+
+
 def decide(state: dict[str, Any]) -> dict[str, Any]:
     """Derive the loop's next action. Precedence: clear > escalate > redesign > review."""
     recorded = len(state["rounds"])
-    next_round = recorded + 1
+    generation = int(state.get("review_generation", 1))
+    # One review round is one logical generation of a PR head, not one gate
+    # response. Concurrent gate completion order must not decide which reviewer
+    # receives round-one blocking authority.
+    next_round = generation
     restart = restart_limits(state)
     max_rounds = max(state["max_rounds"], restart.get("repair_cycles", 0))
     # New ledgers count explicit completed repairs. Old v0.7 ledgers did not
@@ -490,15 +545,38 @@ def decide(state: dict[str, Any]) -> dict[str, Any]:
     blocking = sorted(c["key"] for c in open_components(state))
     pending = sorted(c["key"] for c in redesign_pending(state))
 
-    gate_verdicts = {}
-    for entry in state["rounds"]:
-        gate_verdicts[entry["gate"]] = entry["effective_verdict"]
     pending_review = bool(state.get("repair_pending_review"))
+    current_entries = [
+        entry
+        for entry in state["rounds"]
+        if int(entry.get("generation", entry.get("round", 1))) == generation
+    ]
+    gate_verdicts = {
+        entry["gate"]: entry["effective_verdict"] for entry in current_entries
+    }
+    gate_authority = {
+        entry["gate"]: _round_is_authoritative(state, entry)
+        for entry in current_entries
+    }
+    generation_heads = _current_generation_heads(state)
+    required_gates = {
+        ROLE_GATES[item["role"]]
+        for item in state.get("review_permits", [])
+        if item.get("role") in ROLE_GATES
+        and int(item.get("review_generation", 1)) == generation
+        and not item.get("superseded_at")
+    }
+    if pending_review and state.get("repair_attempts"):
+        required_gates.update(state["repair_attempts"][-1].get("required_gates", []))
+    missing_gates = sorted(required_gates - set(gate_verdicts))
     gates_clear = (
         not pending_review
         and bool(gate_verdicts)
+        and not missing_gates
         and not blocking
         and all(verdict == "PASS" for verdict in gate_verdicts.values())
+        and all(gate_authority.values())
+        and len(generation_heads) == 1
     )
 
     cap_reached = not pending_review and fix_cycles >= max_rounds and bool(blocking)
@@ -518,13 +596,20 @@ def decide(state: dict[str, Any]) -> dict[str, Any]:
         "max_rounds": max_rounds,
         "fix_cycles": fix_cycles,
         "fix_cycles_remaining": max(0, max_rounds - fix_cycles),
-        "next_scope_mode": FULL if next_round == 1 else FROZEN,
+        "next_scope_mode": FULL if generation == 1 else FROZEN,
         "uncertainty_rule": "investigate-on-doubt"
         if fix_cycles == 0
         else "advisory-on-doubt",
         "open_blocking": blocking,
         "redesign_required": pending,
         "gate_verdicts": gate_verdicts,
+        "generation_head": next(iter(generation_heads), "")
+        if len(generation_heads) == 1
+        else "",
+        "generation_head_conflict": len(generation_heads) > 1,
+        "review_generation": generation,
+        "required_gates": sorted(required_gates),
+        "missing_gates": missing_gates,
         "cap_reached": cap_reached,
         "repair_pending_review": pending_review,
         "next_action": action,
@@ -564,6 +649,121 @@ def cmd_open(args: argparse.Namespace) -> None:
             )
             save(path, state)
         emit({"ledger": str(path), **decide(state)})
+
+
+def cmd_migrate_concurrent_review(args: argparse.Namespace) -> None:
+    """Repair the pre-generation ordering defect without weakening any gate.
+
+    Older ledgers numbered each concurrently launched gate response as a new
+    round. A failing initial response recorded second could therefore have its
+    blockers demoted by the scope freeze. This migration is deliberately
+    one-way and fail-closed: it only handles an unrepaired initial generation,
+    proves both gate records came from consumed generation-one permits for the
+    same head, and promotes the affected advisories back to blockers.
+    """
+    path = ledger_path(args)
+    with locked(path):
+        if not args.reason.strip():
+            raise LedgerError("concurrent-review migration requires a non-empty audit reason")
+        state = load(path)
+        legacy = [entry for entry in state["rounds"] if "generation" not in entry]
+        if not legacy:
+            emit({"ledger": str(path), "migration": "not-needed", **decide(state)})
+            return
+        if state.get("repair_attempts") or int(state.get("review_generation", 1)) != 1:
+            raise LedgerError(
+                "automatic concurrent-review migration requires an unrepaired initial generation"
+            )
+        if len({entry["gate"] for entry in legacy}) != len(legacy):
+            raise LedgerError(
+                "automatic concurrent-review migration requires one initial result per gate"
+            )
+
+        permits_by_gate: dict[str, dict[str, Any]] = {}
+        for permit in state.get("review_permits", []):
+            gate = ROLE_GATES.get(str(permit.get("role", "")))
+            if (
+                gate
+                and int(permit.get("review_generation", 1)) == 1
+                and permit.get("receipt_consumed_at")
+                and not permit.get("superseded_at")
+            ):
+                if gate in permits_by_gate:
+                    raise LedgerError(
+                        f"automatic concurrent-review migration found multiple consumed {gate} permits"
+                    )
+                permits_by_gate[gate] = permit
+        missing = sorted({entry["gate"] for entry in legacy} - set(permits_by_gate))
+        if missing:
+            raise LedgerError(
+                "automatic concurrent-review migration lacks consumed permits for: "
+                + ", ".join(missing)
+            )
+        heads = {permits_by_gate[entry["gate"]].get("head") for entry in legacy}
+        if len(heads) != 1 or not next(iter(heads), None):
+            raise LedgerError(
+                "automatic concurrent-review migration requires one exact shared review head"
+            )
+
+        legacy_rounds = {
+            (int(entry["round"]), entry["gate"]): entry for entry in legacy
+        }
+        promoted_by_gate: dict[str, list[tuple[str, str]]] = {}
+        finding_details_by_gate: dict[str, dict[str, dict[str, Any]]] = {}
+        retained_advisories = []
+        for advisory in state.get("advisories", []):
+            marker = (int(advisory.get("round", 0)), advisory.get("gate"))
+            entry = legacy_rounds.get(marker)
+            if (
+                entry
+                and entry.get("claimed_verdict") == "FAIL"
+                and advisory.get("reason") == "out-of-scope-in-frozen-round"
+            ):
+                key = resolve_alias(state, normalize_key(str(advisory["key"])))
+                promoted_by_gate.setdefault(str(advisory["gate"]), []).append(
+                    (key, str(advisory.get("display") or advisory["key"]))
+                )
+                if "finding" in advisory:
+                    finding_details_by_gate.setdefault(str(advisory["gate"]), {})[
+                        key
+                    ] = advisory["finding"]
+                continue
+            retained_advisories.append(advisory)
+
+        for entry in legacy:
+            entry["legacy_result_sequence"] = int(entry["round"])
+            entry["round"] = 1
+            entry["generation"] = 1
+            entry["head"] = str(permits_by_gate[entry["gate"]]["head"])
+            entry["scope_mode"] = FULL
+            promoted = sorted(key for key, _ in promoted_by_gate.get(entry["gate"], []))
+            if promoted:
+                entry["blocking"] = sorted(set(entry.get("blocking", [])) | set(promoted))
+                entry["advisory"] = sorted(set(entry.get("advisory", [])) - set(promoted))
+                entry["effective_verdict"] = "FAIL"
+
+        state["advisories"] = retained_advisories
+        promoted_keys: list[str] = []
+        for gate, accepted in promoted_by_gate.items():
+            apply_gate_claims(
+                state,
+                gate=gate,
+                accepted=accepted,
+                finding_details=finding_details_by_gate.get(gate, {}),
+                round_no=1,
+            )
+            promoted_keys.extend(key for key, _ in accepted)
+        migration = {
+            "kind": "concurrent-review-generation-v1",
+            "recorded_at": now(),
+            "head": next(iter(heads)),
+            "gates": sorted(entry["gate"] for entry in legacy),
+            "promoted_blocking": sorted(set(promoted_keys)),
+            "reason": args.reason.strip(),
+        }
+        state.setdefault("migrations", []).append(migration)
+        save(path, state)
+        emit({"ledger": str(path), "migration": migration, **decide(state)})
 
 
 def _component(
@@ -722,8 +922,9 @@ def cmd_record(args: argparse.Namespace) -> None:
                 f"verdict PASS contradicts {len(args.blocking)} blocking finding(s): "
                 f"{', '.join(args.blocking)}"
             )
-        round_no = len(state["rounds"]) + 1
-        scope = FULL if round_no == 1 else FROZEN
+        generation = int(state.get("review_generation", 1))
+        round_no = generation
+        scope = FULL if generation == 1 else FROZEN
         # The security gate never loses blocking authority to the scope freeze: a
         # data leak found late is not a process nit.
         exempt = args.gate == "security-review"
@@ -815,7 +1016,9 @@ def cmd_record(args: argparse.Namespace) -> None:
         state["rounds"].append(
             {
                 "round": round_no,
+                "generation": generation,
                 "gate": args.gate,
+                "head": args.head.lower() if args.head else "",
                 "scope_mode": scope,
                 "claimed_verdict": args.verdict,
                 "effective_verdict": effective,
@@ -823,6 +1026,7 @@ def cmd_record(args: argparse.Namespace) -> None:
                 "blocking": sorted(accepted_keys),
                 "advisory": sorted({item["key"] for item in advisories}),
                 "resolved": sorted(resolved),
+                "authoritative": bool(args.result),
             }
         )
         if state.get("repair_pending_review") and state.get("repair_attempts"):
@@ -1597,6 +1801,21 @@ def cmd_permit_review(args: argparse.Namespace) -> None:
                 )
         elif decide(state)["next_action"] != ACTION_REVIEW:
             raise LedgerError("review ledger phase does not permit another reviewer")
+        generation_heads = _current_generation_heads(state)
+        if generation_heads and actual_head not in generation_heads:
+            raise LedgerError(
+                "the current review generation is already bound to another exact head"
+            )
+        gate = ROLE_GATES.get(args.role)
+        if gate and any(
+            entry.get("gate") == gate
+            and int(entry.get("generation", entry.get("round", 1)))
+            == int(state.get("review_generation", 1))
+            for entry in state.get("rounds", [])
+        ):
+            raise LedgerError(
+                "the current gate already recorded a result for this review generation"
+            )
         active = [
             item
             for item in state.get("review_permits", [])
@@ -1747,6 +1966,16 @@ def parser() -> argparse.ArgumentParser:
         "--phase-permit", help="single-use permit with a completed review receipt"
     )
     record_parser.set_defaults(func=cmd_record)
+
+    migrate_parser = commands.add_parser(
+        "migrate-concurrent-review",
+        help="restore initial blockers hidden by legacy concurrent gate ordering",
+    )
+    migrate_parser.add_argument("pr")
+    migrate_parser.add_argument(
+        "--reason", required=True, help="auditable explanation for the migration"
+    )
+    migrate_parser.set_defaults(func=cmd_migrate_concurrent_review)
 
     for name, func, helptext in (
         ("status", cmd_status, "emit the ledger state and the loop's next action"),
