@@ -779,6 +779,13 @@ def decide(state: dict[str, Any]) -> dict[str, Any]:
     if pending_review and state.get("repair_attempts"):
         required_gates.update(state["repair_attempts"][-1].get("required_gates", []))
     missing_gates = sorted(required_gates - set(gate_verdicts))
+    rebound_generation_pending_review = bool(
+        missing_gates
+        and any(
+            int(item.get("to_generation", 0)) == generation
+            for item in state.get("generation_rebinds", [])
+        )
+    )
     gates_clear = (
         not pending_review
         and bool(gate_verdicts)
@@ -794,7 +801,7 @@ def decide(state: dict[str, Any]) -> dict[str, Any]:
     elif_escalated = state.get("escalated") and not escalation_acknowledged
     if gates_clear:
         action = ACTION_CLEAR
-    elif pending_review:
+    elif pending_review or rebound_generation_pending_review:
         action = ACTION_REVIEW
     elif elif_escalated or cap_reached:
         action = ACTION_ESCALATE
@@ -825,6 +832,7 @@ def decide(state: dict[str, Any]) -> dict[str, Any]:
         "review_generation": generation,
         "required_gates": sorted(required_gates),
         "missing_gates": missing_gates,
+        "rebound_generation_pending_review": rebound_generation_pending_review,
         "cap_reached": cap_reached,
         "repair_pending_review": pending_review,
         "next_action": action,

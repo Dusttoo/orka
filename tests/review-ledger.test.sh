@@ -258,6 +258,36 @@ if led permit-review rebind-clean --role code-reviewer --head "$REBIND_NEW_HEAD"
   ok "the new generation can issue a permit for its exact head"
 else bad "the new generation can issue a permit for its exact head"; fi
 
+# A moved head starts a mandatory review generation even when historical
+# repairs spent the entire fix budget and left a durable escalation marker.
+# The budget limits subsequent repairs, not review of a non-findings commit.
+led open rebind-exhausted --max-rounds 1 >/dev/null
+led record rebind-exhausted --gate code-review --verdict FAIL \
+  --blocking 'src/exhausted.ts:boundary' >/dev/null
+REBIND_EXHAUSTED_REPAIR_HEAD="$(git -C "$TMP" rev-parse HEAD)"
+cat > "$TMP/rebind-exhausted-repair.json" <<JSON
+{"schema_version":1,"head":"$REBIND_EXHAUSTED_REPAIR_HEAD","findings":[{"component":"src/exhausted.ts:boundary","status":"closed","root_cause":"missing boundary","change":"added boundary","verification":"boundary regression passes"}]}
+JSON
+led record-repair rebind-exhausted --report "$TMP/rebind-exhausted-repair.json" >/dev/null
+record_pass rebind-exhausted code >/dev/null
+eq "the last authorized repair can clear before a later head move" "gates-clear" \
+  "$(led complete-repair-review rebind-exhausted | field next_action)"
+led escalate rebind-exhausted --reason 'historical repair budget exhausted' >/dev/null
+git -C "$TMP" -c user.name=Test -c user.email=test@example.com commit --allow-empty -qm non-findings-update
+REBIND_EXHAUSTED_NEW_HEAD="$(git -C "$TMP" rev-parse HEAD)"
+rebound_exhausted="$(led rebind-generation rebind-exhausted --head "$REBIND_EXHAUSTED_NEW_HEAD" --reason 'merged a non-findings update')"
+eq "a rebound generation remains reviewable with no fix cycles left" "review" \
+  "$(printf '%s' "$rebound_exhausted" | field next_action)"
+eq "a rebound generation does not replenish the repair budget" "0" \
+  "$(printf '%s' "$rebound_exhausted" | field fix_cycles_remaining)"
+eq "a rebound generation reports its pending gate review" "True" \
+  "$(printf '%s' "$rebound_exhausted" | field rebound_generation_pending_review)"
+if record_pass rebind-exhausted code >/dev/null; then
+  ok "a rebound generation can issue and complete its required review"
+else bad "a rebound generation can issue and complete its required review"; fi
+eq "a passing rebound review clears despite historical escalation" "gates-clear" \
+  "$(led status rebind-exhausted | field next_action)"
+
 led open rebind-resolved >/dev/null
 cat > "$TMP/rebind-resolved-fail.json" <<'JSON'
 {"schema_version":1,"gate":"code-review","verdict":"FAIL","checks":[{"name":"review","status":"fail"}],"findings":[{"component":"src/policy.ts:obsolete","disposition":"blocking","severity":"medium","title":"Policy mismatch","explanation":"The old policy required a behavior that is no longer applicable.","regression":false}]}
