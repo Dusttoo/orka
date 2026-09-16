@@ -246,6 +246,12 @@ preserved PRs, existing children, and opaque old outcomes before reporting a
 sprint exhausted. Follow `docs/sprint-controller.md` for `reconcile-legacy` and
 root-issued `restart-ticket` allowances. Do not erase usage or review ledgers,
 duplicate child tickets, or treat a budget grant as a resolved product decision.
+If a preserved PR ledger is already escalated, a ticket restart alone is not
+review authority. Require a root-issued PR-bound `issue-review-repair`
+capability and consume it through `review-ledger.py authorize-repair <pr>
+--operator-capability-stdin`; retain all findings and prior review history.
+Treat only the live root-owned grant as authority; expiry or revocation restores
+the escalation stop.
 
 Honor `plan.retry_waiting` cooldown deadlines while continuing independent lanes.
 Only the controller can award bounded startup credits using stopped execution

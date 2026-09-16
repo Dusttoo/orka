@@ -32,6 +32,18 @@ def _scope(kind: str, repository: Path, ticket: str, attempt: int | None = None)
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
+def _review_repair_scope(repository: Path, pr: str) -> str:
+    return json.dumps(
+        {
+            "kind": "review-repair",
+            "repository": str(repository.resolve()),
+            "pr": str(pr),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
 def _helper() -> tuple[Path, bool]:
     test_helper = os.environ.get("ORCHESTRATION_TEST_AUTHORITY_HELPER")
     if os.environ.get("ORCHESTRATION_TEST_MODE") == "1" and test_helper:
@@ -85,7 +97,12 @@ def _call(
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise AuthorityError(f"host operator authority failed: {exc}") from exc
-    if result.returncode == 3 and command in {"budget-ceiling", "relaunch-ceiling", "restart-grant"}:
+    if result.returncode == 3 and command in {
+        "budget-ceiling",
+        "relaunch-ceiling",
+        "restart-grant",
+        "review-repair-grant",
+    }:
         return None
     if result.returncode != 0:
         detail = result.stderr.strip() or "request denied"
@@ -171,6 +188,53 @@ def consume_recovery(
         _scope("recovery", repository, ticket, attempt),
         token=token.strip(),
     )
+
+
+def _validated_review_repair(raw: str | None) -> dict[str, Any]:
+    try:
+        value = json.loads(raw or "")
+        expected = {
+            "grant_id",
+            "ceiling_repair_cycles",
+            "reason",
+            "issued_at",
+            "expires_at",
+        }
+        if not isinstance(value, dict) or set(value) != expected:
+            raise ValueError("invalid review repair grant")
+        ceiling = value["ceiling_repair_cycles"]
+        if type(ceiling) is not int or not 0 < ceiling <= 10000:
+            raise ValueError("invalid review repair ceiling")
+        if (
+            not value["grant_id"]
+            or not value["reason"]
+            or float(value["expires_at"]) <= time.time()
+        ):
+            raise ValueError("invalid review repair grant")
+    except (ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+        raise AuthorityError("host authority returned an invalid review repair grant") from exc
+    return value
+
+
+def activate_review_repair(repository: Path, pr: str, token: str) -> dict[str, Any]:
+    if not token.strip():
+        raise AuthorityError("review repair capability must not be empty")
+    return _validated_review_repair(
+        _call(
+            "activate-review-repair",
+            _review_repair_scope(repository, pr),
+            token=token.strip(),
+        )
+    )
+
+
+def review_repair_grant(repository: Path, pr: str) -> dict[str, Any] | None:
+    raw = _call(
+        "review-repair-grant",
+        _review_repair_scope(repository, pr),
+        no_authority_ok=True,
+    )
+    return _validated_review_repair(raw) if raw is not None else None
 
 
 def restart_grant(repository: Path, ticket: str, token: str = "") -> dict[str, Any] | None:

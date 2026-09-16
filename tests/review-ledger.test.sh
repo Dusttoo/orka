@@ -299,6 +299,65 @@ if led record 5 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' >/de
 else ok "an escalated ledger refuses further rounds"; fi
 led handoff 5 2>/dev/null | grep -q "Still blocking" && ok "handoff renders the human report" || bad "handoff renders the human report"
 
+# A human may authorize a bounded absolute repair ceiling without deleting the
+# escalation, findings, or prior attempts. The capability is bound to this PR.
+AUTH_HELPER="$ROOT/host-tools/orchestration-recovery-authority.py"
+AUTH_STATE="$TMP/review-authority"
+authorized_led() {
+  (cd "$TMP" && \
+    ORCHESTRATION_TEST_MODE=1 \
+    ORCHESTRATION_TEST_AUTHORITY_HELPER="$AUTH_HELPER" \
+    ORCHESTRATION_AUTHORITY_TEST_MODE=1 \
+    ORCHESTRATION_AUTHORITY_STATE_DIR="$AUTH_STATE" \
+    python3 "$LEDGER" "$@")
+}
+review_token="$(ORCHESTRATION_AUTHORITY_TEST_MODE=1 ORCHESTRATION_AUTHORITY_STATE_DIR="$AUTH_STATE" \
+  "$AUTH_HELPER" issue-review-repair --repository "$TMP" --pr 5 \
+  --ceiling-repair-cycles 3 --reason 'approve one additional bounded repair')"
+authorized="$(printf '%s\n' "$review_token" | \
+  authorized_led authorize-repair 5 --operator-capability-stdin)"
+eq "root review authority raises only the absolute repair ceiling" "3" \
+  "$(printf '%s' "$authorized" | field operator_repair_ceiling)"
+eq "the acknowledged escalation returns to its required redesign" "redesign" \
+  "$(printf '%s' "$authorized" | field next_action)"
+eq "operator repair authority preserves both prior repair cycles" "2" \
+  "$(printf '%s' "$authorized" | field fix_cycles)"
+if printf '%s\n' "$review_token" | \
+  authorized_led authorize-repair 5 --operator-capability-stdin >/dev/null 2>&1; then
+  bad "review repair authority cannot be replayed"
+else ok "review repair authority cannot be replayed"; fi
+
+led open 50 --max-rounds 2 >/dev/null
+led record 50 --gate code-review --verdict FAIL --blocking 'src/support.ts:validation' >/dev/null
+led escalate 50 --reason 'human decision required before repair' >/dev/null
+manual_token="$(ORCHESTRATION_AUTHORITY_TEST_MODE=1 ORCHESTRATION_AUTHORITY_STATE_DIR="$AUTH_STATE" \
+  "$AUTH_HELPER" issue-review-repair --repository "$TMP" --pr 50 \
+  --ceiling-repair-cycles 2 --reason 'human approved the existing repair budget')"
+manual_authorized="$(printf '%s\n' "$manual_token" | \
+  authorized_led authorize-repair 50 --operator-capability-stdin)"
+eq "human acknowledgement can reopen a manually escalated first repair" "review" \
+  "$(printf '%s' "$manual_authorized" | field next_action)"
+eq "human acknowledgement does not erase the escalation record" "True" \
+  "$(authorized_led status 50 | python3 -c 'import json,sys; print(json.load(sys.stdin)["escalated"])')"
+
+# Repository-writable ledger fields cannot manufacture repair authority. The
+# live root-owned grant remains the only source of the effective ceiling.
+python3 - "$TMP" <<'PY'
+import json,sys
+from pathlib import Path
+path=next((Path(sys.argv[1])/".orchestration/.review-ledger").glob("subject-pr-50-*.json"))
+state=json.loads(path.read_text())
+state["operator_repair_ceiling"]=999
+path.write_text(json.dumps(state,indent=2,sort_keys=True)+"\n")
+PY
+ORCHESTRATION_AUTHORITY_TEST_MODE=1 ORCHESTRATION_AUTHORITY_STATE_DIR="$AUTH_STATE" \
+  "$AUTH_HELPER" revoke-review-repair --repository "$TMP" --pr 50
+revoked_status="$(authorized_led status 50)"
+eq "a writable ledger cannot forge root-owned repair authority" "0" \
+  "$(printf '%s' "$revoked_status" | field operator_repair_ceiling)"
+eq "revoking root authority restores the escalation stop" "escalate-human" \
+  "$(printf '%s' "$revoked_status" | field next_action)"
+
 # --- the cap counts explicit repairs, not review passes ------------------------
 led open 9 --max-rounds 2 >/dev/null
 led record 9 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' >/dev/null

@@ -16,6 +16,7 @@ bad() { printf 'FAIL %s\n' "$1"; fails=$((fails + 1)); }
 budget_scope="$(python3 -c 'import json,sys,pathlib; print(json.dumps({"kind":"budget","repository":str(pathlib.Path(sys.argv[1]).resolve()),"ticket":"PROJ-1"},sort_keys=True,separators=(",",":")))' "$TMP/repo")"
 recovery_scope="$(python3 -c 'import json,sys,pathlib; print(json.dumps({"kind":"recovery","repository":str(pathlib.Path(sys.argv[1]).resolve()),"ticket":"PROJ-1","attempt":2},sort_keys=True,separators=(",",":")))' "$TMP/repo")"
 relaunch_scope="$(python3 -c 'import json,sys,pathlib; print(json.dumps({"kind":"relaunch","repository":str(pathlib.Path(sys.argv[1]).resolve()),"ticket":"PROJ-1"},sort_keys=True,separators=(",",":")))' "$TMP/repo")"
+review_repair_scope="$(python3 -c 'import json,sys,pathlib; print(json.dumps({"kind":"review-repair","repository":str(pathlib.Path(sys.argv[1]).resolve()),"pr":"50"},sort_keys=True,separators=(",",":")))' "$TMP/repo")"
 
 budget_token="$($HELPER issue-budget --repository "$TMP/repo" --ticket PROJ-1 --ceiling-usd 35.25)"
 if printf '%s\n' "$budget_token" | "$HELPER" activate-budget --scope "$budget_scope" | grep -qx 35.25; then
@@ -35,6 +36,23 @@ else bad "recovery capability consumes for its exact attempt"; fi
 if printf '%s\n' "$recovery_token" | "$HELPER" consume-recovery --scope "$recovery_scope" >/dev/null 2>&1; then
   bad "recovery capability is one-shot"
 else ok "recovery capability is one-shot"; fi
+
+review_repair_token="$($HELPER issue-review-repair --repository "$TMP/repo" --pr 50 --ceiling-repair-cycles 3 --reason 'operator approved one bounded repair')"
+review_repair_result="$(printf '%s\n' "$review_repair_token" | "$HELPER" activate-review-repair --scope "$review_repair_scope")"
+if python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["ceiling_repair_cycles"] == 3 and v["reason"]' <<<"$review_repair_result"; then
+  ok "review repair capability activates its exact PR-bound ceiling"
+else bad "review repair capability activates its exact PR-bound ceiling"; fi
+if "$HELPER" review-repair-grant --scope "$review_repair_scope" | \
+  python3 -c 'import json,sys; assert json.load(sys.stdin)["ceiling_repair_cycles"] == 3'; then
+  ok "active review repair grant remains queryable"
+else bad "active review repair grant remains queryable"; fi
+if printf '%s\n' "$review_repair_token" | "$HELPER" activate-review-repair --scope "$review_repair_scope" >/dev/null 2>&1; then
+  bad "review repair capability is one-shot"
+else ok "review repair capability is one-shot"; fi
+$HELPER revoke-review-repair --repository "$TMP/repo" --pr 50
+if "$HELPER" review-repair-grant --scope "$review_repair_scope" >/dev/null 2>&1; then
+  bad "revoked review repair grant is unavailable"
+else ok "revoked review repair grant is unavailable"; fi
 
 relaunch_token="$($HELPER issue-relaunch --repository "$TMP/repo" --ticket PROJ-1 --ceiling-attempts 4)"
 if printf '%s\n' "$relaunch_token" | "$HELPER" activate-relaunch --scope "$relaunch_scope" | grep -qx 4; then
@@ -83,6 +101,18 @@ if "$HELPER" issue-relaunch --repository "$TMP/repo" --ticket PROJ-1 \
   bad "authority rejects a non-positive relaunch ceiling"
 else
   ok "authority rejects a non-positive relaunch ceiling"
+fi
+if "$HELPER" issue-review-repair --repository "$TMP/repo" --pr not-a-pr \
+  --ceiling-repair-cycles 3 --reason approved >/dev/null 2>&1; then
+  bad "authority rejects a non-canonical review PR scope"
+else
+  ok "authority rejects a non-canonical review PR scope"
+fi
+if "$HELPER" issue-review-repair --repository "$TMP/repo" --pr 50 \
+  --ceiling-repair-cycles 0 --reason approved >/dev/null 2>&1; then
+  bad "authority rejects a non-positive review repair ceiling"
+else
+  ok "authority rejects a non-positive review repair ceiling"
 fi
 
 if [ "$fails" -eq 0 ]; then echo "ALL PASS"; else echo "$fails failure(s)"; fi
