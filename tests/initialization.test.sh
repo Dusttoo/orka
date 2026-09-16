@@ -58,6 +58,10 @@ check "template gives API runs a hard USD ceiling" \
 check "reviewers use ledger-issued phase permits without config bypass" \
   sh -c '! grep -q "require_review_authorization" "$1" && grep -q "permit-review" "$2"' _ \
   "$ROOT/templates/config.yaml" "$ROOT/skills/gate-pr/SKILL.md"
+check "template exposes opt-in source-branch security triggers" \
+  grep -Eq '^security_required_source_branches:[[:space:]]*\[\]([[:space:]]|$)' "$ROOT/templates/config.yaml"
+check "template exposes opt-in target-branch security triggers" \
+  grep -Eq '^security_required_target_branches:[[:space:]]*\[\]([[:space:]]|$)' "$ROOT/templates/config.yaml"
 check "template sets ticket warning and pause thresholds" \
   rg -q '^[[:space:]]+pause_usd_per_ticket:' "$ROOT/templates/config.yaml"
 check "template bounds model and reviewer run counts" \

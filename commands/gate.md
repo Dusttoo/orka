@@ -67,12 +67,16 @@ must be reconciled and never duplicated.
    under the configured profile. Stronger-profile hypotheticals are advisory;
    they cannot silently turn this PR into host infrastructure work.
 
-2. **Security review.** Inspect the PR diff. If it touches any
-   `security_required_when` trigger (auth, data isolation, migrations, payments,
-   webhooks...), launch the `orchestration-security-reviewer` agent (another
-   fresh agent) with that same raw unified diff and diff-isolated context. It
-   must return the same concise structured review JSON. If the diff has no
-   security surface, note that and skip.
+2. **Security review.** Read the authoritative PR `headRefName` and `baseRefName`
+   from GitHub, save the raw base-to-head unified diff, and run
+   `${CLAUDE_PLUGIN_ROOT}/scripts/orchestration-engine.py security-gate
+   --source-branch <headRefName> --target-branch <baseRefName> --diff-file
+   <raw-diff-file>`. This evaluates diff, source-branch, and target-branch
+   triggers. If `required` is true, launch the
+   `orchestration-security-reviewer` agent (another fresh agent) with that same
+   raw unified diff and diff-isolated context. It must return the same concise
+   structured review JSON. If false, record the empty reasons and skip. If PR
+   metadata, diff capture, or the decision fails, stop fail-closed.
 
 3. **Record the round.** Record every completed gate through the ledger, blocking
    and advisory findings alike:

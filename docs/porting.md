@@ -43,8 +43,13 @@ or understand what it produced.
    - `verification`: only if you have a heavy suite (e2e). Gate each entry to a
      target with `when:` (`production` for a release-only gate). Omit entirely
      otherwise.
-   - `security_required_when`: the diff triggers that make the security gate
-     mandatory (auth, migrations, payments, whatever your risk surface is).
+   - `security_required_when`: diff path/content triggers that make the security
+     gate mandatory (auth, migrations, payments, whatever your risk surface is).
+   - `security_required_source_branches` / `security_required_target_branches`:
+     shell-style branch patterns that force security review from authoritative
+     PR metadata. Use these for policies such as every `hotfix/**` source branch
+     or every PR targeting `main`, including harmless-looking component-only
+     diffs.
    - `ticket`: `jira` / `github` / `none`.
 
    For schema v2, define branch roles instead of fixed branch names:

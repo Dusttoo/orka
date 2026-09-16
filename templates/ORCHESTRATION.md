@@ -37,8 +37,10 @@ scope/matrix -> design* -> implement -> code-review -> security-review -> verify
    repo's standards. Ends with `VERDICT: PASS` or `VERDICT: FAIL`.
 
 4. **Security review** (`orchestration-security-reviewer`). Another fresh agent.
-   Runs only when the change touches a `security_required_when` trigger (auth,
-   data isolation, migrations, payments...). Hunts for leaks / privilege
+   Runs when the shared security-gate decision matches a
+   `security_required_when` diff trigger, a
+   `security_required_source_branches` pattern, or a
+   `security_required_target_branches` pattern. Hunts for leaks / privilege
    escalation / isolation breaks. Ends with `VERDICT: PASS` / `FAIL`.
 
 5. **Verify (optional).** For each `verification:` entry whose `when:` matches
