@@ -220,6 +220,8 @@ orchestrator can count repeated failures on the same defect across gates and
 rounds. In structured output, the `component` field value is the bare
 `<path>:<symbol>` key. For example: `"component":"src/auth/session.ts:refreshToken"`.
 Do not include a `[component: ...]` Markdown wrapper in the JSON value.
+The key must contain no whitespace. Put a prose test name in `title`; for
+`component`, use the test file plus a stable test function or test identifier.
 
 - `<path>` is the repo-relative file path the defect lives in.
 - `<symbol>` is the enclosing function, class, component, test, or export.

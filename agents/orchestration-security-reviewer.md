@@ -138,7 +138,9 @@ Set every finding's JSON `component` value to the bare `<path>:<symbol>` key --
 the repo-relative file path plus the enclosing symbol. For example:
 `"component":"src/auth/session.ts:refreshToken"`. Do not include a `[component: ...]`
 Markdown wrapper, a line number (it drifts on rebase), or a
-free-text subsystem name. If the orchestrator's round brief lists an open
+free-text subsystem name. The key must contain no whitespace. Put prose in
+`title`; use the affected file and stable symbol for `component`. If the
+orchestrator's round brief lists an open
 component that is this same defect, reuse its bare key verbatim.
 
 Rules:

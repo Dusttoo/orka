@@ -88,6 +88,38 @@ cat > "$TMP/no-tracker-pass.json" <<'JSON'
 JSON
 eq "a no-tracker PR completes permit, receipt, and record end to end" "gates-clear" \
   "$(review_record no-tracker-e2e code "$TMP/no-tracker-pass.json" | field next_action)"
+
+# Invalid desktop output is rejected before execution starts. Reissuing the
+# exact gate/head permit is idempotent so a corrected result can finish without
+# fabricating a second reviewer or requiring ledger surgery.
+led open invalid-output-recovery >/dev/null
+INVALID_OUTPUT_HEAD="$(git -C "$TMP" rev-parse HEAD)"
+invalid_permit_json="$(led permit-review invalid-output-recovery --role code-reviewer --head "$INVALID_OUTPUT_HEAD")"
+INVALID_OUTPUT_PERMIT="$(printf '%s' "$invalid_permit_json" | field review_phase_permit)"
+eq "a new review permit is not reported as reused" "False" \
+  "$(printf '%s' "$invalid_permit_json" | field review_phase_permit_reused)"
+cat > "$TMP/invalid-output-review.json" <<'JSON'
+{"schema_version":1,"gate":"code-review","verdict":"PASS","checks":[{"name":"review","status":"pass"}],"findings":[{"component":"tests/e2e/particles.spec.ts:cold hot reset flow","disposition":"advisory","severity":"low","title":"Add flow coverage","explanation":"The flow would benefit from a broader regression.","regression":false}]}
+JSON
+if led complete-review invalid-output-recovery --role code-reviewer \
+  --phase-permit "$INVALID_OUTPUT_PERMIT" --result "$TMP/invalid-output-review.json" \
+  > /dev/null 2> "$TMP/invalid-output-error"; then
+  bad "invalid reviewer output is rejected before permit consumption"
+elif grep -q 'retry with the same phase permit' "$TMP/invalid-output-error"; then
+  ok "invalid reviewer output is rejected before permit consumption"
+else bad "invalid reviewer output explains permit recovery"; fi
+reissued_permit_json="$(led permit-review invalid-output-recovery --role code-reviewer --head "$INVALID_OUTPUT_HEAD")"
+eq "an unstarted review permit is reissued idempotently" "$INVALID_OUTPUT_PERMIT" \
+  "$(printf '%s' "$reissued_permit_json" | field review_phase_permit)"
+eq "permit recovery is explicit in the issuance result" "True" \
+  "$(printf '%s' "$reissued_permit_json" | field review_phase_permit_reused)"
+cat > "$TMP/corrected-output-review.json" <<'JSON'
+{"schema_version":1,"gate":"code-review","verdict":"PASS","checks":[{"name":"review","status":"pass"}],"findings":[{"component":"tests/e2e/particles.spec.ts:cold_hot_reset_flow","disposition":"advisory","severity":"low","title":"Add flow coverage","explanation":"The flow would benefit from a broader regression.","regression":false}]}
+JSON
+led complete-review invalid-output-recovery --role code-reviewer \
+  --phase-permit "$INVALID_OUTPUT_PERMIT" --result "$TMP/corrected-output-review.json" >/dev/null
+eq "the corrected result completes through the recovered permit" "gates-clear" \
+  "$(led record invalid-output-recovery --gate code-review --result "$TMP/corrected-output-review.json" --head "$INVALID_OUTPUT_HEAD" --phase-permit "$INVALID_OUTPUT_PERMIT" | field next_action)"
 eq "line numbers are stripped from component keys" \
   "src/auth/session.ts:refreshtoken" \
   "$(led record 1 --gate code-review --verdict FAIL --blocking 'src/auth/session.ts:refreshToken:142' | field accepted_blocking)"
@@ -513,6 +545,7 @@ else ok "a PASS listing blocking findings is rejected"; fi
 # --- round-aware guidance -----------------------------------------------------
 led open 7 >/dev/null
 led brief 7 | grep -q 'JSON `component` field to the bare `<path>:<symbol>` key' && ok "review brief requests a bare JSON component key" || bad "review brief requests a bare JSON component key"
+led brief 7 | grep -q 'never use whitespace' && ok "review brief forbids whitespace in component keys" || bad "review brief forbids whitespace in component keys"
 if led brief 7 | grep -q 'Key every finding as `\[component:'; then
   bad "review brief does not instruct reviewers to wrap JSON component keys"
 else ok "review brief does not instruct reviewers to wrap JSON component keys"; fi
