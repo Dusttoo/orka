@@ -394,6 +394,7 @@ def load(path: Path) -> dict[str, Any]:
     value.setdefault("repair_pending_review", False)
     value.setdefault("review_permits", [])
     value.setdefault("review_generation", 1)
+    value.setdefault("generation_rebinds", [])
     value.setdefault(
         "work_subject",
         {
@@ -598,6 +599,7 @@ def new_state(pr: str, max_rounds: int, work_subject: dict[str, str]) -> dict[st
         "repair_pending_review": False,
         "review_permits": [],
         "review_generation": 1,
+        "generation_rebinds": [],
         "design": {
             "max_rounds": DEFAULT_MAX_DESIGN_ROUNDS,
             "rounds": [],
@@ -698,6 +700,16 @@ def _current_generation_heads(state: dict[str, Any]) -> set[str]:
         and entry.get("head")
         and _round_is_authoritative(state, entry)
     )
+    rebinds = [
+        item
+        for item in state.get("generation_rebinds", [])
+        if int(item.get("to_generation", 0)) == generation
+    ]
+    if len(rebinds) > 1:
+        raise LedgerError("review generation has multiple new-head bindings")
+    if rebinds:
+        heads.add(str(rebinds[0].get("head") or "").lower())
+        heads.discard("")
     return heads
 
 
@@ -751,6 +763,12 @@ def decide(state: dict[str, Any]) -> dict[str, Any]:
         and int(item.get("review_generation", 1)) == generation
         and not item.get("superseded_at")
     }
+    required_gates.update(
+        gate
+        for item in state.get("generation_rebinds", [])
+        if int(item.get("to_generation", 0)) == generation
+        for gate in item.get("required_gates", [])
+    )
     if pending_review and state.get("repair_attempts"):
         required_gates.update(state["repair_attempts"][-1].get("required_gates", []))
     missing_gates = sorted(required_gates - set(gate_verdicts))
@@ -2020,10 +2038,9 @@ def operator_capability(args: argparse.Namespace) -> str:
     return str(getattr(args, "operator_capability", ""))
 
 
-def cmd_permit_review(args: argparse.Namespace) -> None:
-    """Issue one phase capability when durable ledger state allows review."""
+def exact_repository_head(requested: str) -> str:
     try:
-        actual_head = (
+        actual = (
             subprocess.run(
                 ["git", "rev-parse", "HEAD"],
                 cwd=project_root(),
@@ -2035,11 +2052,83 @@ def cmd_permit_review(args: argparse.Namespace) -> None:
             .lower()
         )
     except (OSError, subprocess.CalledProcessError) as exc:
-        raise LedgerError("cannot bind review permit to repository HEAD") from exc
-    if args.head.lower() != actual_head:
-        raise LedgerError(
-            "review permit head must exactly match the full repository HEAD"
+        raise LedgerError("cannot bind review generation to repository HEAD") from exc
+    if requested.lower() != actual:
+        raise LedgerError("review generation head must exactly match the full repository HEAD")
+    return actual
+
+
+def cmd_rebind_generation(args: argparse.Namespace) -> None:
+    """Start a new review generation for a non-repair commit on the same PR."""
+    actual_head = exact_repository_head(args.head)
+    reason = args.reason.strip()
+    if not reason:
+        raise LedgerError("review generation rebind reason must not be empty")
+    path = ledger_path(args)
+    with locked(path):
+        state = load(path)
+        plan = decide(state)
+        generation = int(state.get("review_generation", 1))
+        current_entries = [
+            entry
+            for entry in state.get("rounds", [])
+            if int(entry.get("generation", entry.get("round", 1))) == generation
+        ]
+        if state.get("repair_pending_review"):
+            raise LedgerError("a repaired head is still awaiting its complete review set")
+        if plan["open_blocking"]:
+            raise LedgerError(
+                "blocking findings require record-repair; a new-head generation cannot bypass them"
+            )
+        if plan["next_action"] == ACTION_ESCALATE:
+            raise LedgerError("an escalated review ledger requires operator recovery")
+        if not current_entries:
+            raise LedgerError("the current review generation has no completed gate results")
+        if plan["missing_gates"]:
+            raise LedgerError(
+                "the current review generation is incomplete; missing gates: "
+                + ", ".join(plan["missing_gates"])
+            )
+        if not all(_round_is_authoritative(state, entry) for entry in current_entries):
+            raise LedgerError("the current review generation lacks authoritative gate evidence")
+        outstanding = [
+            permit
+            for permit in _current_generation_permits(state)
+            if not permit.get("receipt_consumed_at")
+        ]
+        if outstanding:
+            raise LedgerError("the current review generation has an outstanding phase permit")
+        generation_heads = _current_generation_heads(state)
+        if len(generation_heads) != 1:
+            raise LedgerError("the current review generation lacks one exact head binding")
+        prior_head = next(iter(generation_heads))
+        if actual_head == prior_head:
+            raise LedgerError("the requested head is already bound to the current generation")
+        required_gates = sorted(
+            set(plan["required_gates"])
+            or {str(entry["gate"]) for entry in current_entries if entry.get("gate")}
         )
+        if not required_gates:
+            raise LedgerError("cannot derive the required gate set for the new generation")
+        next_generation = generation + 1
+        event = {
+            "from_generation": generation,
+            "to_generation": next_generation,
+            "from_head": prior_head,
+            "head": actual_head,
+            "reason": reason,
+            "required_gates": required_gates,
+            "recorded_at": now(),
+        }
+        state.setdefault("generation_rebinds", []).append(event)
+        state["review_generation"] = next_generation
+        save(path, state)
+        emit({"generation_rebound": event, **decide(state)})
+
+
+def cmd_permit_review(args: argparse.Namespace) -> None:
+    """Issue one phase capability when durable ledger state allows review."""
+    actual_head = exact_repository_head(args.head)
     path = ledger_path(args)
     with locked(path):
         state = load(path)
@@ -2256,6 +2345,15 @@ def parser() -> argparse.ArgumentParser:
     repair_parser.add_argument("pr")
     repair_parser.add_argument("--report", required=True)
     repair_parser.set_defaults(func=cmd_record_repair)
+
+    rebind_parser = commands.add_parser(
+        "rebind-generation",
+        help="start a preserved new review generation for a non-repair PR head",
+    )
+    rebind_parser.add_argument("pr")
+    rebind_parser.add_argument("--head", required=True)
+    rebind_parser.add_argument("--reason", required=True)
+    rebind_parser.set_defaults(func=cmd_rebind_generation)
 
     design_open = commands.add_parser(
         "design-open", help="create or report the pre-code design ledger"

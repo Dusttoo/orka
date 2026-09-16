@@ -119,6 +119,12 @@ Steps:
      permit with `review-ledger.py complete-review`. It normalizes each finding's
      bare `<path>:<symbol>` component key, counts strikes across all gates and
      rounds, freezes blocking scope after round 1, and returns `next_action`.
+   - If a non-findings commit moves the PR head after a complete generation, run
+     `${CLAUDE_PLUGIN_ROOT}/scripts/review-ledger.py rebind-generation <pr>
+     --head <full-exact-head> --reason "<auditable reason>"` before requesting
+     new permits. It preserves history, findings, strikes, and repair-cycle
+     accounting and refuses to run with open blockers or permits. Findings
+     repairs still use `record-repair`.
    - `review` first generates one `repair-brief` after all gates record. Give its
      deduplicated stable IDs to a fresh implementer, require root cause/change/
      affected-boundary/verification evidence for every ID, and record the strict

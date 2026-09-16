@@ -96,6 +96,13 @@ must be reconciled and never duplicated.
    returns `next_action`. Its `effective_verdict` governs, not the reviewer's
    claimed one.
 
+   If a non-findings commit moves the PR head after the current generation is
+   complete, run `${CLAUDE_PLUGIN_ROOT}/scripts/review-ledger.py
+   rebind-generation <pr> --head <full-exact-head> --reason "<auditable
+   reason>"` before requesting new permits. The transition preserves history,
+   findings, strikes, and repair-cycle accounting, and is refused while a
+   blocker or permit remains open. Findings repairs still use `record-repair`.
+
 4. **Act on `next_action`.**
    - `review` -> after every required gate records, generate one deduplicated
      `review-ledger.py repair-brief <pr>`. Give it to one fresh implementer on the

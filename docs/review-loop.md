@@ -84,11 +84,20 @@ review-ledger.py record <pr> --gate code-review \
 review-ledger.py repair-brief <pr>
 review-ledger.py record-repair <pr> --report .orchestration/.review-results/repair.json
 review-ledger.py complete-repair-review <pr>
+review-ledger.py rebind-generation <pr> --head <full-exact-head> --reason "<reason>"
 review-ledger.py metrics <pr>
 review-ledger.py status <pr>                  # strikes, open set, next action
 review-ledger.py redesign <pr> --key <key> --verdict PASS
 review-ledger.py handoff <pr>                 # the human escalation report
 ```
+
+`rebind-generation` is the safe path when a PR head changes for a reason other
+than fixing ledger findings, such as updating from the target branch or applying
+an already-authorized policy change. It requires the exact current Git head and
+a complete authoritative generation with no open blockers or outstanding
+permits. It keeps all history, findings, strikes, and repair-cycle accounting,
+then binds the next generation to the new head. Use `record-repair` instead when
+the commit addresses an open finding.
 
 An escalated ledger is immutable to workers. If a human decides that the same
 PR should receive more repair cycles, issue a PR-bound capability with an

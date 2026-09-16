@@ -142,6 +142,9 @@ contains_contract "structured reviewer result recording" '--result' \
 contains_contract "bounded review loop" 'escalate-human' \
   commands/orchestrate.md skills/orchestrate-ticket/SKILL.md \
   commands/gate.md skills/gate-pr/SKILL.md
+contains_contract "preserved non-repair review generation rebind" 'rebind-generation' \
+  commands/orchestrate.md skills/orchestrate-ticket/SKILL.md \
+  commands/gate.md skills/gate-pr/SKILL.md
 contains_contract "per-role ticket execution routing" 'context_pipeline\.py route' \
   commands/orchestrate.md skills/orchestrate-ticket/SKILL.md
 contains_contract "per-role gate execution routing" 'context_pipeline\.py route' \

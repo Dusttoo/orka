@@ -226,6 +226,59 @@ if led permit-review generation-head-binding --role security-reviewer --head "$M
 else ok "one generation cannot combine review permits from different heads"; fi
 git -C "$TMP" reset --hard -q "$BOUND_HEAD"
 
+# A non-repair commit (for example a branch update or policy-only resolution)
+# starts a preserved review generation without spending a fix cycle.
+led open rebind-clean >/dev/null
+record_pass rebind-clean code >/dev/null
+REBIND_OLD_HEAD="$(git -C "$TMP" rev-parse HEAD)"
+git -C "$TMP" -c user.name=Test -c user.email=test@example.com commit --allow-empty -qm branch-update
+REBIND_NEW_HEAD="$(git -C "$TMP" rev-parse HEAD)"
+if led permit-review rebind-clean --role code-reviewer --head "$REBIND_NEW_HEAD" >/dev/null 2>&1; then
+  bad "a moved head still requires an explicit generation rebind"
+else ok "a moved head still requires an explicit generation rebind"; fi
+rebound="$(led rebind-generation rebind-clean --head "$REBIND_NEW_HEAD" --reason 'merged current develop without findings repair')"
+eq "new-head rebind starts the next review generation" "2" \
+  "$(printf '%s' "$rebound" | field review_generation)"
+eq "new-head rebind does not spend a repair cycle" "0" \
+  "$(printf '%s' "$rebound" | field fix_cycles)"
+eq "new-head rebind preserves the prior required gate set" "code-review" \
+  "$(printf '%s' "$rebound" | field required_gates)"
+eq "new-head rebind binds the exact replacement head" "$REBIND_NEW_HEAD" \
+  "$(printf '%s' "$rebound" | field generation_head)"
+REBIND_LEDGER="$(led open rebind-clean | field ledger)"
+eq "new-head rebind keeps prior review history" "1" \
+  "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["rounds"]))' "$REBIND_LEDGER")"
+eq "new-head rebind records its auditable reason" "merged current develop without findings repair" \
+  "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["generation_rebinds"][-1]["reason"])' "$REBIND_LEDGER")"
+if led rebind-generation rebind-clean --head "$REBIND_NEW_HEAD" --reason 'duplicate' >/dev/null 2>&1; then
+  bad "the same head cannot be rebound twice"
+else ok "the same head cannot be rebound twice"; fi
+if led permit-review rebind-clean --role code-reviewer --head "$REBIND_NEW_HEAD" >/dev/null; then
+  ok "the new generation can issue a permit for its exact head"
+else bad "the new generation can issue a permit for its exact head"; fi
+
+led open rebind-resolved >/dev/null
+cat > "$TMP/rebind-resolved-fail.json" <<'JSON'
+{"schema_version":1,"gate":"code-review","verdict":"FAIL","checks":[{"name":"review","status":"fail"}],"findings":[{"component":"src/policy.ts:obsolete","disposition":"blocking","severity":"medium","title":"Policy mismatch","explanation":"The old policy required a behavior that is no longer applicable.","regression":false}]}
+JSON
+review_record rebind-resolved code "$TMP/rebind-resolved-fail.json" >/dev/null
+led resolve rebind-resolved --key 'src/policy.ts:obsolete' >/dev/null
+git -C "$TMP" -c user.name=Test -c user.email=test@example.com commit --allow-empty -qm policy-resolution
+RESOLVED_HEAD="$(git -C "$TMP" rev-parse HEAD)"
+resolved_rebind="$(led rebind-generation rebind-resolved --head "$RESOLVED_HEAD" --reason 'operator resolved obsolete policy finding')"
+eq "a manually resolved generation can bind a new head" "2" \
+  "$(printf '%s' "$resolved_rebind" | field review_generation)"
+eq "manual resolution rebind preserves zero fix cycles" "0" \
+  "$(printf '%s' "$resolved_rebind" | field fix_cycles)"
+
+led open rebind-blocked >/dev/null
+led record rebind-blocked --gate code-review --verdict FAIL --blocking 'src/open.ts:blocker' >/dev/null
+git -C "$TMP" -c user.name=Test -c user.email=test@example.com commit --allow-empty -qm unrelated-update
+BLOCKED_REBIND_HEAD="$(git -C "$TMP" rev-parse HEAD)"
+if led rebind-generation rebind-blocked --head "$BLOCKED_REBIND_HEAD" --reason 'try to skip repair' >/dev/null 2>&1; then
+  bad "new-head rebind cannot bypass open blocking findings"
+else ok "new-head rebind cannot bypass open blocking findings"; fi
+
 # Recreate the exact legacy corruption: security PASS was stored as round one,
 # then code FAIL was scope-frozen as round two and its blocker became advisory.
 LEGACY_LEDGER="$CONCURRENT_LEDGER"

@@ -173,6 +173,13 @@ working directory.
    bare `<path>:<symbol>` component key so a repeated defect actually accumulates
    strikes, freezes blocking scope after round 1, and returns `next_action`:
 
+   If a non-findings commit moves the PR head after a complete generation, run
+   `review-ledger.py rebind-generation <pr> --head <full-exact-head> --reason
+   "<auditable reason>"` before requesting new review permits. It preserves the
+   prior history, findings, strikes, and repair-cycle count and is refused while
+   blockers or permits remain open. A findings repair must still use
+   `record-repair`.
+
    - `review` -- after all gates record, generate one `repair-brief`; return its
      deduplicated stable IDs to a fresh implementer on the same branch. Require
      root cause, change, affected boundaries, closure condition, and verification
