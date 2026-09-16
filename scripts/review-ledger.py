@@ -715,7 +715,13 @@ def _current_generation_heads(state: dict[str, Any]) -> set[str]:
 
 
 def decide(state: dict[str, Any]) -> dict[str, Any]:
-    """Derive the loop's next action. Precedence: clear > escalate > redesign > review."""
+    """Derive the loop's next action.
+
+    A repair already recorded within the authorized cycle budget must receive
+    its complete review set before an exhausted budget or durable escalation
+    can stop the loop. The review result, not recording the repair, determines
+    whether the ledger clears or returns to human escalation.
+    """
     recorded = len(state["rounds"])
     generation = int(state.get("review_generation", 1))
     # One review round is one logical generation of a PR head, not one gate
@@ -773,6 +779,13 @@ def decide(state: dict[str, Any]) -> dict[str, Any]:
     if pending_review and state.get("repair_attempts"):
         required_gates.update(state["repair_attempts"][-1].get("required_gates", []))
     missing_gates = sorted(required_gates - set(gate_verdicts))
+    rebound_generation_pending_review = bool(
+        missing_gates
+        and any(
+            int(item.get("to_generation", 0)) == generation
+            for item in state.get("generation_rebinds", [])
+        )
+    )
     gates_clear = (
         not pending_review
         and bool(gate_verdicts)
@@ -788,6 +801,8 @@ def decide(state: dict[str, Any]) -> dict[str, Any]:
     elif_escalated = state.get("escalated") and not escalation_acknowledged
     if gates_clear:
         action = ACTION_CLEAR
+    elif pending_review or rebound_generation_pending_review:
+        action = ACTION_REVIEW
     elif elif_escalated or cap_reached:
         action = ACTION_ESCALATE
     elif pending:
@@ -817,6 +832,7 @@ def decide(state: dict[str, Any]) -> dict[str, Any]:
         "review_generation": generation,
         "required_gates": sorted(required_gates),
         "missing_gates": missing_gates,
+        "rebound_generation_pending_review": rebound_generation_pending_review,
         "cap_reached": cap_reached,
         "repair_pending_review": pending_review,
         "next_action": action,
@@ -1797,7 +1813,9 @@ def cmd_brief(args: argparse.Namespace) -> None:
         "",
         "Set every finding's JSON `component` field to the bare `<path>:<symbol>` key --",
         "the file path plus the enclosing symbol. Do not include `[component: ...]` or",
-        "any other wrapper; never use a line number or a free-text subsystem name.",
+        "any other wrapper; never use whitespace, a line number, or a free-text subsystem",
+        "name. Put prose test names in `title`; use the test file and a stable test symbol",
+        "for `component`.",
         "If your finding is the same defect as an open component above, reuse its key",
         "verbatim so the strike lands on it.",
     ]
@@ -2176,36 +2194,54 @@ def cmd_permit_review(args: argparse.Namespace) -> None:
             and not item.get("superseded_at")
             and not item.get("receipt_consumed_at")
         ]
+        reused = False
         if active:
-            raise LedgerError(
-                "the current gate already has an outstanding phase permit"
+            if len(active) != 1:
+                raise LedgerError(
+                    "the current gate has multiple outstanding phase permits"
+                )
+            existing = active[0]
+            if existing.get("completion_receipt"):
+                raise LedgerError(
+                    "the current gate has a completed review awaiting ledger recording"
+                )
+            if existing.get("started_at"):
+                raise LedgerError(
+                    "the current gate has a started review requiring reconciliation"
+                )
+            # Issuance is idempotent until provider or desktop execution starts.
+            # This lets a caller correct locally invalid structured output without
+            # fabricating a second review or stranding the generation.
+            token = str(existing["token"])
+            reused = True
+        else:
+            token = "phase_" + os.urandom(24).hex()
+            state.setdefault("review_permits", []).append(
+                {
+                    "token": token,
+                    "work_subject": subject,
+                    "role": args.role,
+                    "head": actual_head,
+                    "review_generation": state["review_generation"],
+                    "issued_at": now(),
+                    "round_count": len(state.get("rounds", [])),
+                    "repair_count": len(state.get("repair_attempts", [])),
+                    "design_round_count": len(
+                        (state.get("design") or {}).get("rounds", [])
+                    ),
+                    "started_at": "",
+                    "completion_receipt": "",
+                    "receipt_consumed_at": "",
+                }
             )
-        token = "phase_" + os.urandom(24).hex()
-        state.setdefault("review_permits", []).append(
-            {
-                "token": token,
-                "work_subject": subject,
-                "role": args.role,
-                "head": actual_head,
-                "review_generation": state["review_generation"],
-                "issued_at": now(),
-                "round_count": len(state.get("rounds", [])),
-                "repair_count": len(state.get("repair_attempts", [])),
-                "design_round_count": len(
-                    (state.get("design") or {}).get("rounds", [])
-                ),
-                "started_at": "",
-                "completion_receipt": "",
-                "receipt_consumed_at": "",
-            }
-        )
-        save(path, state)
+            save(path, state)
     emit(
         {
             "review_phase_permit": token,
             "work_subject": subject,
             "role": args.role,
             "head": actual_head,
+            "review_phase_permit_reused": reused,
         }
     )
 
@@ -2221,7 +2257,10 @@ def cmd_complete_review(args: argparse.Namespace) -> None:
         if gate:
             context_pipeline.validate_review_output(result, gate)
     except (OSError, json.JSONDecodeError, context_pipeline.ContextError) as exc:
-        raise LedgerError(f"invalid completed review result: {exc}") from exc
+        raise LedgerError(
+            "invalid completed review result: "
+            f"{exc}; correct the result and retry with the same phase permit"
+        ) from exc
     try:
         actual_head = (
             subprocess.run(

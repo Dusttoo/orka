@@ -100,7 +100,7 @@ def review_output_schema(gate: str) -> dict[str, Any]:
                             "maxLength": 240,
                             "description": (
                                 "Bare repo-relative <path>:<symbol> key; do not include "
-                                "a [component: ...] wrapper or a line number"
+                                "whitespace, a [component: ...] wrapper, or a line number"
                             ),
                         },
                         "disposition": {"type": "string", "enum": ["blocking", "advisory"]},

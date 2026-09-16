@@ -110,6 +110,13 @@ json.dump(value, open(sys.argv[2], "w"))
 PY
 "$PIPELINE" validate-review --gate code-review --input "$TMP/wrapped-review.json" > "$TMP/normalized-review.json"
 check "legacy wrapped component keys normalize without discarding the review" 'data["findings"][0]["component"] == "src/a.py:parse"' "$TMP/normalized-review.json"
+python3 - "$TMP/fail-review.json" "$TMP/invalid-component-review.json" <<'PY'
+import json, sys
+value = json.load(open(sys.argv[1]))
+value["findings"][0]["component"] = "tests/e2e/particles.spec.ts:cold hot reset flow"
+json.dump(value, open(sys.argv[2], "w"))
+PY
+run_fail "component keys reject prose test names with whitespace" "$PIPELINE" validate-review --gate code-review --input "$TMP/invalid-component-review.json"
 python3 - "$TMP/pass-review.json" "$TMP/invalid-review.json" <<'PY'
 import json, sys
 value = json.load(open(sys.argv[1]))

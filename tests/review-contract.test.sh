@@ -47,6 +47,8 @@ for file in agents/orchestration-code-reviewer.md agents/orchestration-security-
     "structured component values are bare path-plus-symbol keys"
   require_text "$file" 'Do not include a `[component: ...]`' \
     "structured component values exclude the prose wrapper"
+  require_text "$file" 'no whitespace' \
+    "structured component values exclude prose and whitespace"
 done
 require_text agents/orchestration-visual-qa.md "[component:" \
   "visual findings identify a stable component"

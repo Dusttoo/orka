@@ -88,6 +88,38 @@ cat > "$TMP/no-tracker-pass.json" <<'JSON'
 JSON
 eq "a no-tracker PR completes permit, receipt, and record end to end" "gates-clear" \
   "$(review_record no-tracker-e2e code "$TMP/no-tracker-pass.json" | field next_action)"
+
+# Invalid desktop output is rejected before execution starts. Reissuing the
+# exact gate/head permit is idempotent so a corrected result can finish without
+# fabricating a second reviewer or requiring ledger surgery.
+led open invalid-output-recovery >/dev/null
+INVALID_OUTPUT_HEAD="$(git -C "$TMP" rev-parse HEAD)"
+invalid_permit_json="$(led permit-review invalid-output-recovery --role code-reviewer --head "$INVALID_OUTPUT_HEAD")"
+INVALID_OUTPUT_PERMIT="$(printf '%s' "$invalid_permit_json" | field review_phase_permit)"
+eq "a new review permit is not reported as reused" "False" \
+  "$(printf '%s' "$invalid_permit_json" | field review_phase_permit_reused)"
+cat > "$TMP/invalid-output-review.json" <<'JSON'
+{"schema_version":1,"gate":"code-review","verdict":"PASS","checks":[{"name":"review","status":"pass"}],"findings":[{"component":"tests/e2e/particles.spec.ts:cold hot reset flow","disposition":"advisory","severity":"low","title":"Add flow coverage","explanation":"The flow would benefit from a broader regression.","regression":false}]}
+JSON
+if led complete-review invalid-output-recovery --role code-reviewer \
+  --phase-permit "$INVALID_OUTPUT_PERMIT" --result "$TMP/invalid-output-review.json" \
+  > /dev/null 2> "$TMP/invalid-output-error"; then
+  bad "invalid reviewer output is rejected before permit consumption"
+elif grep -q 'retry with the same phase permit' "$TMP/invalid-output-error"; then
+  ok "invalid reviewer output is rejected before permit consumption"
+else bad "invalid reviewer output explains permit recovery"; fi
+reissued_permit_json="$(led permit-review invalid-output-recovery --role code-reviewer --head "$INVALID_OUTPUT_HEAD")"
+eq "an unstarted review permit is reissued idempotently" "$INVALID_OUTPUT_PERMIT" \
+  "$(printf '%s' "$reissued_permit_json" | field review_phase_permit)"
+eq "permit recovery is explicit in the issuance result" "True" \
+  "$(printf '%s' "$reissued_permit_json" | field review_phase_permit_reused)"
+cat > "$TMP/corrected-output-review.json" <<'JSON'
+{"schema_version":1,"gate":"code-review","verdict":"PASS","checks":[{"name":"review","status":"pass"}],"findings":[{"component":"tests/e2e/particles.spec.ts:cold_hot_reset_flow","disposition":"advisory","severity":"low","title":"Add flow coverage","explanation":"The flow would benefit from a broader regression.","regression":false}]}
+JSON
+led complete-review invalid-output-recovery --role code-reviewer \
+  --phase-permit "$INVALID_OUTPUT_PERMIT" --result "$TMP/corrected-output-review.json" >/dev/null
+eq "the corrected result completes through the recovered permit" "gates-clear" \
+  "$(led record invalid-output-recovery --gate code-review --result "$TMP/corrected-output-review.json" --head "$INVALID_OUTPUT_HEAD" --phase-permit "$INVALID_OUTPUT_PERMIT" | field next_action)"
 eq "line numbers are stripped from component keys" \
   "src/auth/session.ts:refreshtoken" \
   "$(led record 1 --gate code-review --verdict FAIL --blocking 'src/auth/session.ts:refreshToken:142' | field accepted_blocking)"
@@ -258,6 +290,36 @@ if led permit-review rebind-clean --role code-reviewer --head "$REBIND_NEW_HEAD"
   ok "the new generation can issue a permit for its exact head"
 else bad "the new generation can issue a permit for its exact head"; fi
 
+# A moved head starts a mandatory review generation even when historical
+# repairs spent the entire fix budget and left a durable escalation marker.
+# The budget limits subsequent repairs, not review of a non-findings commit.
+led open rebind-exhausted --max-rounds 1 >/dev/null
+led record rebind-exhausted --gate code-review --verdict FAIL \
+  --blocking 'src/exhausted.ts:boundary' >/dev/null
+REBIND_EXHAUSTED_REPAIR_HEAD="$(git -C "$TMP" rev-parse HEAD)"
+cat > "$TMP/rebind-exhausted-repair.json" <<JSON
+{"schema_version":1,"head":"$REBIND_EXHAUSTED_REPAIR_HEAD","findings":[{"component":"src/exhausted.ts:boundary","status":"closed","root_cause":"missing boundary","change":"added boundary","verification":"boundary regression passes"}]}
+JSON
+led record-repair rebind-exhausted --report "$TMP/rebind-exhausted-repair.json" >/dev/null
+record_pass rebind-exhausted code >/dev/null
+eq "the last authorized repair can clear before a later head move" "gates-clear" \
+  "$(led complete-repair-review rebind-exhausted | field next_action)"
+led escalate rebind-exhausted --reason 'historical repair budget exhausted' >/dev/null
+git -C "$TMP" -c user.name=Test -c user.email=test@example.com commit --allow-empty -qm non-findings-update
+REBIND_EXHAUSTED_NEW_HEAD="$(git -C "$TMP" rev-parse HEAD)"
+rebound_exhausted="$(led rebind-generation rebind-exhausted --head "$REBIND_EXHAUSTED_NEW_HEAD" --reason 'merged a non-findings update')"
+eq "a rebound generation remains reviewable with no fix cycles left" "review" \
+  "$(printf '%s' "$rebound_exhausted" | field next_action)"
+eq "a rebound generation does not replenish the repair budget" "0" \
+  "$(printf '%s' "$rebound_exhausted" | field fix_cycles_remaining)"
+eq "a rebound generation reports its pending gate review" "True" \
+  "$(printf '%s' "$rebound_exhausted" | field rebound_generation_pending_review)"
+if record_pass rebind-exhausted code >/dev/null; then
+  ok "a rebound generation can issue and complete its required review"
+else bad "a rebound generation can issue and complete its required review"; fi
+eq "a passing rebound review clears despite historical escalation" "gates-clear" \
+  "$(led status rebind-exhausted | field next_action)"
+
 led open rebind-resolved >/dev/null
 cat > "$TMP/rebind-resolved-fail.json" <<'JSON'
 {"schema_version":1,"gate":"code-review","verdict":"FAIL","checks":[{"name":"review","status":"fail"}],"findings":[{"component":"src/policy.ts:obsolete","disposition":"blocking","severity":"medium","title":"Policy mismatch","explanation":"The old policy required a behavior that is no longer applicable.","regression":false}]}
@@ -419,6 +481,32 @@ eq "a writable ledger cannot forge root-owned repair authority" "0" \
 eq "revoking root authority restores the escalation stop" "escalate-human" \
   "$(printf '%s' "$revoked_status" | field next_action)"
 
+# Recording the last authorized repair spends the remaining cycle immediately,
+# but the repaired head still owns a mandatory review. A durable escalation
+# must not deadlock that review against authorize-repair. If the review fails,
+# escalation resumes after its result is finalized.
+led open pending-review-at-cap --max-rounds 1 >/dev/null
+led record pending-review-at-cap --gate code-review --verdict FAIL \
+  --blocking 'src/final.ts:boundary' >/dev/null
+PENDING_REPAIR_HEAD="$(git -C "$TMP" rev-parse HEAD)"
+cat > "$TMP/pending-review-at-cap.json" <<JSON
+{"schema_version":1,"head":"$PENDING_REPAIR_HEAD","findings":[{"component":"src/final.ts:boundary","status":"closed","root_cause":"missing boundary","change":"added boundary","verification":"boundary regression passes"}]}
+JSON
+led record-repair pending-review-at-cap --report "$TMP/pending-review-at-cap.json" >/dev/null
+pending_escalated="$(led escalate pending-review-at-cap --reason 'last authorized repair requires review')"
+eq "a pending repair review outranks durable escalation" "review" \
+  "$(printf '%s' "$pending_escalated" | field next_action)"
+eq "a pending repair review remains allowed with no fix cycles left" "0" \
+  "$(printf '%s' "$pending_escalated" | field fix_cycles_remaining)"
+cat > "$TMP/pending-review-fail.json" <<'JSON'
+{"schema_version":1,"gate":"code-review","verdict":"FAIL","checks":[{"name":"repair verification","status":"fail"}],"findings":[{"component":"src/final.ts:boundary","disposition":"blocking","severity":"high","title":"Boundary remains open","explanation":"The repaired head does not close the boundary.","regression":true}]}
+JSON
+if review_record pending-review-at-cap code "$TMP/pending-review-fail.json" >/dev/null; then
+  ok "an escalated ledger permits the pending repaired-head review"
+else bad "an escalated ledger permits the pending repaired-head review"; fi
+eq "a failed last-cycle repair escalates after review completion" "escalate-human" \
+  "$(led complete-repair-review pending-review-at-cap | field next_action)"
+
 # --- the cap counts explicit repairs, not review passes ------------------------
 led open 9 --max-rounds 2 >/dev/null
 led record 9 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' >/dev/null
@@ -457,6 +545,7 @@ else ok "a PASS listing blocking findings is rejected"; fi
 # --- round-aware guidance -----------------------------------------------------
 led open 7 >/dev/null
 led brief 7 | grep -q 'JSON `component` field to the bare `<path>:<symbol>` key' && ok "review brief requests a bare JSON component key" || bad "review brief requests a bare JSON component key"
+led brief 7 | grep -q 'never use whitespace' && ok "review brief forbids whitespace in component keys" || bad "review brief forbids whitespace in component keys"
 if led brief 7 | grep -q 'Key every finding as `\[component:'; then
   bad "review brief does not instruct reviewers to wrap JSON component keys"
 else ok "review brief does not instruct reviewers to wrap JSON component keys"; fi
