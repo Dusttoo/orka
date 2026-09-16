@@ -17,6 +17,7 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/repo/.orchestration"
 cp "$HERE"/../scripts/lib-config.sh "$HERE"/../scripts/run-verification.sh \
    "$HERE"/../scripts/merge-guard.sh "$HERE"/../scripts/orchestration-engine.py \
+   "$HERE"/../scripts/version_policy.py \
    "$TMP/repo/"
 cat > "$TMP/repo/.orchestration/config.yaml" <<'YAML'
 integration_branch: develop

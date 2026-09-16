@@ -146,6 +146,9 @@ working directory.
    (PR number, branch, worktree, SELF_CHECK).
 
 4. **Gate.** Run the review gates on the PR concurrently against one exact head:
+   first run `version_policy.py --plugin-root <resolved-plugin-root> --config
+   .orchestration/config.yaml` and stop unless it reports `status: compatible`.
+   The permit and merge scripts repeat this minimum-version check mechanically.
    a fresh code-review role using `orchestration-code-reviewer.md` (no implementer context), and a fresh
    security-review role using `orchestration-security-reviewer.md` when the
    shared `orchestration-engine.py security-gate` decision requires it from the
@@ -172,6 +175,13 @@ working directory.
    that permit after writing the structured result. It normalizes each finding's
    bare `<path>:<symbol>` component key so a repeated defect actually accumulates
    strikes, freezes blocking scope after round 1, and returns `next_action`:
+
+   If a non-findings commit moves the PR head after a complete generation, run
+   `review-ledger.py rebind-generation <pr> --head <full-exact-head> --reason
+   "<auditable reason>"` before requesting new review permits. It preserves the
+   prior history, findings, strikes, and repair-cycle count and is refused while
+   blockers or permits remain open. A findings repair must still use
+   `record-repair`.
 
    - `review` -- after all gates record, generate one `repair-brief`; return its
      deduplicated stable IDs to a fresh implementer on the same branch. Require

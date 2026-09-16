@@ -35,7 +35,8 @@ export MERGE_GUARD_PR_BASE_SHA="base-sha"
 mkdir -p "$MERGE_GUARD_STATUS_DIR"
 mkdir -p "$TMP/repo/.orchestration"
 cp "$HERE/../scripts/lib-config.sh" "$HERE/../scripts/merge-guard.sh" \
-   "$HERE/../scripts/orchestration-engine.py" "$TMP/repo/"
+   "$HERE/../scripts/orchestration-engine.py" "$HERE/../scripts/version_policy.py" \
+   "$TMP/repo/"
 printf 'integration_branch: develop\nproduction_branch: main\n' > "$TMP/repo/.orchestration/config.yaml"
 cd "$TMP/repo" && git init -q
 GUARD="$TMP/repo/merge-guard.sh"
@@ -63,6 +64,20 @@ assert_exit "commit body mentioning gh pr merge allowed" 0 \
 assert_exit "merge without marker blocked" 2 "$(run Bash 'gh pr merge 42 --merge')"
 assert_exit "record-green refuses wrong configured base" 2 \
   "$(MERGE_GUARD_PR_HEAD_SHA="$HEAD" MERGE_GUARD_PR_BASE_BRANCH=main bash "$GUARD" --record-green 42 >/dev/null 2>&1; echo $?)"
+
+# Repository minimum version applies both when evidence is recorded and when it
+# is asserted for merge. A marker from an incompatible runtime cannot help.
+printf 'integration_branch: develop\nproduction_branch: main\nminimum_orka_version: 1.6.0\n' \
+  > "$TMP/repo/.orchestration/config.yaml"
+assert_exit "record-green rejects runtime below repository minimum" 2 \
+  "$(MERGE_GUARD_PLUGIN_VERSION=1.5.7 MERGE_GUARD_PR_HEAD_SHA="$HEAD" bash "$GUARD" --record-green 41 >/dev/null 2>&1; echo $?)"
+assert_exit "record-green accepts runtime meeting repository minimum" 0 \
+  "$(MERGE_GUARD_PLUGIN_VERSION=1.6.0 MERGE_GUARD_PR_HEAD_SHA="$HEAD" bash "$GUARD" --record-green 41 >/dev/null 2>&1; echo $?)"
+printf 'integration_branch: develop\nproduction_branch: main\nminimum_orka_version: 1.7.0\n' \
+  > "$TMP/repo/.orchestration/config.yaml"
+assert_exit "assert-green rejects runtime below repository minimum" 2 \
+  "$(MERGE_GUARD_PLUGIN_VERSION=1.6.0 MERGE_GUARD_PR_HEAD_SHA="$HEAD" bash "$GUARD" --assert-green 41 feat/test >/dev/null 2>&1; echo $?)"
+printf 'integration_branch: develop\nproduction_branch: main\n' > "$TMP/repo/.orchestration/config.yaml"
 
 # 4. A merge with a valid, fresh marker whose sha matches HEAD is allowed.
 record_green 43 "$HEAD"

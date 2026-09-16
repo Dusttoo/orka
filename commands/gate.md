@@ -8,7 +8,13 @@ mutation:
 
 ```bash
 ${CLAUDE_PLUGIN_ROOT}/scripts/orchestration-engine.py validate-config
+python3 ${CLAUDE_PLUGIN_ROOT}/scripts/version_policy.py \
+  --plugin-root ${CLAUDE_PLUGIN_ROOT} --config .orchestration/config.yaml
 ```
+
+Stop fail-closed unless the version check reports `status: compatible`.
+`review-ledger.py permit-review` and `merge-guard.sh` repeat this check
+mechanically before review or merge authority is created.
 
 For `schema_version: 2`, use the configured transition plan for the target gate
 or merge transition. Branch roles, evidence, approvals, CI categories, and
@@ -95,6 +101,13 @@ must be reconciled and never duplicated.
    no longer reports, demotes out-of-scope new findings in a frozen round, and
    returns `next_action`. Its `effective_verdict` governs, not the reviewer's
    claimed one.
+
+   If a non-findings commit moves the PR head after the current generation is
+   complete, run `${CLAUDE_PLUGIN_ROOT}/scripts/review-ledger.py
+   rebind-generation <pr> --head <full-exact-head> --reason "<auditable
+   reason>"` before requesting new permits. The transition preserves history,
+   findings, strikes, and repair-cycle accounting, and is refused while a
+   blocker or permit remains open. Findings repairs still use `record-repair`.
 
 4. **Act on `next_action`.**
    - `review` -> after every required gate records, generate one deduplicated

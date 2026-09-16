@@ -27,11 +27,20 @@ reading them:
 - `../../scripts/review-ledger.py`
 - `../../scripts/run-gates.sh`
 - `../../scripts/run-verification.sh`
+- `../../scripts/version_policy.py`
 
 Execute scripts by absolute path while keeping the target repository as the
 working directory.
 
 ## Procedure
+
+0. Validate the active runtime against repository policy before opening or
+   resuming a review:
+   `version_policy.py --plugin-root <resolved-plugin-root> --config
+   .orchestration/config.yaml`. Stop fail-closed unless it reports
+   `status: compatible`. `review-ledger.py permit-review` and
+   `merge-guard.sh` repeat this check mechanically, so an older runtime cannot
+   mint review authority or record/assert merge evidence.
 
 Before each `code-reviewer` or `security-reviewer` pass, resolve its route with
 `scripts/context_pipeline.py route --config .orchestration/config.yaml --role
@@ -71,6 +80,13 @@ completion receipt after successful provider output.
    carries the round number, the scope mode, the
    round-aware uncertainty rule, and the open component keys to reuse. Without it
    a reviewer assumes round 1 and reviews with full blocking authority.
+   If the PR head moved for a non-findings change after the current generation
+   completed, first run `review-ledger.py rebind-generation <pr> --head
+   <full-exact-head> --reason "<auditable reason>"`. This starts a fresh review
+   generation while preserving history, findings, strikes, and repair-cycle
+   accounting. It is valid only when the prior generation is complete and has no
+   open blocker or outstanding permit. Never use it instead of `record-repair`
+   for a findings repair.
 3. Launch the code-review gate and any required security-review gate concurrently
    against the same exact PR head, raw diff, and round brief. Do not let one
    reviewer's findings contaminate the other's independent pass. Run code review

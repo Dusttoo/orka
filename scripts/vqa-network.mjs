@@ -53,13 +53,13 @@ export function isExpectedRscRetryAbort(
   if (!ABORT_ERRORS.test(failed.errorText || '')) return false;
   if (failed.navigation || failed.method !== 'GET') return false;
   if (failed.headers?.rsc !== '1') return false;
+  if (!Number.isSafeInteger(failed.order) || failed.order === Number.MAX_SAFE_INTEGER) return false;
   if (!expectedStateReached || pageErrors.length > 0) return false;
 
   const failedUrl = urlIdentity(failed.url);
   if (!failedUrl?.rsc) return false;
 
   return completedRequests.some((completed) => {
-    if (completed.order <= failed.order) return false;
     if (completed.method !== failed.method) return false;
     if (completed.headers?.rsc !== '1') return false;
     if (completed.status == null || completed.status < 200 || completed.status >= 300) return false;

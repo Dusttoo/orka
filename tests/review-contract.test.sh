@@ -102,7 +102,13 @@ for file in skills/orchestrate-ticket/SKILL.md skills/gate-pr/SKILL.md commands/
   require_text "$file" "review-ledger.py" "orchestrator drives the durable review ledger"
   require_text "$file" "escalate-human" "orchestrator stops the loop at the round cap"
   require_text "$file" "brief" "orchestrator hands each reviewer its round brief"
+  require_text "$file" "version_policy.py" "review workflows enforce repository minimum Orka version"
 done
+
+require_text scripts/review-ledger.py "assert_minimum_version" \
+  "review permits enforce repository minimum Orka version mechanically"
+require_text scripts/merge-guard.sh "orch_assert_minimum_version" \
+  "merge evidence enforces repository minimum Orka version mechanically"
 
 claude_version="$(sed -n 's/.*"version": "\([^"]*\)".*/\1/p' "$ROOT/.claude-plugin/plugin.json" | head -1)"
 codex_version="$(sed -n 's/.*"version": "\([^"]*\)".*/\1/p' "$ROOT/.codex-plugin/plugin.json" | head -1)"

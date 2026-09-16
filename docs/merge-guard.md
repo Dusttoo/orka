@@ -20,6 +20,11 @@ live PR head/base identity. A trusted hook adds coverage for raw `gh pr merge`
 commands, but correctness does not disappear on a Codex or Claude Code host that
 does not register it.
 
+Before recording or accepting a marker, the guard also checks the active plugin
+against the repository's `minimum_orka_version`. An older runtime fails closed
+even when its marker matches its own version. The review ledger applies the same
+policy before issuing any review permit.
+
 ## Hook contract
 
 ```

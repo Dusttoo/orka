@@ -101,7 +101,6 @@ assert.deepEqual(classifyRequestFailures([abortedRsc], [completedRetry], {
 
 for (const [name, failed, completed, context] of [
   ['no successful retry', abortedRsc, [], { expectedStateReached: true, pageErrors: [] }],
-  ['retry is earlier', abortedRsc, [{ ...completedRetry, order: 1 }], { expectedStateReached: true, pageErrors: [] }],
   ['different pathname', abortedRsc, [{ ...completedRetry, url: 'https://example.test/labs/other?_rsc=x' }], { expectedStateReached: true, pageErrors: [] }],
   ['different origin', abortedRsc, [{ ...completedRetry, url: 'https://other.test/labs/mass-vs-weight?_rsc=x' }], { expectedStateReached: true, pageErrors: [] }],
   ['failed retry', abortedRsc, [{ ...completedRetry, status: 500 }], { expectedStateReached: true, pageErrors: [] }],
@@ -123,7 +122,7 @@ assert.equal(snap.order, 7);
 assert.equal(snap.status, 204);
 assert.equal(snap.headers.rsc, '1');
 
-console.log('ok - aborted RSC navigation requests require a later successful exact-path retry');
+console.log('ok - aborted RSC navigation requests require a successful exact-path request');
 
 const page = new FakePage();
 const observed = observeCaptureRequests(page, {
@@ -148,9 +147,92 @@ assert.deepEqual(classifyRequestFailures(
   observed.failedRequests,
   observed.completedRequests,
   { expectedStateReached: true, pageErrors: [] },
-), { ignored: [], failures: [observed.failedRequests[0]] });
+), { ignored: [observed.failedRequests[0]], failures: [] });
 
-console.log('ok - request-start order prevents an older concurrent completion from hiding a later abort');
+console.log('ok - an earlier same-step RSC completion can satisfy a redundant later abort');
+
+const completedBeforeDuplicateAbort = {
+  order: 38,
+  url: 'https://example.test/labs/build-a-circuit?_rsc=vYl0_THbSB_cMCwn',
+  method: 'GET',
+  headers: { rsc: '1' },
+  navigation: false,
+  errorText: '',
+  status: 200,
+};
+const duplicateAbort = {
+  ...completedBeforeDuplicateAbort,
+  order: 39,
+  errorText: 'net::ERR_ABORTED',
+  status: null,
+};
+assert.deepEqual(classifyRequestFailures(
+  [duplicateAbort],
+  [completedBeforeDuplicateAbort],
+  { expectedStateReached: true, pageErrors: [] },
+), { ignored: [duplicateAbort], failures: [] });
+
+const earlierPrefetchCompletion = {
+  order: 21,
+  url: 'https://example.test/labs/mass-vs-weight?_rsc=WoRyWN',
+  method: 'GET',
+  headers: { rsc: '1', 'next-router-prefetch': '1' },
+  navigation: false,
+  errorText: '',
+  status: 200,
+};
+const settledNavigationAbort = {
+  order: 30,
+  url: 'https://example.test/labs/mass-vs-weight?_rsc=3RQhkJys',
+  method: 'GET',
+  headers: { rsc: '1' },
+  navigation: false,
+  errorText: 'net::ERR_ABORTED',
+  status: null,
+};
+assert.deepEqual(classifyRequestFailures(
+  [settledNavigationAbort],
+  [earlierPrefetchCompletion],
+  { expectedStateReached: true, pageErrors: [] },
+), { ignored: [settledNavigationAbort], failures: [] });
+
+console.log('ok - recorded PNP-149 and PNP-21 earlier-completion sequences pass');
+
+const mobilePrefetchAborts = [
+  {
+    order: 27,
+    url: 'https://example.test/labs/too-small-to-see?_rsc=1HG1cpklRGag6LzN',
+    method: 'GET',
+    headers: {
+      rsc: '1',
+      'next-router-prefetch': '1',
+      'next-router-state-tree': '["",{},null,"metadata-only"]',
+    },
+    navigation: false,
+    errorText: 'net::ERR_ABORTED',
+    status: null,
+  },
+  {
+    order: 28,
+    url: 'https://example.test/labs/hot-or-not?_rsc=1HG1cpklRGag6LzN',
+    method: 'GET',
+    headers: {
+      rsc: '1',
+      'next-router-prefetch': '1',
+      'next-router-state-tree': '["",{},null,"metadata-only"]',
+    },
+    navigation: false,
+    errorText: 'net::ERR_ABORTED',
+    status: null,
+  },
+];
+assert.deepEqual(classifyRequestFailures(
+  mobilePrefetchAborts,
+  [],
+  { expectedStateReached: true, pageErrors: [] },
+), { ignored: mobilePrefetchAborts, failures: [] });
+
+console.log('ok - recorded mobile metadata prefetch aborts remain ignored');
 
 const missingStartPage = new FakePage();
 const missingStartObserved = observeCaptureRequests(missingStartPage, {
