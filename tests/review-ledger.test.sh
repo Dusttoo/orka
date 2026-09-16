@@ -419,6 +419,32 @@ eq "a writable ledger cannot forge root-owned repair authority" "0" \
 eq "revoking root authority restores the escalation stop" "escalate-human" \
   "$(printf '%s' "$revoked_status" | field next_action)"
 
+# Recording the last authorized repair spends the remaining cycle immediately,
+# but the repaired head still owns a mandatory review. A durable escalation
+# must not deadlock that review against authorize-repair. If the review fails,
+# escalation resumes after its result is finalized.
+led open pending-review-at-cap --max-rounds 1 >/dev/null
+led record pending-review-at-cap --gate code-review --verdict FAIL \
+  --blocking 'src/final.ts:boundary' >/dev/null
+PENDING_REPAIR_HEAD="$(git -C "$TMP" rev-parse HEAD)"
+cat > "$TMP/pending-review-at-cap.json" <<JSON
+{"schema_version":1,"head":"$PENDING_REPAIR_HEAD","findings":[{"component":"src/final.ts:boundary","status":"closed","root_cause":"missing boundary","change":"added boundary","verification":"boundary regression passes"}]}
+JSON
+led record-repair pending-review-at-cap --report "$TMP/pending-review-at-cap.json" >/dev/null
+pending_escalated="$(led escalate pending-review-at-cap --reason 'last authorized repair requires review')"
+eq "a pending repair review outranks durable escalation" "review" \
+  "$(printf '%s' "$pending_escalated" | field next_action)"
+eq "a pending repair review remains allowed with no fix cycles left" "0" \
+  "$(printf '%s' "$pending_escalated" | field fix_cycles_remaining)"
+cat > "$TMP/pending-review-fail.json" <<'JSON'
+{"schema_version":1,"gate":"code-review","verdict":"FAIL","checks":[{"name":"repair verification","status":"fail"}],"findings":[{"component":"src/final.ts:boundary","disposition":"blocking","severity":"high","title":"Boundary remains open","explanation":"The repaired head does not close the boundary.","regression":true}]}
+JSON
+if review_record pending-review-at-cap code "$TMP/pending-review-fail.json" >/dev/null; then
+  ok "an escalated ledger permits the pending repaired-head review"
+else bad "an escalated ledger permits the pending repaired-head review"; fi
+eq "a failed last-cycle repair escalates after review completion" "escalate-human" \
+  "$(led complete-repair-review pending-review-at-cap | field next_action)"
+
 # --- the cap counts explicit repairs, not review passes ------------------------
 led open 9 --max-rounds 2 >/dev/null
 led record 9 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' >/dev/null

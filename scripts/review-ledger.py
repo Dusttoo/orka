@@ -715,7 +715,13 @@ def _current_generation_heads(state: dict[str, Any]) -> set[str]:
 
 
 def decide(state: dict[str, Any]) -> dict[str, Any]:
-    """Derive the loop's next action. Precedence: clear > escalate > redesign > review."""
+    """Derive the loop's next action.
+
+    A repair already recorded within the authorized cycle budget must receive
+    its complete review set before an exhausted budget or durable escalation
+    can stop the loop. The review result, not recording the repair, determines
+    whether the ledger clears or returns to human escalation.
+    """
     recorded = len(state["rounds"])
     generation = int(state.get("review_generation", 1))
     # One review round is one logical generation of a PR head, not one gate
@@ -788,6 +794,8 @@ def decide(state: dict[str, Any]) -> dict[str, Any]:
     elif_escalated = state.get("escalated") and not escalation_acknowledged
     if gates_clear:
         action = ACTION_CLEAR
+    elif pending_review:
+        action = ACTION_REVIEW
     elif elif_escalated or cap_reached:
         action = ACTION_ESCALATE
     elif pending:
