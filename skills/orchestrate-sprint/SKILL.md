@@ -352,8 +352,12 @@ Before launching, resolve the executable because non-interactive SSH shells may 
    lost its attempt token or mechanically
    verified execution-unit identity, require a separate root-issued,
    attempt-bound recovery capability and use `recover-terminal`; do not
-   fabricate inventory or identity. Include warning state, projected spend,
-   active absolute ceiling, and run count in meaningful status updates.
+   fabricate inventory or identity. The same command is the supported bridge
+   for a tokenless `needs_repair` checkpoint only when its PR and branch are
+   preserved and every execution-unit field is empty; the controller validates
+   that exact shape before consuming the capability. Include warning state,
+   projected spend, active absolute ceiling, and run count in meaningful status
+   updates.
 
    An exhausted launch count is a separate hard stop. Continue only after root
    issues an expiring ticket-scoped `issue-relaunch` capability whose

@@ -4888,16 +4888,47 @@ def recover_terminal(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
     with locked(path):
         state = load(path)
         ticket = state["tickets"].get(key)
-        if not ticket or ticket.get("state") not in {
-            "blocked",
-            "external_blocked",
-            "operator_decision",
-            "user_action",
-        }:
-            current = ticket.get("state") if ticket else "missing"
+        current = ticket.get("state") if ticket else "missing"
+        tokenless_preserved_repair = bool(
+            ticket
+            and current == "needs_repair"
+            and not ticket.get("attempt_token")
+        )
+        if not ticket or (
+            current not in {
+                "blocked",
+                "external_blocked",
+                "operator_decision",
+                "user_action",
+            }
+            and not tokenless_preserved_repair
+        ):
             raise SprintError(
                 f"ticket {key} cannot be terminal-recovered from state {current}"
             )
+        if tokenless_preserved_repair:
+            if not ticket.get("pr") or not ticket.get("branch"):
+                raise SprintError(
+                    "tokenless needs_repair recovery requires a preserved PR and branch"
+                )
+            stale_execution_fields = [
+                name
+                for name in (
+                    "run_ref",
+                    "worker_identity",
+                    "launch_evidence",
+                    "attach_capability",
+                    "attached_at",
+                    "attempt_capability",
+                    "recovery_binding",
+                )
+                if ticket.get(name)
+            ]
+            if stale_execution_fields:
+                raise SprintError(
+                    "tokenless needs_repair recovery requires an empty execution unit; "
+                    "stale fields: " + ", ".join(stale_execution_fields)
+                )
         try:
             consume_recovery(
                 cfg["shared_root"],
@@ -4919,9 +4950,15 @@ def recover_terminal(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         ticket["attach_capability"] = ""
         ticket["attached_at"] = ""
         ticket["launch_evidence"] = {}
+        ticket["next_launch_continuation"] = False
         ticket["legacy_recovery_pending"] = False
         ticket["history"].append(
-            {"at": now(), "event": "terminal-recovered", "reason": args.reason.strip()}
+            {
+                "at": now(),
+                "event": "terminal-recovered",
+                "previous_state": current,
+                "reason": args.reason.strip(),
+            }
         )
         save(path, state)
     emit({"ticket": key, "state": "pending", "recovered": True})
