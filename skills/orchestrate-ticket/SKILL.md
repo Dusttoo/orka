@@ -147,8 +147,10 @@ working directory.
 
 4. **Gate.** Run the review gates on the PR concurrently against one exact head:
    a fresh code-review role using `orchestration-code-reviewer.md` (no implementer context), and a fresh
-   security-review role using `orchestration-security-reviewer.md` when the diff
-   hits a `security_required_when` trigger. Both must return validated structured
+   security-review role using `orchestration-security-reviewer.md` when the
+   shared `orchestration-engine.py security-gate` decision requires it from the
+   raw diff or authoritative PR source/target branches. A failed decision is a
+   fail-closed stop, never permission to skip security. Both must return validated structured
    PASS results with no blocking findings. On
    each pass, supply the raw unified base-to-head git diff as the default code
    input, never a full-codebase index; expand only for a named verification or

@@ -133,6 +133,9 @@ contains_contract "operator capability stdin hygiene" 'operator-capability-stdin
 contains_contract "durable review ledger" 'review-ledger\.py' \
   commands/orchestrate.md skills/orchestrate-ticket/SKILL.md \
   commands/gate.md skills/gate-pr/SKILL.md
+contains_contract "mechanical security gate decision" 'orchestration-engine\.py security-gate' \
+  commands/orchestrate.md skills/orchestrate-ticket/SKILL.md \
+  commands/gate.md skills/gate-pr/SKILL.md
 contains_contract "structured reviewer result recording" '--result' \
   commands/orchestrate.md skills/orchestrate-ticket/SKILL.md \
   commands/gate.md skills/gate-pr/SKILL.md

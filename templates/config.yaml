@@ -290,8 +290,10 @@ max_repair_cycles: 2
 review_ledger_dir: .orchestration/.review-ledger
 
 # --- Security-gate trigger ------------------------------------------------ agent
-# When the security gate is mandatory. Either the literal `always`, or a list of
-# path fragments / keywords matched against the PR diff. Any match -> required.
+# When the security gate is mandatory. Diff triggers accept the literal `always`
+# or path fragments / keywords matched against the PR diff. Branch triggers use
+# shell-style patterns and authoritative PR source/target metadata. Any match
+# makes security review mandatory.
 security_required_when:
   - migrations/
   - rls
@@ -300,6 +302,10 @@ security_required_when:
   - SECURITY DEFINER
   - webhook
   - payment
+# Example policy: ["hotfix/**"]
+security_required_source_branches: []
+# Example policy: ["main"]
+security_required_target_branches: []
 
 # --- Ticket system -------------------------------------------------------- agent
 # How the orchestrator resolves and transitions work items.

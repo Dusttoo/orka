@@ -88,12 +88,18 @@ completion receipt after successful provider output.
    wrong outcome/impact, and reproduction or exact falsifying assertion under
    the selected profile. Do not let a reviewer expand the PR into new host
    infrastructure based only on a stronger, unconfigured threat model.
-4. Inspect the PR diff against `security_required_when` before launching the
-   pair. If any trigger matches, run a fresh security-review pass using
-   `orchestration-security-reviewer.md`
-   with the same raw unified diff and diff-isolated context.
-   If nothing matches, record that the security gate was skipped because the diff
-   has no configured security surface.
+4. Before launching the pair, read the authoritative PR `headRefName` and
+   `baseRefName` from GitHub, save the raw base-to-head unified diff to a file,
+   and run `orchestration-engine.py security-gate --source-branch <headRefName>
+   --target-branch <baseRefName> --diff-file <raw-diff-file>`. This shared
+   decision evaluates `security_required_when`,
+   `security_required_source_branches`, and
+   `security_required_target_branches`. If `required` is true, run a fresh
+   security-review pass using `orchestration-security-reviewer.md` with the same
+   raw unified diff and diff-isolated context. If it is false, record the empty
+   reasons list and skip. If metadata, diff capture, configuration validation,
+   or the decision command fails, stop fail-closed; never infer that security is
+   optional.
 5. Wait for both launched reviewers, then record every completed gate through the
    ledger, blocking and advisory findings
    alike: `review-ledger.py record <pr> --gate code-review --result

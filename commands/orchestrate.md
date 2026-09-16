@@ -96,8 +96,9 @@ Steps:
    worktree, SELF_CHECK).
 
 4. **Gate.** Run the gate pipeline on the resulting PR -- invoke
-   `/orka:gate <pr>` (code-review and, when the diff
-   hits a `security_required_when` trigger). Both must return validated structured
+   `/orka:gate <pr>` (code-review and security-review whenever the shared
+   `orchestration-engine.py security-gate` decision requires it from diff or
+   authoritative PR source/target branches). Both must return validated structured
    PASS results with no blocking findings. Launch both required reviewers
    concurrently against the same exact head and round brief.
    Give each reviewer the raw unified base-to-head git diff by default, not a

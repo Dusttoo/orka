@@ -219,7 +219,8 @@ Legacy key blocks:
 | `self_check` | named shell checks run before review (typecheck, build, test, plus any repo convention) |
 | `verification` | opt-in heavy suites (e.g. e2e), each gated to a target via `when:` |
 | `gates` | which review roles run (`code-review`, `security-review`) |
-| `security_required_when` | diff triggers that make the security gate mandatory |
+| `security_required_when` | diff path/content triggers that make the security gate mandatory |
+| `security_required_source_branches` / `security_required_target_branches` | source/target branch patterns that force security review even when the diff has no configured keyword |
 | `sprint_id` / `sprint_*` | configured Jira sprint, dependency/status mapping, and checkpoint location |
 | `sprint_decomposition` | optional pre-code complexity assessment, bounded Jira child creation, and an approved multi-step path to a launchable Jira status |
 | `sprint_decomposition.required_slice_contracts` | repository-selected contract fields every generated slice must carry before Jira creation |

@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import fnmatch
+import json
 import os
 import re
 import subprocess
@@ -376,6 +378,20 @@ def validate_config(cfg: dict[str, Any]) -> None:
         raise EngineError(
             "worker_trust_profile must be cooperative-worker or isolated-worker"
         )
+    for key in (
+        "security_required_when",
+        "security_required_source_branches",
+        "security_required_target_branches",
+    ):
+        value = cfg.get(key)
+        if value is None or value == "":
+            continue
+        if not isinstance(value, (str, list)):
+            raise EngineError(f"{key} must be a string or list of strings")
+        if any(
+            not isinstance(item, str) or not item.strip() for item in as_list(value)
+        ):
+            raise EngineError(f"{key} entries must be non-empty strings")
     if version == "1":
         if not cfg.get("integration_branch"):
             raise EngineError("legacy config requires integration_branch")
@@ -694,6 +710,106 @@ def cmd_guard_policy(args: argparse.Namespace) -> None:
         print(f"blocked_branch={branch}")
 
 
+def normalize_branch(value: str) -> str:
+    value = value.strip()
+    prefix = "refs/heads/"
+    return value[len(prefix):] if value.startswith(prefix) else value
+
+
+def branch_pattern_match(branch: str, pattern: str) -> bool:
+    return fnmatch.fnmatchcase(normalize_branch(branch), normalize_branch(pattern))
+
+
+def changed_paths(diff_text: str) -> list[str]:
+    paths: set[str] = set()
+    for line in diff_text.splitlines():
+        if not line.startswith(("+++ ", "--- ")):
+            continue
+        value = line[4:].split("\t", 1)[0]
+        if value == "/dev/null":
+            continue
+        if value.startswith(("a/", "b/")):
+            value = value[2:]
+        paths.add(value)
+    return sorted(paths)
+
+
+def security_gate_decision(
+    cfg: dict[str, Any], source_branch: str, target_branch: str, diff_text: str
+) -> dict[str, Any]:
+    reasons: list[dict[str, str]] = []
+    for pattern in as_list(cfg.get("security_required_source_branches")):
+        pattern = str(pattern)
+        if branch_pattern_match(source_branch, pattern):
+            reasons.append(
+                {
+                    "kind": "source_branch",
+                    "value": normalize_branch(source_branch),
+                    "pattern": pattern,
+                }
+            )
+    for pattern in as_list(cfg.get("security_required_target_branches")):
+        pattern = str(pattern)
+        if branch_pattern_match(target_branch, pattern):
+            reasons.append(
+                {
+                    "kind": "target_branch",
+                    "value": normalize_branch(target_branch),
+                    "pattern": pattern,
+                }
+            )
+
+    paths = changed_paths(diff_text)
+    lowered_diff = diff_text.lower()
+    for trigger_value in as_list(cfg.get("security_required_when")):
+        trigger = str(trigger_value).strip()
+        lowered = trigger.lower()
+        matched_path = next(
+            (
+                path
+                for path in paths
+                if lowered in path.lower()
+                or (
+                    any(char in trigger for char in "*?[")
+                    and fnmatch.fnmatchcase(path, trigger)
+                )
+            ),
+            None,
+        )
+        if lowered == "always":
+            reasons.append({"kind": "diff", "value": "always", "pattern": trigger})
+        elif matched_path is not None:
+            reasons.append({"kind": "diff_path", "value": matched_path, "pattern": trigger})
+        elif lowered and lowered in lowered_diff:
+            reasons.append({"kind": "diff_content", "value": trigger, "pattern": trigger})
+
+    return {
+        "required": bool(reasons),
+        "source_branch": normalize_branch(source_branch),
+        "target_branch": normalize_branch(target_branch),
+        "reasons": reasons,
+    }
+
+
+def cmd_security_gate(args: argparse.Namespace) -> None:
+    cfg = require_config(args)
+    diff_path = Path(args.diff_file)
+    if not diff_path.is_file():
+        fail(f"diff file not found: {diff_path}")
+    if not args.source_branch.strip() or not args.target_branch.strip():
+        fail("security-gate requires non-empty source and target branches")
+    diff_text = diff_path.read_text(encoding="utf-8", errors="replace")
+    if not diff_text.strip():
+        fail("security-gate requires non-empty raw diff evidence")
+    decision = security_gate_decision(
+        cfg,
+        args.source_branch,
+        args.target_branch,
+        diff_text,
+    )
+    print(json.dumps(decision, sort_keys=True, separators=(",", ":")))
+
+
 def transition_plan(cfg: dict[str, Any], transition_name: str, variables: dict[str, str]) -> list[tuple[str, str]]:
     transition = find_transition(cfg, transition_name)
     lines: list[tuple[str, str]] = [
@@ -964,6 +1080,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("guard-policy")
 
+    security = sub.add_parser("security-gate")
+    security.add_argument("--source-branch", required=True)
+    security.add_argument("--target-branch", required=True)
+    security.add_argument("--diff-file", required=True)
+
     plan = sub.add_parser("plan-transition")
     plan.add_argument("transition")
     plan.add_argument("--var", action="append", default=[])
@@ -1009,6 +1130,7 @@ def main(argv: list[str] | None = None) -> None:
         "validate-config": cmd_validate,
         "branch-name": cmd_branch_name,
         "guard-policy": cmd_guard_policy,
+        "security-gate": cmd_security_gate,
         "plan-transition": cmd_plan_transition,
         "adapter-plan": cmd_adapter_plan,
         "init-candidate": cmd_init_candidate,
