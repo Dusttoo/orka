@@ -53,21 +53,30 @@ def canonical_scope(raw: str, expected_kind: str) -> str:
     if not raw or len(raw) > 4096 or "\n" in raw or "\r" in raw:
         raise ValueError("invalid authority scope")
     value = json.loads(raw)
-    expected = {"kind", "repository", "ticket"}
-    if expected_kind == "recovery":
-        expected.add("attempt")
+    if expected_kind == "review-repair":
+        expected = {"kind", "repository", "pr"}
+    else:
+        expected = {"kind", "repository", "ticket"}
+        if expected_kind == "recovery":
+            expected.add("attempt")
     if not isinstance(value, dict) or set(value) != expected:
         raise ValueError("authority scope has unexpected fields")
     if value.get("kind") != expected_kind:
         raise ValueError("authority scope kind mismatch")
     repository = str(value.get("repository") or "")
-    ticket = str(value.get("ticket") or "")
-    if (
-        not repository.startswith("/")
-        or not re.fullmatch(r"[A-Z][A-Z0-9_]*-[0-9]+", ticket)
-        or len(ticket) > 64
-    ):
-        raise ValueError("authority scope is incomplete")
+    if expected_kind == "review-repair":
+        if not repository.startswith("/") or not re.fullmatch(
+            r"[1-9][0-9]{0,19}", str(value.get("pr") or "")
+        ):
+            raise ValueError("review repair scope is incomplete")
+    else:
+        ticket = str(value.get("ticket") or "")
+        if (
+            not repository.startswith("/")
+            or not re.fullmatch(r"[A-Z][A-Z0-9_]*-[0-9]+", ticket)
+            or len(ticket) > 64
+        ):
+            raise ValueError("authority scope is incomplete")
     if expected_kind == "recovery":
         attempt = value.get("attempt")
         if not isinstance(attempt, int) or attempt < 0:
@@ -93,6 +102,20 @@ def build_scope(kind: str, repository: str, ticket: str, attempt: int | None) ->
         value["attempt"] = attempt
     return canonical_scope(
         json.dumps(value, sort_keys=True, separators=(",", ":")), kind
+    )
+
+
+def build_review_repair_scope(repository: str, pr: str) -> str:
+    root = Path(repository).resolve()
+    if not root.is_dir():
+        raise ValueError("repository does not exist")
+    value = {
+        "kind": "review-repair",
+        "repository": str(root),
+        "pr": str(pr).strip(),
+    }
+    return canonical_scope(
+        json.dumps(value, sort_keys=True, separators=(",", ":")), "review-repair"
     )
 
 
@@ -319,6 +342,95 @@ def consume_recovery(args: argparse.Namespace) -> int:
     return 0
 
 
+def issue_review_repair(args: argparse.Namespace) -> int:
+    require_real_root()
+    if not 0 < args.expires_hours <= 168:
+        raise ValueError("capability expiry must be greater than zero and at most 168 hours")
+    if not 0 < args.ceiling_repair_cycles <= 10000:
+        raise ValueError("review repair ceiling must be between 1 and 10000")
+    if not args.reason.strip() or len(args.reason) > 2000:
+        raise ValueError("review repair authorization requires a bounded operator reason")
+    scope = build_review_repair_scope(args.repository, args.pr)
+    token = secrets.token_hex(32)
+    root = state_root()
+    ensure_layout(root)
+    record = {
+        "kind": "review-repair",
+        "scope": scope,
+        "ceiling_repair_cycles": args.ceiling_repair_cycles,
+        "reason": args.reason.strip(),
+        "grant_id": secrets.token_hex(16),
+        "issued_at": time.time(),
+        "expires_at": time.time() + args.expires_hours * 3600,
+    }
+    with locked(root):
+        atomic_json(root / "pending" / f"{token}.json", record)
+    print(token)
+    return 0
+
+
+def review_repair_grant(args: argparse.Namespace, activate: bool = False) -> int:
+    scope = canonical_scope(args.scope, "review-repair")
+    token = read_token() if activate else None
+    root = state_root()
+    require_layout(root)
+    key = hashlib.sha256(scope.encode("utf-8")).hexdigest()
+    target = root / "active" / f"{key}.json"
+    with locked(root):
+        source = root / "pending" / f"{token}.json" if activate else target
+        if not source.is_file():
+            return fail("review repair capability missing or consumed") if activate else 3
+        record = load_record(source)
+        if record.get("kind") != "review-repair" or not live(record):
+            return fail("review repair capability is invalid or expired") if activate else 3
+        if not hmac.compare_digest(str(record.get("scope") or ""), scope):
+            return fail("review repair capability scope mismatch") if activate else 3
+        ceiling = record.get("ceiling_repair_cycles")
+        if type(ceiling) is not int or not 0 < ceiling <= 10000:
+            return fail("review repair capability has an invalid ceiling") if activate else 3
+        if activate:
+            if target.is_file():
+                current = load_record(target)
+                current_ceiling = current.get("ceiling_repair_cycles")
+                if (
+                    current.get("kind") == "review-repair"
+                    and live(current)
+                    and type(current_ceiling) is int
+                    and current_ceiling > ceiling
+                ):
+                    record = current
+            atomic_json(target, record)
+            os.replace(source, root / "consumed" / f"{token}.json")
+    print(
+        json.dumps(
+            {
+                key: record[key]
+                for key in (
+                    "grant_id",
+                    "ceiling_repair_cycles",
+                    "reason",
+                    "issued_at",
+                    "expires_at",
+                )
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    return 0
+
+
+def revoke_review_repair(args: argparse.Namespace) -> int:
+    require_real_root()
+    scope = build_review_repair_scope(args.repository, args.pr)
+    root = state_root()
+    ensure_layout(root)
+    key = hashlib.sha256(scope.encode("utf-8")).hexdigest()
+    with locked(root):
+        (root / "active" / f"{key}.json").unlink(missing_ok=True)
+    return 0
+
+
 def activate_budget(args: argparse.Namespace) -> int:
     scope = canonical_scope(args.scope, "budget")
     token = read_token()
@@ -445,6 +557,8 @@ def parser() -> argparse.ArgumentParser:
     commands = result.add_subparsers(dest="command", required=True)
     for name in (
         "consume-recovery",
+        "activate-review-repair",
+        "review-repair-grant",
         "activate-budget",
         "budget-ceiling",
         "activate-relaunch",
@@ -459,6 +573,15 @@ def parser() -> argparse.ArgumentParser:
     recovery.add_argument("--ticket", required=True)
     recovery.add_argument("--attempt", required=True, type=int)
     recovery.add_argument("--expires-hours", type=float, default=24)
+    review_repair = commands.add_parser("issue-review-repair")
+    review_repair.add_argument("--repository", required=True)
+    review_repair.add_argument("--pr", required=True)
+    review_repair.add_argument("--ceiling-repair-cycles", required=True, type=int)
+    review_repair.add_argument("--reason", required=True)
+    review_repair.add_argument("--expires-hours", type=float, default=24)
+    revoke_review_repair_parser = commands.add_parser("revoke-review-repair")
+    revoke_review_repair_parser.add_argument("--repository", required=True)
+    revoke_review_repair_parser.add_argument("--pr", required=True)
     budget = commands.add_parser("issue-budget")
     budget.add_argument("--repository", required=True)
     budget.add_argument("--ticket", required=True)
@@ -500,12 +623,20 @@ def main() -> int:
             return revoke_restart(args)
         if args.command == "issue-recovery":
             return issue(args, "recovery")
+        if args.command == "issue-review-repair":
+            return issue_review_repair(args)
         if args.command == "issue-budget":
             return issue(args, "budget")
         if args.command == "issue-relaunch":
             return issue(args, "relaunch")
         if args.command == "consume-recovery":
             return consume_recovery(args)
+        if args.command == "activate-review-repair":
+            return review_repair_grant(args, activate=True)
+        if args.command == "review-repair-grant":
+            return review_repair_grant(args)
+        if args.command == "revoke-review-repair":
+            return revoke_review_repair(args)
         if args.command == "activate-budget":
             return activate_budget(args)
         if args.command == "budget-ceiling":

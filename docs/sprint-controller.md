@@ -628,6 +628,14 @@ restores normal enforcement. Re-running `restart-ticket` without a token can
 finish applying an already-activated grant after a crash; applying the same grant
 twice does not reset state again. A new grant replaces the previous restart grant.
 
+Ticket restart and review escalation are separate authorities. If the
+preserved PR's review ledger already reached `escalate-human`, restarting its
+controller lane does not erase that decision. After reviewing the ledger
+handoff, use the PR-bound `issue-review-repair` / `authorize-repair` flow in
+`docs/review-loop.md` to grant an absolute repair-cycle ceiling. Upgrade the
+host authority helper first; runtime users may consume this capability but may
+not issue it.
+
 `plan.legacy_reconciliation` identifies old `blocked`/`user_action` tickets with
 concrete next actions: refresh inventory, inspect a preserved PR, reconcile
 existing children, classify an old worker outcome, or verify Jira readiness.

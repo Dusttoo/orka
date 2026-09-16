@@ -367,6 +367,15 @@ Before launching, resolve the executable because non-interactive SSH shells may 
    breakers and does not turn `blocked` or `user_action` back into `pending`;
    terminal work still needs its separately scoped `recover-terminal` token.
 
+   A controller restart does not clear an already escalated PR review ledger.
+   If the operator approves more repair work on that same PR, require the
+   PR-bound root `issue-review-repair` capability and consume it with
+   `review-ledger.py authorize-repair <pr> --operator-capability-stdin`. The
+   absolute ceiling may add bounded cycles, but the command must preserve the
+   escalation record, findings, gate history, and prior repair attempts. The
+   root-owned grant remains authoritative and is checked live; expiry or
+   revocation restores the stop even if repository state is edited.
+
    **Quiet captain contract.** When `sprint_status_update_mode` is `event`, do
    not spend model turns polling, rereading full transcripts, or narrating
    unchanged work. Use the host's blocking worker wait primitive with its

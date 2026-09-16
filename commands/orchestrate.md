@@ -107,8 +107,9 @@ Steps:
    - A blocker names a concrete failing input/precondition, production path,
      wrong outcome/impact, and reproduction or exact falsifying assertion under
      the configured profile. Stronger-profile hypotheticals are advisory.
-   - The durable failure ledger owns the loop. Open it once
-     (`${CLAUDE_PLUGIN_ROOT}/scripts/review-ledger.py open <pr>`), paste
+   - The durable failure ledger owns the loop. Open it once with the immutable
+     ticket binding (`${CLAUDE_PLUGIN_ROOT}/scripts/review-ledger.py open <pr>
+     --work-kind jira --work-id <ticket>`), paste
      `review-ledger.py brief <pr>` into every reviewer brief, save the JSON under
      `.orchestration/.review-results/`, and record every completed gate with
      `review-ledger.py record <pr> --gate <gate> --result

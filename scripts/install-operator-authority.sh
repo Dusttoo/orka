@@ -41,6 +41,8 @@ trap 'rm -f "$temporary"' EXIT
 {
   printf 'Cmnd_Alias ORCHESTRATION_AUTHORITY_RUNTIME = '
   printf '%s consume-recovery --scope *, ' "$TARGET"
+  printf '%s activate-review-repair --scope *, ' "$TARGET"
+  printf '%s review-repair-grant --scope *, ' "$TARGET"
   printf '%s activate-budget --scope *, ' "$TARGET"
   printf '%s budget-ceiling --scope *, ' "$TARGET"
   printf '%s activate-relaunch --scope *, ' "$TARGET"

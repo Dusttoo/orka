@@ -113,6 +113,8 @@ contains_contract "root-authorized terminal recovery" 'recover-terminal' \
   commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
 contains_contract "root-authorized ticket relaunch ceiling" 'grant-relaunch' \
   commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
+contains_contract "root-authorized PR review continuation" 'authorize-repair' \
+  commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
 contains_contract "autonomous ticket decomposition" 'jira_decomposition\.py' \
   commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
 contains_contract "fresh ticket scoper preserves captain context" 'ticket-scoper' \

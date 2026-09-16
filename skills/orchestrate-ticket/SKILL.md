@@ -161,7 +161,8 @@ working directory.
    concerns are advisory and must not expand the ticket into infrastructure.
 
    The durable failure ledger owns this loop; do not track it in your own
-   context, which compacts. Open it once (`review-ledger.py open <pr>`), paste
+   context, which compacts. Open it once with the immutable ticket binding
+   (`review-ledger.py open <pr> --work-kind jira --work-id <ticket>`), paste
    `review-ledger.py brief <pr>` into every reviewer brief, and record every
    completed gate with `review-ledger.py record <pr> --gate <gate> --result
    .orchestration/.review-results/<gate>.json --head <exact-sha>

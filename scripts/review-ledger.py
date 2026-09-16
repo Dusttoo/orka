@@ -35,7 +35,12 @@ from review_permit import (
     consume_completion,
     subject_ledger_candidates,
 )
-from operator_authority import AuthorityError, restart_grant as authorized_restart_grant
+from operator_authority import (
+    AuthorityError,
+    activate_review_repair,
+    review_repair_grant,
+    restart_grant as authorized_restart_grant,
+)
 
 from runtime_state import (
     RuntimeStateError,
@@ -631,6 +636,24 @@ def restart_limits(state):
     return grant["allowances"] if grant else {}
 
 
+def operator_review_repair_grant(state: dict[str, Any]) -> dict[str, Any]:
+    """Read the live, root-owned PR repair grant without trusting ledger data."""
+    # Avoid invoking host authority for ordinary ledgers. This repository-owned
+    # marker is only a query hint, never authority: a forged marker still has to
+    # match a live root-owned grant before it can affect a decision.
+    if not state.get("operator_repair_grants"):
+        return {}
+    pr = str(state.get("pr") or "")
+    if not re.fullmatch(r"[1-9][0-9]{0,19}", pr):
+        return {}
+    repository = shared_repository_root(project_root()).resolve()
+    try:
+        grant = review_repair_grant(repository, pr)
+    except AuthorityError as exc:
+        raise LedgerError(str(exc)) from exc
+    return grant or {}
+
+
 def _current_generation_permits(state: dict[str, Any]) -> list[dict[str, Any]]:
     generation = int(state.get("review_generation", 1))
     return [
@@ -687,7 +710,15 @@ def decide(state: dict[str, Any]) -> dict[str, Any]:
     # receives round-one blocking authority.
     next_round = generation
     restart = restart_limits(state)
-    max_rounds = max(state["max_rounds"], restart.get("repair_cycles", 0))
+    operator_grant = operator_review_repair_grant(state)
+    operator_repair_ceiling = int(
+        operator_grant.get("ceiling_repair_cycles") or 0
+    )
+    max_rounds = max(
+        state["max_rounds"],
+        restart.get("repair_cycles", 0),
+        operator_repair_ceiling,
+    )
     # New ledgers count explicit completed repairs. Old v0.7 ledgers did not
     # record them, so retain their historical failed-pass count on load.
     if "repair_attempts" in state:
@@ -734,9 +765,11 @@ def decide(state: dict[str, Any]) -> dict[str, Any]:
     )
 
     cap_reached = not pending_review and fix_cycles >= max_rounds and bool(blocking)
+    escalation_acknowledged = bool(restart) or fix_cycles < operator_repair_ceiling
+    elif_escalated = state.get("escalated") and not escalation_acknowledged
     if gates_clear:
         action = ACTION_CLEAR
-    elif (state.get("escalated") and not restart) or cap_reached:
+    elif elif_escalated or cap_reached:
         action = ACTION_ESCALATE
     elif pending:
         action = ACTION_REDESIGN
@@ -748,6 +781,7 @@ def decide(state: dict[str, Any]) -> dict[str, Any]:
         "rounds_recorded": recorded,
         "next_round": next_round,
         "max_rounds": max_rounds,
+        "operator_repair_ceiling": operator_repair_ceiling,
         "fix_cycles": fix_cycles,
         "fix_cycles_remaining": max(0, max_rounds - fix_cycles),
         "next_scope_mode": FULL if generation == 1 else FROZEN,
@@ -1677,6 +1711,8 @@ def cmd_status(args: argparse.Namespace) -> None:
         {
             **decide(state),
             "work_subject": state["work_subject"],
+            "escalated": bool(state.get("escalated")),
+            "operator_repair_grants": state.get("operator_repair_grants", []),
             "components": components,
         }
     )
@@ -1930,6 +1966,58 @@ def cmd_escalate(args: argparse.Namespace) -> None:
         state["escalation_reason"] = args.reason
         save(path, state)
         emit({"escalated": True, "reason": args.reason, **decide(state)})
+
+
+def cmd_authorize_repair(args: argparse.Namespace) -> None:
+    """Consume root authority for a bounded post-escalation repair continuation."""
+    path = ledger_path(args)
+    with locked(path):
+        state = load(path)
+        plan = decide(state)
+        if not state.get("escalated") and not plan["cap_reached"]:
+            raise LedgerError("review ledger has not reached a repair escalation")
+        if state.get("repair_pending_review"):
+            raise LedgerError("the current repaired head still requires review completion")
+        if not plan["open_blocking"]:
+            raise LedgerError("review ledger has no blocking findings to repair")
+        try:
+            grant = activate_review_repair(
+                shared_repository_root(project_root()).resolve(),
+                str(state["pr"]),
+                operator_capability(args),
+            )
+        except AuthorityError as exc:
+            raise LedgerError(str(exc)) from exc
+        ceiling = int(grant["ceiling_repair_cycles"])
+        if ceiling <= plan["fix_cycles"]:
+            raise LedgerError(
+                "review repair ceiling must exceed the completed repair-cycle count"
+            )
+        state.setdefault("operator_repair_grants", []).append(
+            {
+                **grant,
+                "authorized_at": now(),
+                "fix_cycles_at_authorization": plan["fix_cycles"],
+            }
+        )
+        save(path, state)
+        emit(
+            {
+                "repair_authorized": True,
+                "grant_id": grant["grant_id"],
+                "reason": grant["reason"],
+                **decide(state),
+            }
+        )
+
+
+def operator_capability(args: argparse.Namespace) -> str:
+    if getattr(args, "operator_capability_stdin", False):
+        value = sys.stdin.readline().strip()
+        if not value:
+            raise LedgerError("operator capability stdin was empty")
+        return value
+    return str(getattr(args, "operator_capability", ""))
 
 
 def cmd_permit_review(args: argparse.Namespace) -> None:
@@ -2241,6 +2329,20 @@ def parser() -> argparse.ArgumentParser:
     escalate_parser.add_argument("pr")
     escalate_parser.add_argument("--reason", required=True)
     escalate_parser.set_defaults(func=cmd_escalate)
+
+    authorize_repair_parser = commands.add_parser(
+        "authorize-repair",
+        help="consume root authority for bounded repair after human escalation",
+    )
+    authorize_repair_parser.add_argument("pr")
+    repair_authority = authorize_repair_parser.add_mutually_exclusive_group(
+        required=True
+    )
+    repair_authority.add_argument("--operator-capability", help=argparse.SUPPRESS)
+    repair_authority.add_argument(
+        "--operator-capability-stdin", action="store_true"
+    )
+    authorize_repair_parser.set_defaults(func=cmd_authorize_repair)
 
     return result
 

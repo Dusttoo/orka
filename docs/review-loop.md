@@ -90,6 +90,25 @@ review-ledger.py redesign <pr> --key <key> --verdict PASS
 review-ledger.py handoff <pr>                 # the human escalation report
 ```
 
+An escalated ledger is immutable to workers. If a human decides that the same
+PR should receive more repair cycles, issue a PR-bound capability with an
+absolute lifetime ceiling and pipe it directly to the ledger:
+
+```text
+sudo /usr/local/libexec/orchestration-recovery-authority issue-review-repair \
+  --repository /absolute/repo --pr 123 --ceiling-repair-cycles 3 \
+  --reason "Approved one additional bounded repair after reviewing the handoff" \
+| python3 /absolute/plugin/scripts/review-ledger.py authorize-repair 123 \
+  --operator-capability-stdin
+```
+
+This acknowledges the escalation without deleting it. The command preserves
+every finding, gate result, repair attempt, and PR binding; it only raises the
+absolute repair-cycle ceiling. The effective ceiling is read from the live,
+root-owned grant on every decision; repository ledger edits cannot create
+authority. Reaching the ceiling, expiry, or root revocation restores the
+escalation stop.
+
 Pre-code design uses the same durable store keyed by ticket/change identifier:
 
 ```bash
