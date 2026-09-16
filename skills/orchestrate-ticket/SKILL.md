@@ -146,6 +146,9 @@ working directory.
    (PR number, branch, worktree, SELF_CHECK).
 
 4. **Gate.** Run the review gates on the PR concurrently against one exact head:
+   first run `version_policy.py --plugin-root <resolved-plugin-root> --config
+   .orchestration/config.yaml` and stop unless it reports `status: compatible`.
+   The permit and merge scripts repeat this minimum-version check mechanically.
    a fresh code-review role using `orchestration-code-reviewer.md` (no implementer context), and a fresh
    security-review role using `orchestration-security-reviewer.md` when the
    shared `orchestration-engine.py security-gate` decision requires it from the

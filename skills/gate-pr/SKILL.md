@@ -27,11 +27,20 @@ reading them:
 - `../../scripts/review-ledger.py`
 - `../../scripts/run-gates.sh`
 - `../../scripts/run-verification.sh`
+- `../../scripts/version_policy.py`
 
 Execute scripts by absolute path while keeping the target repository as the
 working directory.
 
 ## Procedure
+
+0. Validate the active runtime against repository policy before opening or
+   resuming a review:
+   `version_policy.py --plugin-root <resolved-plugin-root> --config
+   .orchestration/config.yaml`. Stop fail-closed unless it reports
+   `status: compatible`. `review-ledger.py permit-review` and
+   `merge-guard.sh` repeat this check mechanically, so an older runtime cannot
+   mint review authority or record/assert merge evidence.
 
 Before each `code-reviewer` or `security-reviewer` pass, resolve its route with
 `scripts/context_pipeline.py route --config .orchestration/config.yaml --role

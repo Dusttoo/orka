@@ -18,6 +18,7 @@ trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/repo/.orchestration"
 cp "$HERE"/../scripts/lib-config.sh "$HERE"/../scripts/merge-guard.sh \
    "$HERE"/../scripts/merge-on-green.sh "$HERE"/../scripts/orchestration-engine.py \
+   "$HERE"/../scripts/version_policy.py \
    "$TMP/repo/"
 printf 'integration_branch: develop\nproduction_branch: main\nmerge_to_integration: merge\n' > "$TMP/repo/.orchestration/config.yaml"
 cd "$TMP/repo" && git init -q

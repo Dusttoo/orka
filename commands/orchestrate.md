@@ -108,6 +108,10 @@ Steps:
    - A blocker names a concrete failing input/precondition, production path,
      wrong outcome/impact, and reproduction or exact falsifying assertion under
      the configured profile. Stronger-profile hypotheticals are advisory.
+   - Before the review loop, run `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/version_policy.py
+     --plugin-root ${CLAUDE_PLUGIN_ROOT} --config .orchestration/config.yaml` and
+     stop unless it reports `status: compatible`. Review permits and merge
+     evidence repeat this minimum-version check mechanically.
    - The durable failure ledger owns the loop. Open it once with the immutable
      ticket binding (`${CLAUDE_PLUGIN_ROOT}/scripts/review-ledger.py open <pr>
      --work-kind jira --work-id <ticket>`), paste

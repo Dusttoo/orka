@@ -35,6 +35,13 @@ orch_validate_config() {
   python3 "$(orch_engine)" validate-config >/dev/null
 }
 
+orch_assert_minimum_version() {
+  local active_version="${1:-}"
+  local args=(--plugin-root "$(orch_script_dir)/.." --config "$(orch_config_file)")
+  if [ -n "$active_version" ]; then args+=(--active-version "$active_version"); fi
+  python3 "$(orch_script_dir)/version_policy.py" "${args[@]}" >/dev/null
+}
+
 # --- location -----------------------------------------------------------------
 
 orch_project_root() {

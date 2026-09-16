@@ -16,6 +16,7 @@ trap 'rm -rf "$TMP" "$LANE"' EXIT
 git -C "$TMP" init -q .
 git -C "$TMP" -c user.name=Test -c user.email=test@example.com commit --allow-empty -qm initial
 mkdir -p "$TMP/.orchestration"
+printf 'minimum_orka_version: ""\n' > "$TMP/.orchestration/config.yaml"
 
 led() { (cd "$TMP" && python3 "$LEDGER" "$@"); }
 field() { python3 -c "import json,sys; v=json.load(sys.stdin)['$1']; print(','.join(v) if isinstance(v,list) else v)"; }
@@ -278,6 +279,13 @@ BLOCKED_REBIND_HEAD="$(git -C "$TMP" rev-parse HEAD)"
 if led rebind-generation rebind-blocked --head "$BLOCKED_REBIND_HEAD" --reason 'try to skip repair' >/dev/null 2>&1; then
   bad "new-head rebind cannot bypass open blocking findings"
 else ok "new-head rebind cannot bypass open blocking findings"; fi
+
+led open minimum-version-review >/dev/null
+printf 'minimum_orka_version: 99.0.0\n' > "$TMP/.orchestration/config.yaml"
+if led permit-review minimum-version-review --role code-reviewer --head "$BLOCKED_REBIND_HEAD" >/dev/null 2>&1; then
+  bad "review permits fail closed below the repository minimum Orka version"
+else ok "review permits fail closed below the repository minimum Orka version"; fi
+printf 'minimum_orka_version: ""\n' > "$TMP/.orchestration/config.yaml"
 
 # Recreate the exact legacy corruption: security PASS was stored as round one,
 # then code FAIL was scope-frozen as round two and its blocker became advisory.

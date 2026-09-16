@@ -49,6 +49,7 @@ from runtime_state import (
     shared_repository_root,
     working_repository_root,
 )
+from version_policy import VersionPolicyError, assert_minimum_version
 
 
 SCHEMA_VERSION = 1
@@ -2128,6 +2129,14 @@ def cmd_rebind_generation(args: argparse.Namespace) -> None:
 
 def cmd_permit_review(args: argparse.Namespace) -> None:
     """Issue one phase capability when durable ledger state allows review."""
+    try:
+        assert_minimum_version(
+            Path(__file__).resolve().parent.parent,
+            canonical_config_path(project_root()),
+            allow_missing_config=True,
+        )
+    except (RuntimeStateError, VersionPolicyError) as exc:
+        raise LedgerError(f"review gate runtime is incompatible: {exc}") from exc
     actual_head = exact_repository_head(args.head)
     path = ledger_path(args)
     with locked(path):

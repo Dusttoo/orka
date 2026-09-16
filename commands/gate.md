@@ -8,7 +8,13 @@ mutation:
 
 ```bash
 ${CLAUDE_PLUGIN_ROOT}/scripts/orchestration-engine.py validate-config
+python3 ${CLAUDE_PLUGIN_ROOT}/scripts/version_policy.py \
+  --plugin-root ${CLAUDE_PLUGIN_ROOT} --config .orchestration/config.yaml
 ```
+
+Stop fail-closed unless the version check reports `status: compatible`.
+`review-ledger.py permit-review` and `merge-guard.sh` repeat this check
+mechanically before review or merge authority is created.
 
 For `schema_version: 2`, use the configured transition plan for the target gate
 or merge transition. Branch roles, evidence, approvals, CI categories, and

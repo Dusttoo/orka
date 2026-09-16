@@ -6,8 +6,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import re
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from version_policy import VersionPolicyError, assert_minimum_version, release_version
 
 
 REQUIRED = (
@@ -16,6 +19,7 @@ REQUIRED = (
     "scripts/api_agent.py",
     "scripts/provider_health.py",
     "scripts/runtime_smoke.py",
+    "scripts/version_policy.py",
     "scripts/native_gateway.py",
     "scripts/codex_gateway.py",
     "scripts/ticket_dependencies.py",
@@ -23,13 +27,6 @@ REQUIRED = (
     "skills/orchestrate-sprint/SKILL.md",
     "skills/orchestrate-ticket/SKILL.md",
 )
-
-
-def release_version(value: str) -> tuple[int, int, int]:
-    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:\+[0-9A-Za-z.-]+)?", value)
-    if not match:
-        raise ValueError(f"invalid Orka release version: {value}")
-    return tuple(int(part) for part in match.groups())
 
 
 def main() -> int:
@@ -55,28 +52,18 @@ def main() -> int:
     if failures:
         print(json.dumps({"status": "blocked", "missing": failures}, indent=2))
         return 2
-    from api_agent import load_yaml
-    minimum_version = str(load_yaml(config).get("minimum_orka_version") or "").strip()
-    if minimum_version:
-        try:
-            if release_version(version) < release_version(minimum_version):
-                print(json.dumps({
-                    "status": "blocked",
-                    "installation_status": "incompatible",
-                    "plugin_version": version,
-                    "minimum_orka_version": minimum_version,
-                    "reason": "active Orka version is below repository minimum",
-                }, indent=2))
-                return 2
-        except ValueError as exc:
-            print(json.dumps({
-                "status": "blocked",
-                "installation_status": "incompatible",
-                "plugin_version": version,
-                "minimum_orka_version": minimum_version,
-                "reason": str(exc),
-            }, indent=2))
-            return 2
+    try:
+        policy = assert_minimum_version(plugin, config, active_version=version)
+    except VersionPolicyError as exc:
+        print(json.dumps({
+            "status": "blocked",
+            "installation_status": "incompatible",
+            "plugin_version": exc.plugin_version or version,
+            "minimum_orka_version": exc.minimum_version,
+            "reason": str(exc),
+        }, indent=2))
+        return 2
+    minimum_version = str(policy.get("minimum_orka_version") or "")
     digest = hashlib.sha256()
     for relative in REQUIRED:
         digest.update(relative.encode())

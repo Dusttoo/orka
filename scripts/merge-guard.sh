@@ -96,6 +96,10 @@ assert_green() {
     echo "merge-guard: REFUSED: could not resolve plugin version or configured target branch." >&2
     return 2
   fi
+  if ! orch_assert_minimum_version "$plugin_version"; then
+    echo "merge-guard: REFUSED: active Orka runtime does not satisfy the repository minimum version." >&2
+    return 2
+  fi
 
   mark_version="$(marker_value "$marker" plugin_version)"
   mark_head_branch="$(marker_value "$marker" head_branch)"
@@ -168,6 +172,10 @@ case "${1:-}" in
     fi
     if [ -z "$PLUGIN_VERSION" ]; then
       echo "merge-guard: REFUSED: could not resolve active plugin version." >&2
+      exit 2
+    fi
+    if ! orch_assert_minimum_version "$PLUGIN_VERSION"; then
+      echo "merge-guard: REFUSED: active Orka runtime does not satisfy the repository minimum version." >&2
       exit 2
     fi
     if [ "$BASE_BRANCH" != "$TARGET_BRANCH" ]; then
