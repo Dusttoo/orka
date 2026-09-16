@@ -1312,6 +1312,108 @@ class ResilienceTests(unittest.TestCase):
         self.assertEqual(reserved["attempts"], 2)
         self.assertTrue(reserved["attempt_token"].startswith("attempt_"))
 
+    def test_terminal_recovery_bridges_tokenless_preserved_repair_to_reserve(self):
+        self.ticket(
+            "PROJ-1",
+            "needs_repair",
+            raw_status="In Progress",
+            attempts=1,
+            branch="feat/proj-1",
+            pr="https://example.test/pull/46",
+            attempt_token="",
+            run_ref="",
+            worker_identity="",
+            launch_evidence={},
+            attach_capability="",
+            attached_at="",
+            attempt_capability={},
+            recovery_binding={},
+            history=[{"event": "operator-restart"}],
+        )
+        path = controller.state_path(self.cfg["state_dir"], "1")
+        controller.save(path, self.state)
+        recovery_args = argparse.Namespace(
+            sprint="1",
+            ticket="PROJ-1",
+            reason="recover preserved repair after tokenless restart",
+            operator_capability="recovery",
+            operator_capability_stdin=False,
+        )
+        with (
+            patch.object(controller, "consume_recovery") as consume,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            controller.recover_terminal(recovery_args, self.cfg)
+        consume.assert_called_once_with(self.cfg["shared_root"], "PROJ-1", 1, "recovery")
+        recovered = controller.load(path)["tickets"]["PROJ-1"]
+        self.assertEqual(recovered["state"], "pending")
+        self.assertEqual(recovered["branch"], "feat/proj-1")
+        self.assertEqual(recovered["pr"], "https://example.test/pull/46")
+        self.assertEqual(recovered["attempt_token"], "")
+        self.assertEqual(recovered["history"][-1]["previous_state"], "needs_repair")
+        self.assertIn(
+            "PROJ-1", controller.plan_value(controller.load(path), self.cfg)["launch"]
+        )
+
+        reserve_args = argparse.Namespace(
+            sprint="1",
+            ticket="PROJ-1",
+            run_ref="repair-2",
+            run_id="repair-2",
+            role="sprint-worker",
+            worker_ref="repair-2",
+        )
+        with (
+            patch.object(controller, "usage_snapshots", return_value={}),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            controller.reserve(reserve_args, self.cfg)
+        reserved = controller.load(path)["tickets"]["PROJ-1"]
+        self.assertEqual(reserved["state"], "running")
+        self.assertEqual(reserved["attempts"], 2)
+        self.assertTrue(reserved["attempt_token"].startswith("attempt_"))
+
+    def test_terminal_recovery_rejects_unsafe_needs_repair_variants(self):
+        args = argparse.Namespace(
+            sprint="1",
+            ticket="PROJ-1",
+            reason="unsafe recovery",
+            operator_capability="recovery",
+            operator_capability_stdin=False,
+        )
+        unsafe = (
+            {"attempt_token": "current"},
+            {"attempt_token": "", "pr": ""},
+            {"attempt_token": "", "worker_identity": {"kind": "execution_unit"}},
+            {"attempt_token": "", "launch_evidence": {"status": "launched"}},
+        )
+        for update in unsafe:
+            with self.subTest(update=update):
+                self.state["tickets"] = {}
+                fields = dict(
+                    attempts=1,
+                    branch="feat/proj-1",
+                    pr="https://example.test/pull/46",
+                    attempt_token="",
+                    run_ref="",
+                    worker_identity="",
+                    launch_evidence={},
+                    attach_capability="",
+                    attached_at="",
+                    attempt_capability={},
+                    recovery_binding={},
+                )
+                fields.update(update)
+                self.ticket("PROJ-1", "needs_repair", **fields)
+                path = controller.state_path(self.cfg["state_dir"], "1")
+                controller.save(path, self.state)
+                with (
+                    patch.object(controller, "consume_recovery") as consume,
+                    self.assertRaises(controller.SprintError),
+                ):
+                    controller.recover_terminal(args, self.cfg)
+                consume.assert_not_called()
+
     def test_supervisor_error_records_exit_before_terminal_receipt(self):
         root = self.cfg["shared_root"]
         self.cfg["config"] = root / "config.yaml"

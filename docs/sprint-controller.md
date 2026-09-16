@@ -323,10 +323,14 @@ sudo /usr/local/libexec/orchestration-recovery-authority issue-recovery \
 ```
 
 `blocked`, `external_blocked`, `operator_decision`, and legacy `user_action`
-entries can use terminal recovery after their cause is resolved. The command
-records the reason, consumes the capability exactly once, clears stale launch
-identity, and returns the ticket to `pending`; the next normal `plan`/`reserve`
-creates a fresh fenced attempt.
+entries can use terminal recovery after their cause is resolved. A
+`needs_repair` entry may also use it only when an older recovery preserved its
+PR and branch but left no attempt token, run reference, worker identity, launch
+evidence, or recovery binding. That narrow bridge still requires the same
+one-shot capability and refuses a current or ambiguous execution attempt. The
+command records the prior state and reason, consumes the capability exactly
+once, clears stale launch identity, and returns the ticket to `pending`; the
+next normal `plan`/`reserve` creates a fresh fenced attempt.
 
 `concurrency_max` is a ticket-lane limit. The host separately admits local
 builds, full test suites, and browser runs under `max_heavy_processes`; model
