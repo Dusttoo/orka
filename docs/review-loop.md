@@ -66,7 +66,9 @@ else serves.
   repair reports, not review passes, so concurrent code and security gates
   consume one attempt together. Neither cap permits a merge with blockers.
 - **A repair is a checkable artifact.** `repair-brief` emits one deduplicated set
-  of finding IDs. `record-repair` requires root cause, change, and verification
+  of finding IDs. When several gates block the same component, it lists each
+  gate's explanation labelled by gate (`[code-review]`, `[security-review]`), as
+  does `handoff`. `record-repair` requires root cause, change, and verification
   for every ID. `complete-repair-review` closes an attempt only after every
   required gate reviews that exact head.
 
@@ -211,6 +213,12 @@ The next attempt requires a fresh permit and retains all billable usage and
 execution-attempt accounting. Token-count failures before submission also allow
 a fresh permit. Uncertain submissions and nonterminal provider responses remain
 fenced for reconciliation; they cannot authorize another reviewer.
+`permit-review` names the started permit's token prefix and run, then points at
+recovery: `api_agent.py reconcile --run-id <run>` closes the reservation and
+cancels the permit, and `review-ledger.py
+cancel-permit <pr> --phase-permit <token> --reason <text>` releases a permit
+that is still started once no usage reservation for it remains open. Neither path creates a PASS receipt; see
+[API agent submission recovery](api-agent.md#submission-recovery).
 
 ## The security gate is exempt
 

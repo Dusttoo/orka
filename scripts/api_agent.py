@@ -44,8 +44,11 @@ from operator_authority import (
 from review_permit import (
     ReviewPermitError,
     cancel_started as cancel_review_permit,
+    cancel_unresolved as cancel_unresolved_review_permit,
     complete as complete_review_permit,
     consume as consume_review_permit,
+    token_digest as review_token_digest,
+    token_prefix as review_token_prefix,
 )
 from runtime_state import (
     RuntimeStateError,
@@ -2467,22 +2470,34 @@ class ApiAgent:
                 raise AgentError(
                     "cannot bind review authorization to repository HEAD"
                 ) from exc
+            review_ledger_dir = str(
+                self.config.get("review_ledger_dir") or ".orchestration/.review-ledger"
+            )
             try:
                 self.logical_review_id = consume_review_permit(
                     shared_root=self.shared_root,
-                    ledger_dir=str(
-                        self.config.get("review_ledger_dir")
-                        or ".orchestration/.review-ledger"
-                    ),
+                    ledger_dir=review_ledger_dir,
                     pr=self.review_pr,
                     token=self.review_authorization,
                     role=self.role,
                     head=head,
                     timestamp=utc_now(),
+                    run_id=self.run_id,
                 )
             except ReviewPermitError as exc:
                 raise AgentError(str(exc)) from exc
             self._active_review_head = head
+            # Reconciliation must find this permit after the process is gone.
+            # The run state binds it by digest, never by the bearer token.
+            self.state["review_permit"] = {
+                "pr": str(self.review_pr),
+                "role": self.role,
+                "head": head.lower(),
+                "ledger_dir": review_ledger_dir,
+                "token_sha256": review_token_digest(self.review_authorization),
+                "token_prefix": review_token_prefix(self.review_authorization),
+                "logical_review_id": self.logical_review_id,
+            }
         self._save(status="ready", request=request)
         body = request
         transcript: list[dict[str, Any]] = []
@@ -3079,6 +3094,10 @@ def reconcile_run(args: argparse.Namespace, root: Path) -> dict[str, Any]:
         )
         status = "reconciled_completed"
         state.setdefault("response_ids", []).append(args.response_id)
+    # Money is closed first; a failure above leaves the permit untouched. The
+    # permit step is idempotent, so a crash before the state write is repaired
+    # by rerunning this command.
+    permit = release_reconciled_review_permit(root, state, args.run_id, args.outcome)
     state.update(
         {
             "status": status,
@@ -3088,14 +3107,79 @@ def reconcile_run(args: argparse.Namespace, root: Path) -> dict[str, Any]:
             "reconciled_at": utc_now(),
         }
     )
+    if permit is not None:
+        state["review_permit_reconciliation"] = permit
     atomic_json(state_path, state)
-    return {
+    output = {
         "run_id": args.run_id,
         "status": status,
         "cost_usd": str(cost),
         "state": str(state_path),
         "usage": ledger.summary(),
     }
+    if permit is not None:
+        output["review_permit"] = permit
+    return output
+
+
+RECONCILABLE_REVIEWER_ROLES = {"design-reviewer", "code-reviewer", "security-reviewer"}
+
+
+def release_reconciled_review_permit(
+    root: Path, state: dict[str, Any], run_id: str, outcome: str
+) -> dict[str, Any] | None:
+    """Cancel the started review permit of a reconciled reviewer run.
+
+    Reconciliation never has validated structured review output, so it can
+    never yield a completion receipt or PASS: whether the provider found no
+    request or completed one, the review must run again under a new permit.
+    An already terminal permit is reported rather than failing reconciliation.
+    """
+    if state.get("role") not in RECONCILABLE_REVIEWER_ROLES:
+        return None
+    binding = state.get("review_permit")
+    if not isinstance(binding, dict) or not binding.get("token_sha256"):
+        return {
+            "status": "unbound",
+            "message": (
+                "this run state predates review permit binding; if permit-review "
+                "still reports a started review, run review-ledger.py cancel-permit "
+                "<pr> --phase-permit <token> --reason <text>"
+            ),
+        }
+    try:
+        result = cancel_unresolved_review_permit(
+            shared_root=root,
+            ledger_dir=str(binding.get("ledger_dir") or ".orchestration/.review-ledger"),
+            pr=str(binding.get("pr") or ""),
+            role=str(binding.get("role") or ""),
+            head=str(binding.get("head") or ""),
+            token_sha256=str(binding["token_sha256"]),
+            reason=(
+                f"api_agent reconcile {run_id} ({outcome}): no validated review "
+                "output or completion receipt exists"
+            ),
+            timestamp=utc_now(),
+        )
+    except (ReviewPermitError, OSError, json.JSONDecodeError) as exc:
+        return {
+            "status": "error",
+            "error": str(exc),
+            "message": (
+                "provider usage is reconciled but the review permit was not "
+                "cancelled; run review-ledger.py cancel-permit "
+                f"{binding.get('pr')} --phase-permit <token> --reason <text>"
+            ),
+        }
+    result["pr"] = binding.get("pr")
+    if result["status"] == "cancelled":
+        result["message"] = (
+            "provider usage was settled but no review output was validated or "
+            "receipted; the review permit is cancelled and the review must be re-run"
+            if outcome == "completed"
+            else "the review permit is cancelled; issue a new permit to re-run the review"
+        )
+    return result
 
 
 GATEWAY_RESERVATION_ORIGINS = {"native-gateway", "codex-gateway"}
@@ -3658,6 +3742,11 @@ def reconcile_reservation_manifest(
                         "reconciled_at": utc_now(),
                     }
                 )
+                permit = release_reconciled_review_permit(
+                    root, state, run_id, "not-found"
+                )
+                if permit is not None:
+                    state["review_permit_reconciliation"] = permit
                 atomic_json(binding["state_path"], state)
             elif not already_done:
                 # Durable evidence precedes the ledger change; replay after a

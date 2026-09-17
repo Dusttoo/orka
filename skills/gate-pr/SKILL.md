@@ -54,7 +54,11 @@ issues it only while that gate is the permitted next phase, and it cannot be
 reused. This is sequencing, not human authentication.
 Desktop fallback is allowed only before provider
 acknowledgement; submitted, timed-out, or uncertain work must be reconciled
-instead of duplicated.
+instead of duplicated. If `permit-review` reports a started review, reconcile
+that run with `api_agent.py reconcile --run-id <run>`, which also cancels its
+permit; if the permit is still started afterwards, run `review-ledger.py
+cancel-permit <pr> --phase-permit <token> --reason <text>`. Either way the
+review re-runs under a new permit; no PASS is ever inferred.
 For a native desktop reviewer, write its final structured JSON first, then run
 `review-ledger.py complete-review <pr> --role <role>
 --phase-permit <token> --result <file>`. `complete-review` is for desktop

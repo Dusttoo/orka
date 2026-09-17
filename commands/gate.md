@@ -36,7 +36,11 @@ and pipe it to `${CLAUDE_PLUGIN_ROOT}/scripts/api_agent.py run --request -
 from the valid ledger phase with `review-ledger.py permit-review <pr>
 --role <role> --head <full-exact-head>`. Desktop fallback is permitted only before provider
 acknowledgement; a provider id, timeout after submission, or uncertain state
-must be reconciled and never duplicated.
+must be reconciled and never duplicated. If `permit-review` reports a started
+review, reconcile that run with `api_agent.py reconcile --run-id <run>`, which
+also cancels its permit; if the permit is still started afterwards, run
+`review-ledger.py cancel-permit <pr> --phase-permit <token> --reason <text>`.
+Either way the review re-runs under a new permit; no PASS is ever inferred.
 
 `permit-review` binds the local `git rev-parse HEAD`, because reviewers and
 receipts read the local tree. When the current checkout is not at the exact PR

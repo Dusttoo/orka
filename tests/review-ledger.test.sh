@@ -659,6 +659,113 @@ led complete-repair-review recorded-alias >/dev/null
 eq "staged recording resolves persisted aliases" "src/a.ts:canonical" \
   "$(led status recorded-alias | field open_blocking)"
 
+# --- operator cancellation of a started review permit -------------------------
+led open cancel-permit-cli >/dev/null
+CANCEL_CLI_HEAD="$(git -C "$TMP" rev-parse HEAD)"
+UNSTARTED_PERMIT="$(led permit-review cancel-permit-cli --role code-reviewer --head "$CANCEL_CLI_HEAD" | field review_phase_permit)"
+if led cancel-permit cancel-permit-cli --phase-permit "$UNSTARTED_PERMIT" --reason "not started" >/dev/null 2> "$TMP/cancel-unstarted-error"; then
+  bad "cancel-permit refuses an unstarted permit"
+elif grep -q 'reissues it' "$TMP/cancel-unstarted-error"; then
+  ok "cancel-permit refuses an unstarted permit"
+else bad "cancel-permit explains idempotent reissue for an unstarted permit"; fi
+python3 - "$TMP" "$UNSTARTED_PERMIT" "$CANCEL_CLI_HEAD" "$LEDGER" <<'PY'
+import importlib.util,sys
+from pathlib import Path
+spec=importlib.util.spec_from_file_location("review_permit",str(Path(sys.argv[4]).with_name("review_permit.py")))
+module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+module.consume(shared_root=Path(sys.argv[1]),ledger_dir=".orchestration/.review-ledger",pr="cancel-permit-cli",token=sys.argv[2],role="code-reviewer",head=sys.argv[3],timestamp="start")
+PY
+if led permit-review cancel-permit-cli --role code-reviewer --head "$CANCEL_CLI_HEAD" >/dev/null 2> "$TMP/started-refusal"; then
+  bad "a started permit blocks another reviewer"
+elif grep -q "permit ${UNSTARTED_PERMIT:0:14}" "$TMP/started-refusal" \
+  && ! grep -q "$UNSTARTED_PERMIT" "$TMP/started-refusal" \
+  && grep -q 'api_agent.py reconcile' "$TMP/started-refusal" \
+  && grep -q 'cancel-permit cancel-permit-cli' "$TMP/started-refusal"; then
+  ok "started-permit refusal names the permit prefix and both recovery commands"
+else bad "started-permit refusal names the permit prefix and both recovery commands"; fi
+if led cancel-permit cancel-permit-cli --phase-permit "$UNSTARTED_PERMIT" --role security-reviewer --reason "wrong role" >/dev/null 2>&1; then
+  bad "cancel-permit refuses a mismatched role"
+else ok "cancel-permit refuses a mismatched role"; fi
+eq "cancel-permit cancels a started permit with no open provider work" "cancelled" \
+  "$(led cancel-permit cancel-permit-cli --phase-permit "$UNSTARTED_PERMIT" --role code-reviewer --reason 'reviewer process was killed' | python3 -c 'import json,sys; print(json.load(sys.stdin)["permit_cancelled"]["status"])')"
+eq "cancel-permit records its reason without a receipt" "reviewer process was killed|" \
+  "$(python3 -c 'import json,sys; p=next(p for p in json.load(open(sys.argv[1]))["review_permits"] if p["token"]==sys.argv[2]); print(p["cancellation_reason"]+"|"+p["completion_receipt"])' "$(led open cancel-permit-cli | field ledger)" "$UNSTARTED_PERMIT")"
+if led cancel-permit cancel-permit-cli --phase-permit "$UNSTARTED_PERMIT" --reason "again" >/dev/null 2>&1; then
+  bad "cancel-permit refuses an already cancelled permit"
+else ok "cancel-permit refuses an already cancelled permit"; fi
+RECOVERED_PERMIT="$(led permit-review cancel-permit-cli --role code-reviewer --head "$CANCEL_CLI_HEAD" | field review_phase_permit)"
+if [ -n "$RECOVERED_PERMIT" ] && [ "$RECOVERED_PERMIT" != "$UNSTARTED_PERMIT" ]; then
+  ok "a cancelled permit frees the gate for a new permit"
+else bad "a cancelled permit frees the gate for a new permit"; fi
+led complete-review cancel-permit-cli --role code-reviewer --phase-permit "$RECOVERED_PERMIT" --result "$TMP/concurrent-code.json" >/dev/null
+if led cancel-permit cancel-permit-cli --phase-permit "$RECOVERED_PERMIT" --reason "completed" >/dev/null 2> "$TMP/cancel-completed-error"; then
+  bad "cancel-permit refuses a completed permit"
+elif grep -q 'completion receipt' "$TMP/cancel-completed-error"; then
+  ok "cancel-permit refuses a completed permit"
+else bad "cancel-permit explains a completed permit refusal"; fi
+
+# --- repair briefs keep every gate's explanation for a shared component -------
+cat > "$TMP/shared-code-fail.json" <<'JSON'
+{"schema_version":1,"gate":"code-review","verdict":"FAIL","checks":[{"name":"review","status":"fail"}],"findings":[{"component":".github/workflows/owner-qa-hold.yml:owner-qa-hold","disposition":"blocking","severity":"high","title":"Hold never releases","explanation":"CODE-EXPLANATION the hold label is never removed after owner QA passes.","regression":false}]}
+JSON
+cat > "$TMP/shared-security-fail.json" <<'JSON'
+{"schema_version":1,"gate":"security-review","verdict":"FAIL","checks":[{"name":"review","status":"fail"}],"findings":[{"component":".github/workflows/owner-qa-hold.yml:owner-qa-hold","disposition":"blocking","severity":"high","title":"Untrusted checkout with secrets","explanation":"SECURITY-EXPLANATION pull_request_target checks out fork code with write secrets.","regression":false}]}
+JSON
+shared_gate_record() {
+  local pr="$1" gate="$2" file="$3" head permit
+  head="$(git -C "$TMP" rev-parse HEAD)"
+  permit="$(led permit-review "$pr" --role "$gate-reviewer" --head "$head" | field review_phase_permit)" || return
+  led complete-review "$pr" --role "$gate-reviewer" --phase-permit "$permit" --result "$file" >/dev/null || return
+  led record "$pr" --gate "$gate-review" --result "$file" --head "$head" --phase-permit "$permit" >/dev/null
+}
+for order in code-first security-first; do
+  led open "shared-brief-$order" >/dev/null
+  if [ "$order" = code-first ]; then first=code; second=security; else first=security; second=code; fi
+  shared_gate_record "shared-brief-$order" "$first" "$TMP/shared-$first-fail.json"
+  shared_gate_record "shared-brief-$order" "$second" "$TMP/shared-$second-fail.json"
+  brief="$(led repair-brief "shared-brief-$order")"
+  if printf '%s' "$brief" | grep -q '\[code-review\] Hold never releases: CODE-EXPLANATION' \
+    && printf '%s' "$brief" | grep -q '\[security-review\] Untrusted checkout with secrets: SECURITY-EXPLANATION'; then
+    ok "repair brief keeps both gate explanations for a shared component ($order)"
+  else
+    printf 'FAIL repair brief keeps both gate explanations for a shared component (%s)\n%s\n' "$order" "$brief"; fails=$((fails + 1))
+  fi
+  eq "repair brief labels gates in stable order ($order)" "code-review,security-review" \
+    "$(printf '%s' "$brief" | sed -n 's/^  \[\([a-z-]*\)\].*/\1/p' | paste -sd, -)"
+  handoff="$(led handoff "shared-brief-$order")"
+  if printf '%s' "$handoff" | grep -q 'CODE-EXPLANATION' && printf '%s' "$handoff" | grep -q 'SECURITY-EXPLANATION'; then
+    ok "handoff keeps both gate explanations for a shared component ($order)"
+  else bad "handoff keeps both gate explanations for a shared component ($order)"; fi
+done
+SHARED_HEAD="$(git -C "$TMP" rev-parse HEAD)"
+cat > "$TMP/shared-repair.json" <<JSON
+{"schema_version":1,"head":"$SHARED_HEAD","findings":[{"component":".github/workflows/owner-qa-hold.yml:owner-qa-hold","status":"closed","root_cause":"hold","change":"release hold","verification":"workflow regression"}]}
+JSON
+led record-repair shared-brief-code-first --report "$TMP/shared-repair.json" >/dev/null
+shared_gate_record shared-brief-code-first security "$TMP/shared-security-fail.json"
+shared_gate_record shared-brief-code-first code "$TMP/shared-code-fail.json"
+led complete-repair-review shared-brief-code-first >/dev/null
+staged_brief="$(led repair-brief shared-brief-code-first)"
+if printf '%s' "$staged_brief" | grep -q '\[code-review\].*CODE-EXPLANATION' \
+  && printf '%s' "$staged_brief" | grep -q '\[security-review\].*SECURITY-EXPLANATION'; then
+  ok "staged repair finalization keeps both gate explanations"
+else printf 'FAIL staged repair finalization keeps both gate explanations\n%s\n' "$staged_brief"; fails=$((fails + 1)); fi
+python3 - "$TMP/.orchestration/.review-ledger" <<'PY'
+import json,sys
+from pathlib import Path
+path=next(p for p in Path(sys.argv[1]).glob("subject-*.json") if json.loads(p.read_text()).get("pr") == "shared-brief-security-first")
+state=json.loads(path.read_text())
+for component in state["components"].values(): component.pop("findings_by_gate", None)
+path.write_text(json.dumps(state, indent=2, sort_keys=True)+"\n")
+PY
+legacy_brief="$(led repair-brief shared-brief-security-first)"
+if printf '%s' "$legacy_brief" | grep -q '^  Hold never releases: CODE-EXPLANATION'; then
+  ok "legacy single-finding ledgers still render in the repair brief"
+else printf 'FAIL legacy single-finding ledgers still render in the repair brief\n%s\n' "$legacy_brief"; fails=$((fails + 1)); fi
+if led handoff shared-brief-security-first | grep -q 'CODE-EXPLANATION'; then
+  ok "legacy single-finding ledgers still render in the handoff"
+else bad "legacy single-finding ledgers still render in the handoff"; fi
+
 # --- v0.7 ledgers preserve their already-spent budget -------------------------
 cat > "$TMP/.orchestration/.review-ledger/pr-legacy.json" <<'JSON'
 {"schema_version":1,"pr":"legacy","created_at":"2026-01-01T00:00:00+00:00","updated_at":"2026-01-01T00:00:00+00:00","max_rounds":2,"rounds":[{"round":1,"gate":"code-review","scope_mode":"full-authority","claimed_verdict":"FAIL","effective_verdict":"FAIL","recorded_at":"2026-01-01T00:00:00+00:00","blocking":["src/a.ts:foo"],"advisory":[],"resolved":[]}],"components":{"src/a.ts:foo":{"key":"src/a.ts:foo","display":"src/a.ts:foo","strikes":1,"status":"open","first_round":1,"last_round":1,"rounds":[1],"gates":["code-review"],"redesigned_at_strike":0}},"escalated":false}

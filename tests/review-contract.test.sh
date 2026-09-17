@@ -108,11 +108,18 @@ for file in skills/orchestrate-ticket/SKILL.md skills/gate-pr/SKILL.md commands/
 done
 
 for file in skills/gate-pr/SKILL.md commands/gate.md docs/review-loop.md; do
+  require_text "$file" "api_agent.py reconcile --run-id <run>" \
+    "started review recovery reconciles the provider run first"
+  require_text "$file" "cancel-permit <pr> --phase-permit <token> --reason <text>" \
+    "started review recovery names the operator permit cancellation"
   require_text "$file" "record-security-gate" \
     "the security-gate decision is bound to the review generation"
   require_text "$file" "git worktree add --detach" \
     "reviews of a PR head outside the checkout use a detached worktree"
 done
+require_text docs/api-agent.md "cancel-permit" "reconciliation documents permit cancellation"
+require_text docs/api-agent.md "never creates a receipt" "permit cancellation never creates a receipt"
+require_text docs/review-loop.md "labelled by gate" "repair briefs keep every gate's explanation"
 for file in skills/gate-pr/SKILL.md commands/gate.md; do
   require_text "$file" '`complete-review` is for desktop' \
     "API reviewer runs record directly instead of re-completing their permit"

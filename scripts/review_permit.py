@@ -10,7 +10,7 @@ import os
 import re
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 class ReviewPermitError(RuntimeError):
@@ -84,6 +84,7 @@ def consume(
     role: str,
     head: str,
     timestamp: str,
+    run_id: str | None = None,
 ) -> str:
     path = ledger_path(shared_root, ledger_dir, pr)
     lock_path = path.with_suffix(path.suffix + ".lock")
@@ -121,6 +122,8 @@ def consume(
         if permit.get("review_generation", 1) != state.get("review_generation", 1):
             raise ReviewPermitError("review phase changed after this permit was issued")
         permit["started_at"] = timestamp
+        if run_id:
+            permit["run_id"] = run_id
         _save(path, state)
         return canonical_digest({key: permit.get(key) for key in (
             "work_subject", "role", "head", "review_generation", "design_round_count")})
@@ -341,3 +344,115 @@ def consumed_permit(state: dict[str, Any], token: str, *, role: str, head: str) 
         and not item.get("superseded_at")
         for item in state.get("review_permits", [])
     )
+
+
+def token_digest(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def token_prefix(token: str) -> str:
+    """A non-authorizing handle that names a permit in operator messages."""
+    return token[:14] + "..."
+
+
+def logical_review_id(permit: dict[str, Any]) -> str:
+    """The id `consume` returns and usage reservations record for this review."""
+    return canonical_digest(
+        {
+            key: permit.get(key)
+            for key in (
+                "work_subject",
+                "role",
+                "head",
+                "review_generation",
+                "design_round_count",
+            )
+        }
+    )
+
+
+def cancel_unresolved(
+    *,
+    shared_root: Path,
+    ledger_dir: str,
+    pr: str,
+    reason: str,
+    timestamp: str,
+    token: str | None = None,
+    token_sha256: str | None = None,
+    role: str | None = None,
+    head: str | None = None,
+    guard: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Cancel a started, incomplete permit once its provider work is settled.
+
+    Reconciliation and the operator command share this transition. A permit
+    that is already terminal is reported, not raised, so a caller that already
+    settled money never reports that settlement as failed. `guard` runs under
+    the ledger lock immediately before cancellation and raises to refuse it.
+    Cancellation never creates a completion receipt.
+    """
+    if not reason.strip():
+        raise ReviewPermitError("permit cancellation requires a reason")
+    if (token is None) == (token_sha256 is None):
+        raise ReviewPermitError("permit cancellation requires exactly one token binding")
+    digest = token_sha256 if token is None else token_digest(token)
+    path = ledger_path(shared_root, ledger_dir, pr)
+    if not path.is_file():
+        raise ReviewPermitError("review phase permit ledger does not exist")
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        state = json.loads(path.read_text(encoding="utf-8"))
+        permit = next(
+            (
+                item
+                for item in state.get("review_permits", [])
+                if token_digest(str(item.get("token") or "")) == digest
+            ),
+            None,
+        )
+        if not permit:
+            raise ReviewPermitError("no review phase permit matches this token")
+        if (
+            permit.get("work_subject") != state.get("work_subject")
+            or (role is not None and permit.get("role") != role)
+            or (head is not None and permit.get("head") != head.lower())
+        ):
+            raise ReviewPermitError(
+                "review phase permit does not match work subject, role, and exact head"
+            )
+        outcome: dict[str, Any] = {
+            "token_prefix": token_prefix(str(permit["token"])),
+            "role": permit.get("role"),
+            "head": permit.get("head"),
+            "review_generation": permit.get("review_generation", 1),
+            "run_id": permit.get("run_id") or "",
+        }
+        if permit.get("cancelled_at"):
+            return {
+                **outcome,
+                "status": "already_cancelled",
+                "cancelled_at": permit["cancelled_at"],
+            }
+        if permit.get("superseded_at"):
+            return {
+                **outcome,
+                "status": "superseded",
+                "superseded_at": permit["superseded_at"],
+            }
+        if permit.get("completion_receipt"):
+            return {**outcome, "status": "completed"}
+        if not permit.get("started_at"):
+            return {**outcome, "status": "not_started"}
+        if guard is not None:
+            guard(permit)
+        permit.update(
+            {
+                "cancelled_at": timestamp,
+                "receipt_consumed_at": timestamp,
+                "cancellation_reason": reason.strip(),
+            }
+        )
+        _save(path, state)
+        return {**outcome, "status": "cancelled", "cancelled_at": timestamp}

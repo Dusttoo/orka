@@ -248,6 +248,32 @@ id, and the provider-reported token counts. This settles actual cost, but the
 controller must still inspect the recovered result before advancing workflow
 state. Never release an uncertain reservation merely to make budget available.
 
+A reviewer run records its review permit binding (PR, role, exact head, ledger
+directory, logical review id, and a SHA-256 digest and short prefix of the
+token, never the token itself) in its run marker. Reconciling that run closes
+the money first and then cancels the started permit, reported under
+`review_permit` in the output and `review_permit_reconciliation` in the run
+state. Both outcomes cancel: a `completed` reconciliation settles cost but has
+no validated structured review or completion receipt, so it can never yield a
+PASS and the review must be re-run under a new permit. A money failure leaves
+the permit untouched. A permit that is already cancelled, superseded, or
+completed is reported without failing reconciliation, and rerunning after a
+crash is safe. `reconcile-reservations` cancels bound permits the same way.
+
+Run markers written before this binding report `review_permit.status:
+unbound`. Once the reservation is reconciled, release the permit explicitly:
+
+```text
+scripts/review-ledger.py cancel-permit PR --phase-permit TOKEN \
+  --role code-reviewer --reason "provider lookup found no request"
+```
+
+`cancel-permit` refuses while any usage reservation for the permit's run or
+logical review is still open, and refuses unstarted (reissue it with
+`permit-review`), completed, cancelled, or superseded permits. It records the
+reason and time on the permit and never creates a receipt. Confirm no reviewer
+process for that permit is still running before using it.
+
 For several historical reservations, first generate a bounded manifest inside
 the repository:
 

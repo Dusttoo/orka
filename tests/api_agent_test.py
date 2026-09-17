@@ -1935,6 +1935,182 @@ self_check:
         self.assertEqual(reconciled["status"], "reconciled_not_found")
         self.assertEqual(reconciled["usage"]["open_reservations"], [])
 
+    def _needs_reconcile_review(self, run_id):
+        agent = self.agent(
+            FakeTransport([api_agent.ProviderAmbiguous("503 after submission")]),
+            run_id=run_id,
+        )
+        token = agent.review_authorization
+        with self.assertRaises(api_agent.ProviderAmbiguous):
+            agent.run(
+                {
+                    "model": "test-model",
+                    "max_tokens": 100,
+                    "system": [],
+                    "messages": [{"role": "user", "content": "review"}],
+                }
+            )
+        self.assertEqual(agent.state["status"], "needs_reconcile")
+        return agent, token
+
+    def _reconcile_args(self, run_id, outcome="not-found", **usage):
+        return type(
+            "Args",
+            (),
+            {
+                "run_id": run_id,
+                "outcome": outcome,
+                "evidence": "provider dashboard search at 2026-09-17T12:00Z",
+                "response_id": usage.pop("response_id", None),
+                "input_tokens": usage.get("input_tokens", 0),
+                "cache_write_tokens": 0,
+                "cache_read_tokens": 0,
+                "output_tokens": usage.get("output_tokens", 0),
+                "config": str(self.root / ".orchestration" / "config.yaml"),
+            },
+        )()
+
+    def _review_permit(self, token, pr="1"):
+        from review_permit import ledger_path
+
+        ledger = json.loads(
+            ledger_path(self.root, ".orchestration/.review-ledger", pr).read_text(
+                encoding="utf-8"
+            )
+        )
+        return next(p for p in ledger["review_permits"] if p["token"] == token)
+
+    def _ledger_cli(self, *args):
+        return subprocess.run(
+            [sys.executable, str(ROOT / "scripts/review-ledger.py"), *args],
+            cwd=self.root,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_started_review_refusal_names_permit_run_and_recovery(self):
+        _, token = self._needs_reconcile_review("refusal-run")
+        head = self._review_permit(token)["head"]
+        refused = self._ledger_cli(
+            "permit-review", "1", "--role", "code-reviewer", "--head", head
+        )
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn(token[:14], refused.stderr)
+        self.assertNotIn(token, refused.stderr)
+        self.assertIn("run refusal-run", refused.stderr)
+        self.assertIn("api_agent.py reconcile --run-id refusal-run", refused.stderr)
+        self.assertIn("cancel-permit", refused.stderr)
+
+    def test_reconcile_not_found_cancels_started_review_permit(self):
+        agent, token = self._needs_reconcile_review("not-found-review")
+        binding = json.loads(agent.state_path.read_text(encoding="utf-8"))[
+            "review_permit"
+        ]
+        self.assertEqual(binding["pr"], "1")
+        self.assertEqual(binding["role"], "code-reviewer")
+        self.assertNotIn(token, json.dumps(binding))
+        reconciled = api_agent.reconcile_run(
+            self._reconcile_args("not-found-review"), self.root
+        )
+        self.assertEqual(reconciled["status"], "reconciled_not_found")
+        self.assertEqual(reconciled["usage"]["open_reservations"], [])
+        self.assertEqual(reconciled["review_permit"]["status"], "cancelled")
+        permit = self._review_permit(token)
+        self.assertTrue(permit["cancelled_at"])
+        self.assertIn("not-found", permit["cancellation_reason"])
+        self.assertFalse(permit["completion_receipt"])
+        self.assertNotEqual(self.phase_permit(), token)
+
+    def test_reconcile_completed_cancels_permit_without_a_receipt(self):
+        _, token = self._needs_reconcile_review("completed-review")
+        reconciled = api_agent.reconcile_run(
+            self._reconcile_args(
+                "completed-review",
+                outcome="completed",
+                response_id="msg_found",
+                input_tokens=40,
+                output_tokens=5,
+            ),
+            self.root,
+        )
+        self.assertEqual(reconciled["status"], "reconciled_completed")
+        self.assertGreater(api_agent.Decimal(reconciled["cost_usd"]), 0)
+        self.assertEqual(reconciled["review_permit"]["status"], "cancelled")
+        self.assertIn("re-run", reconciled["review_permit"]["message"])
+        permit = self._review_permit(token)
+        self.assertTrue(permit["cancelled_at"])
+        self.assertFalse(permit["completion_receipt"])
+        self.assertNotEqual(self.phase_permit(), token)
+
+    def test_reconcile_reports_an_already_cancelled_permit(self):
+        agent, token = self._needs_reconcile_review("already-cancelled")
+        api_agent.cancel_unresolved_review_permit(
+            shared_root=self.root,
+            ledger_dir=".orchestration/.review-ledger",
+            pr="1",
+            token=token,
+            reason="operator cleanup",
+            timestamp="earlier",
+        )
+        reconciled = api_agent.reconcile_run(
+            self._reconcile_args("already-cancelled"), self.root
+        )
+        self.assertEqual(reconciled["status"], "reconciled_not_found")
+        self.assertEqual(reconciled["usage"]["open_reservations"], [])
+        self.assertEqual(reconciled["review_permit"]["status"], "already_cancelled")
+        self.assertEqual(self._review_permit(token)["cancelled_at"], "earlier")
+
+    def test_failed_money_reconciliation_never_cancels_the_permit(self):
+        _, token = self._needs_reconcile_review("money-first")
+        with self.assertRaisesRegex(api_agent.AgentError, "response-id"):
+            api_agent.reconcile_run(
+                self._reconcile_args("money-first", outcome="completed"), self.root
+            )
+        permit = self._review_permit(token)
+        self.assertTrue(permit["started_at"])
+        self.assertFalse(permit.get("cancelled_at"))
+
+    def test_cancel_permit_fails_closed_until_provider_work_is_reconciled(self):
+        agent, token = self._needs_reconcile_review("legacy-review")
+        # A run state written before permit binding cannot cancel on reconcile.
+        state = json.loads(agent.state_path.read_text(encoding="utf-8"))
+        state.pop("review_permit")
+        agent.state_path.write_text(json.dumps(state), encoding="utf-8")
+        refused = self._ledger_cli(
+            "cancel-permit", "1", "--phase-permit", token, "--reason", "stuck"
+        )
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("open usage reservation", refused.stderr)
+        self.assertIn("legacy-review", refused.stderr)
+        self.assertFalse(self._review_permit(token).get("cancelled_at"))
+
+        reconciled = api_agent.reconcile_run(
+            self._reconcile_args("legacy-review"), self.root
+        )
+        self.assertEqual(reconciled["review_permit"]["status"], "unbound")
+        self.assertIn("cancel-permit", reconciled["review_permit"]["message"])
+        self.assertTrue(self._review_permit(token)["started_at"])
+
+        cancelled = self._ledger_cli(
+            "cancel-permit",
+            "1",
+            "--phase-permit",
+            token,
+            "--role",
+            "code-reviewer",
+            "--reason",
+            "provider confirmed no request",
+        )
+        self.assertEqual(cancelled.returncode, 0, cancelled.stderr)
+        self.assertEqual(
+            json.loads(cancelled.stdout)["permit_cancelled"]["status"], "cancelled"
+        )
+        permit = self._review_permit(token)
+        self.assertEqual(permit["cancellation_reason"], "provider confirmed no request")
+        self.assertTrue(permit["cancelled_at"])
+        self.assertFalse(permit["completion_receipt"])
+        self.assertNotEqual(self.phase_permit(), token)
+
     def test_bulk_reservation_reconciliation_requires_and_preserves_evidence(self):
         ledger = api_agent.UsageLedger(self.root)
         run_id = "historical-timeout"

@@ -31,9 +31,12 @@ from typing import Any, Iterator
 import context_pipeline
 from review_permit import (
     ReviewPermitError,
+    cancel_unresolved as cancel_unresolved_review_permit,
     complete_with_status as complete_review_permit,
     consume_completion,
+    logical_review_id,
     subject_ledger_candidates,
+    token_prefix,
 )
 from operator_authority import (
     AuthorityError,
@@ -1169,7 +1172,11 @@ def apply_gate_claims(
         component["last_round"] = round_no
         component["rounds"].append(round_no)
         if key in finding_details:
+            # Keep every gate's explanation: two gates can block the same
+            # normalized component for unrelated defects. `finding` remains the
+            # latest detail for older readers.
             component["finding"] = finding_details[key]
+            component.setdefault("findings_by_gate", {})[gate] = finding_details[key]
         if gate not in component["gates"]:
             component["gates"].append(gate)
         component["claims"][gate] = {
@@ -1462,6 +1469,47 @@ def _load_repair_report(path: str) -> dict[str, Any]:
     return report
 
 
+GATE_ORDER = ("design-review", "code-review", "security-review")
+
+
+def component_findings(
+    component: dict[str, Any],
+) -> list[tuple[str | None, dict[str, Any]]]:
+    """Every gate's explanation for one component, in stable gate order.
+
+    Gates whose claim on the component has since resolved are omitted while
+    another gate still holds it open. Ledgers written before per-gate details
+    existed carry only `finding`, which renders unlabelled.
+    """
+    by_gate = component.get("findings_by_gate")
+    by_gate = by_gate if isinstance(by_gate, dict) else {}
+    claims = component.get("claims") if isinstance(component.get("claims"), dict) else {}
+    open_gates = [
+        gate for gate in by_gate if (claims.get(gate) or {}).get("status") == "open"
+    ]
+    gates = sorted(
+        open_gates or list(by_gate),
+        key=lambda gate: (
+            GATE_ORDER.index(gate) if gate in GATE_ORDER else len(GATE_ORDER),
+            gate,
+        ),
+    )
+    result: list[tuple[str | None, dict[str, Any]]] = [
+        (gate, by_gate[gate]) for gate in gates
+    ]
+    legacy = component.get("finding")
+    if legacy and legacy not in by_gate.values():
+        result.append((None, legacy))
+    return result
+
+
+def finding_lines(component: dict[str, Any], indent: str = "  ") -> list[str]:
+    return [
+        f"{indent}{f'[{gate}] ' if gate else ''}{finding['title']}: {finding['explanation']}"
+        for gate, finding in component_findings(component)
+    ]
+
+
 def cmd_repair_brief(args: argparse.Namespace) -> None:
     state = load(ledger_path(args))
     plan = decide(state)
@@ -1479,9 +1527,7 @@ def cmd_repair_brief(args: argparse.Namespace) -> None:
     ]
     for component in sorted(open_components(state), key=lambda item: item["key"]):
         lines.append(f"- `{component['key']}`")
-        finding = component.get("finding")
-        if finding:
-            lines.append(f"  {finding['title']}: {finding['explanation']}")
+        lines.extend(finding_lines(component))
         lines.append(
             "  Closure must be demonstrated by a named regression test or equivalent evidence."
         )
@@ -2046,9 +2092,7 @@ def cmd_handoff(args: argparse.Namespace) -> None:
                 f"- `{component['key']}` -- {component['strikes']} strike(s), "
                 f"rounds {component['rounds']}, gates {', '.join(component['gates'])}"
             )
-            if component.get("finding"):
-                finding = component["finding"]
-                lines.append(f"  {finding['title']}: {finding['explanation']}")
+            lines.extend(finding_lines(component))
     else:
         lines.append("- none")
     lines += ["", "## Round history"]
@@ -2178,6 +2222,13 @@ def cmd_alias(args: argparse.Namespace) -> None:
                         int(right.get("last_round", 0)),
                     ),
                 }
+        merged_findings = merged.get("findings_by_gate")
+        if isinstance(merged_findings, dict) and merged_findings:
+            canonical_findings = canonical.setdefault("findings_by_gate", {})
+            for gate, finding in merged_findings.items():
+                canonical_findings.setdefault(gate, finding)
+        if merged.get("finding") and not canonical.get("finding"):
+            canonical["finding"] = merged["finding"]
         canonical["first_round"] = min(canonical["first_round"], merged["first_round"])
         if merged["status"] == "open":
             canonical["status"] = "open"
@@ -2470,8 +2521,15 @@ def cmd_permit_review(args: argparse.Namespace) -> None:
                     "the current gate has a completed review awaiting ledger recording"
                 )
             if existing.get("started_at"):
+                run = str(existing.get("run_id") or "")
                 raise LedgerError(
-                    "the current gate has a started review requiring reconciliation"
+                    "the current gate has a started review requiring reconciliation "
+                    f"(permit {token_prefix(str(existing.get('token') or ''))}, "
+                    f"run {run or 'unrecorded'}). Reconcile provider work first with "
+                    f"`api_agent.py reconcile --run-id {run or '<run-id>'} --outcome "
+                    "not-found|completed --evidence ...`, which also cancels the permit; "
+                    f"if it remains started, run `review-ledger.py cancel-permit {args.pr} "
+                    "--phase-permit <token> --reason ...`"
                 )
             # Issuance is idempotent until provider or desktop execution starts.
             # This lets a caller correct locally invalid structured output without
@@ -2508,6 +2566,64 @@ def cmd_permit_review(args: argparse.Namespace) -> None:
             "review_phase_permit_reused": reused,
         }
     )
+
+
+def cmd_cancel_permit(args: argparse.Namespace) -> None:
+    """Operator recovery for a started review permit whose run cannot finish.
+
+    Fails closed while any usage reservation for that run or logical review is
+    still open: provider work is then uncertain and must be reconciled first.
+    """
+    root = shared_repository_root(project_root())
+    path = ledger_path(args)
+
+    def no_open_provider_work(permit: dict[str, Any]) -> None:
+        # Imported lazily: the usage ledger lives with the API runner.
+        from api_agent import UsageLedger
+
+        run_id = str(permit.get("run_id") or "")
+        review_id = logical_review_id(permit)
+        _, open_items = UsageLedger._totals(UsageLedger(root).snapshot())
+        blocking = sorted(
+            str(item.get("run_id") or item.get("reservation_id"))
+            for item in open_items.values()
+            if (run_id and str(item.get("run_id") or "") == run_id)
+            or item.get("logical_review_id") == review_id
+        )
+        if blocking:
+            raise ReviewPermitError(
+                "provider work for this review is still uncertain: open usage "
+                f"reservation(s) for run(s) {', '.join(blocking)}; reconcile with "
+                "`api_agent.py reconcile` before cancelling the permit"
+            )
+
+    try:
+        outcome = cancel_unresolved_review_permit(
+            shared_root=root,
+            ledger_dir=str(path.parent.relative_to(root)),
+            pr=args.pr,
+            token=args.phase_permit,
+            role=args.role,
+            reason=args.reason,
+            timestamp=now(),
+            guard=no_open_provider_work,
+        )
+    except (OSError, ValueError, json.JSONDecodeError, ReviewPermitError) as exc:
+        raise LedgerError(str(exc)) from exc
+    refusals = {
+        "not_started": "the permit was never started; permit-review reissues it "
+        "idempotently, so no cancellation is needed",
+        "completed": "the permit already has a completion receipt; record its result "
+        "instead of cancelling",
+        "already_cancelled": "the permit is already cancelled",
+        "superseded": "the permit was superseded by a newer review generation",
+    }
+    if outcome["status"] in refusals:
+        raise LedgerError(
+            f"cannot cancel permit {outcome['token_prefix']}: "
+            + refusals[outcome["status"]]
+        )
+    emit({"permit_cancelled": outcome, "reason": args.reason.strip()})
 
 
 def cmd_complete_review(args: argparse.Namespace) -> None:
@@ -2738,6 +2854,17 @@ def parser() -> argparse.ArgumentParser:
     complete.add_argument("--phase-permit", required=True)
     complete.add_argument("--result", required=True)
     complete.set_defaults(func=cmd_complete_review)
+    cancel = commands.add_parser(
+        "cancel-permit",
+        help="cancel a started review permit after its provider work is reconciled",
+    )
+    cancel.add_argument("pr")
+    cancel.add_argument("--phase-permit", required=True)
+    cancel.add_argument(
+        "--role", choices=("design-reviewer", "code-reviewer", "security-reviewer")
+    )
+    cancel.add_argument("--reason", required=True)
+    cancel.set_defaults(func=cmd_cancel_permit)
 
     resolve_parser = commands.add_parser("resolve", help="manually close a component")
     resolve_parser.add_argument("pr")
