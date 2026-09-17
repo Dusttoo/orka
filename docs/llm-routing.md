@@ -68,6 +68,9 @@ scripts/context_pipeline.py route --config .orchestration/config.yaml \
 - `execution: api` builds the provider request with `context_pipeline.py payload
   --config ... --role ...`, then submits it through `api_agent.py run`. The
   runner owns the constrained tool-call loop, usage ledger, and budget stops.
+  API reviewer roles reserve `max_output_tokens_per_review_turn` per turn and,
+  when the budget or tool-round limit ends their tool loop, get one tool-free
+  final verdict turn instead of discarding the review.
 - `provider: azure_adm` uses Azure's OpenAI-compatible Chat Completions endpoint.
   Set `AZURE_ADM_API_KEY` and the resource-specific `AZURE_ADM_BASE_URL`; route
   `model` values to Azure deployment names.

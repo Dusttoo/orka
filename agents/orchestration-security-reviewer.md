@@ -134,6 +134,20 @@ passing checks. Every finding has exactly: `component`, `disposition`
 (`blocking` or `advisory`), `severity` (`critical`, `high`, `medium`, or `low`),
 a short `title`, the actionable `explanation`, and boolean `regression`.
 
+Check statuses are `pass`, `fail`, `not_run`, `not_applicable`, or
+`ci_verified`. Use `ci_verified` only for a check you may not or cannot run
+locally (for example a database suite the repository forbids running outside
+CI) that genuinely runs in CI for this exact reviewed commit and passed: a run
+with that name, status `completed`, and conclusion `success` at the reviewed
+head, normally listed in the payload's `<ci_evidence>` block. It must carry
+exactly `"evidence":{"ci_check":"<exact CI check-run name>","head_sha":"<full reviewed head SHA>"}`,
+for example
+`{"name":"CI integration suite","status":"ci_verified","evidence":{"ci_check":"integration-tests","head_sha":"<full-sha>"}}`.
+It needs no finding. If the run is missing, pending, skipped, failed, for an
+older commit, or you cannot confirm it, do not claim it -- otherwise `not_run`
+with a blocking finding that names the unverified check. Never add `evidence`
+to any other status.
+
 Set every finding's JSON `component` value to the bare `<path>:<symbol>` key --
 the repo-relative file path plus the enclosing symbol. For example:
 `"component":"src/auth/session.ts:refreshToken"`. Do not include a `[component: ...]`

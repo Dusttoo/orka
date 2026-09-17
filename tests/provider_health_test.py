@@ -261,6 +261,102 @@ class HealthTests(unittest.TestCase):
         self.assertEqual(state["state"], "rate_limited")
         self.assertEqual(state["retry_at"], 1120)
 
+    def api_config(self):
+        config = self.root / "config.yaml"
+        config.write_text("llm:\n  execution: api\n  provider: openai\n  model: gpt-test\n")
+        return config
+
+    def test_route_scoped_client_incompatibility_does_not_hold_provider(self):
+        from api_agent import ProviderAdmissionError
+        from provider_health import ProviderTransport
+
+        self.health.failure("openai", "incompatible", scope="route-a", client="codex-gateway",
+                            detail="native Codex gateway does not meter POST /v1/other")
+        self.assertEqual(self.health.status("openai")["state"], "unverified")
+        held = self.health.status("openai", route="route-a")
+        self.assertEqual((held["state"], held["scope"], held["client"]),
+                         ("incompatible", "route", "codex-gateway"))
+        self.assertEqual(self.health.status("openai", route="route-b")["state"], "unverified")
+        token = self.health.claim_probe("openai")
+        self.health.complete_probe("openai", token, "healthy", route="route-b")
+        self.assertEqual(self.health.status("openai", route="route-b")["state"], "healthy")
+        self.assertEqual(self.health.status("openai", route="route-a")["state"], "incompatible")
+        transport = Mock()
+        transport.request.return_value = {"id": "ok"}
+        self.assertEqual(ProviderTransport(self.root, transport).request("openai", "responses", {}), {"id": "ok"})
+        # Genuine provider incidents still hold every route and API roles.
+        for reason in ("authentication", "rate_limited"):
+            with self.subTest(reason=reason):
+                self.health.directory.joinpath("openai.json").unlink()
+                self.health.failure("openai", "incompatible", scope="route-a", client="codex-gateway")
+                self.health.failure("openai", reason)
+                for route in (None, "route-a", "route-b"):
+                    self.assertEqual(self.health.status("openai", route=route)["state"], reason)
+                with self.assertRaisesRegex(ProviderAdmissionError, reason):
+                    ProviderTransport(self.root, transport).request("openai", "responses", {})
+
+    def test_scoped_incompatibility_rejects_other_reasons(self):
+        with self.assertRaises(HealthError):
+            self.health.failure("openai", "rate_limited", scope="route-a")
+
+    def test_plain_probe_keeps_scoped_hold_and_after_repair_clears_only_that_route(self):
+        from context_pipeline import llm_route_from_config
+        from provider_health import route_identity
+
+        config = self.api_config()
+        identity = route_identity(llm_route_from_config(config, "sprint-worker"))
+        self.health.failure("openai", "incompatible", scope=identity, client="codex-gateway")
+        self.health.failure("openai", "incompatible", scope="other-route", client="codex-gateway")
+        transport = Mock()
+        transport.request.return_value = {"input_tokens": 3}
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "offline-fixture"}):
+            self.assertEqual(probe(self.root, config, transport=transport)["state"], "incompatible")
+            transport.request.assert_not_called()
+            self.assertEqual(probe(self.root, config, repair=True, transport=transport)["state"], "healthy")
+        self.assertEqual(self.health.status("openai", route=identity)["state"], "healthy")
+        self.assertEqual(self.health.status("openai", route="other-route")["state"], "incompatible")
+
+    def test_legacy_provider_wide_incompatibility_holds_until_after_repair(self):
+        from api_agent import ProviderAdmissionError
+        from provider_health import ProviderTransport
+
+        self.health.directory.mkdir(parents=True)
+        (self.health.directory / "openai.json").write_text(json.dumps(
+            {"state": "incompatible", "failures": 1, "probe_count": 0, "at": 1, "retry_at": 31,
+             "incident": "legacy"}))
+        for route in (None, "any-route"):
+            self.assertEqual(self.health.status("openai", route=route)["state"], "incompatible")
+        with self.assertRaisesRegex(ProviderAdmissionError, "incompatible"):
+            ProviderTransport(self.root, Mock()).request("openai", "responses", {})
+        config = self.api_config()
+        transport = Mock()
+        transport.request.return_value = {"input_tokens": 3}
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "offline-fixture"}):
+            self.assertEqual(probe(self.root, config, transport=transport)["state"], "incompatible")
+            transport.request.assert_not_called()
+            self.assertEqual(probe(self.root, config, repair=True, transport=transport)["state"], "healthy")
+
+    def test_desktop_client_smoke_failure_is_scoped_to_that_route(self):
+        from context_pipeline import llm_route_from_config
+        from provider_health import route_identity
+
+        config = self.root / "config.yaml"
+        config.write_text("llm:\n  execution: api\n  provider: openai\n  model: gpt-test\n"
+                          "  roles:\n    sprint-worker:\n      execution: desktop\n")
+        worker = route_identity(llm_route_from_config(config, "sprint-worker"))
+        reviewer = route_identity(llm_route_from_config(config, "code-reviewer"))
+        transport = Mock()
+        transport.request.return_value = {"input_tokens": 3}
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "offline-fixture"}), patch(
+                "runtime_smoke.check", side_effect=RuntimeError("client drift")):
+            state = probe(self.root, config, role="sprint-worker", repair=True, transport=transport)
+        self.assertEqual((state["state"], state["scope"]), ("incompatible", "route"))
+        self.assertEqual(self.health.status("openai")["state"], "unverified")
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "offline-fixture"}):
+            self.assertEqual(probe(self.root, config, role="code-reviewer", transport=transport)["state"], "healthy")
+        self.assertEqual(self.health.status("openai", route=reviewer)["state"], "healthy")
+        self.assertEqual(self.health.status("openai", route=worker)["state"], "incompatible")
+
 
 class AdmissionTests(unittest.TestCase):
     def setUp(self):
@@ -809,6 +905,26 @@ class AdmissionTests(unittest.TestCase):
         self.assertFalse(
             any(h["provider"] == "openai" for h in result["health_probes"])
         )
+
+    def test_route_scoped_client_hold_gates_only_that_route_relaunch(self):
+        from context_pipeline import llm_route_from_config
+        from provider_health import route_identity
+
+        self.healthy()
+        self.healthy("ticket-scoper")
+        worker = route_identity(llm_route_from_config(self.cfg["config"], "sprint-worker"))
+        health = ProviderHealth(self.root)
+        health.failure("openai", "incompatible", scope="another-openai-route", client="codex-gateway")
+        self.assertEqual(self.c.plan_value(self.state, self.cfg)["launch"], ["T-1"])
+        health.failure("openai", "incompatible", scope=worker, client="codex-gateway")
+        result = self.c.plan_value(self.state, self.cfg)
+        self.assertFalse(result["launch"])
+        self.assertEqual(
+            [(h["provider"], h["state"], h.get("scope")) for h in result["provider_holds"]],
+            [("openai", "incompatible", "route")],
+        )
+        self.assertEqual(result["health_probes"], [])
+        self.assertEqual(health.status("openai")["state"], "healthy")
 
     def test_completed_sprint_does_not_schedule_health_work(self):
         self.ticket["state"] = "completed"

@@ -11,7 +11,15 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
 
 0. Run `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/captain-preflight.py
    --plugin-root ${CLAUDE_PLUGIN_ROOT} --repo . --host claude --verify-runtime`. Continue only
-   when it returns `status: ready`, `execution_ready: true`, and `captain_mode: controller-only`. If this
+   when it returns `status: ready`, `execution_ready: true`, and `captain_mode: controller-only`.
+   Preflight also authenticates to Jira (`GET /rest/api/3/myself`) with the
+   credentials sync will use: `JIRA_API_TOKEN` (plus `JIRA_EMAIL` for Jira
+   Cloud) from the environment, or else from the gitignored, `chmod 600`
+   `.orchestration/.env` in the shared repository root. If `jira.state` is
+   `blocked`, report its `reason` as a user action; never print the values.
+   Use `--skip-jira-auth-check` only when the operator explicitly asks, and
+   report it from `skipped_checks`. Record `budget_limits` (and any
+   `budget_cap_warnings`) in the first status event. If this
    script or this exact command is absent, stop as `user_action`: never infer the
    plugin purpose, invent a similarly named skill, or operate sprint tickets
    directly. Record its plugin version and runtime fingerprint in the first

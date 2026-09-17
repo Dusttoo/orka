@@ -6,8 +6,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
+from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from version_policy import VersionPolicyError, assert_minimum_version, release_version
@@ -24,9 +27,87 @@ REQUIRED = (
     "scripts/codex_gateway.py",
     "scripts/ticket_dependencies.py",
     "scripts/jira_inventory_fetch.py",
+    "scripts/runtime_state.py",
     "skills/orchestrate-sprint/SKILL.md",
     "skills/orchestrate-ticket/SKILL.md",
 )
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _json_safe(child) for key, child in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(child) for child in value]
+    return value
+
+
+def jira_readiness(
+    repo: Path,
+    config: Path,
+    *,
+    skip_live: bool,
+    opener: Any = None,
+    environ: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Prove the Jira access `sprint-controller.py sync` needs, without secrets.
+
+    Policy is parsed and credentials are resolved by the same functions the
+    controller-owned Jira adapter uses, so preflight and sync cannot disagree.
+    """
+    import jira_inventory_fetch as jira
+    from api_agent import AgentError, load_yaml
+
+    result: dict[str, Any] = {
+        "state": "blocked",
+        "live_check": "not_run",
+        "credential_file": str(jira.credential_file(repo)),
+    }
+    try:
+        ticket = load_yaml(config).get("ticket")
+    except AgentError as exc:
+        return {**result, "reason": str(exc)}
+    kind = str(ticket.get("kind") or "") if isinstance(ticket, dict) else ""
+    if kind != "jira":
+        return {**result, "reason": f"orchestrate-sprint requires ticket.kind: jira (found {kind or 'unset'})"}
+    project = jira.ticket_project_from_config(config).upper()
+    sprint_policy = jira.scalar_config(config, "sprint_id", "").strip()
+    base_url = jira.scalar_config(config, "jira_base_url", "").strip()
+    if not project or not sprint_policy:
+        return {**result, "reason": "ticket.project and sprint_id are required canonical Jira policy"}
+    if not base_url:
+        return {**result, "reason": "jira_base_url is required canonical Jira policy"}
+    try:
+        result["jira_origin"] = jira.validate_base_url(base_url)
+        credentials = jira.resolve_jira_credentials(repo, environ)
+    except ValueError as exc:
+        return {**result, "reason": str(exc)}
+    result["auth_mode"] = "basic" if credentials["email"] else "bearer"
+    result["credential_sources"] = credentials["sources"]
+    if skip_live:
+        return {**result, "state": "ready", "live_check": "skipped"}
+    try:
+        jira.verify_jira_identity(base_url, credentials, opener=opener)
+    except ValueError as exc:
+        return {**result, "live_check": "failed", "reason": str(exc)}
+    return {**result, "state": "ready", "live_check": "passed"}
+
+
+def budget_report(config: Path) -> dict[str, Any]:
+    """Effective (capped) budget limits, plus cap warnings when available."""
+    import api_agent
+
+    try:
+        loaded = api_agent.load_yaml(config)
+        limits = api_agent.budgets_from_config(loaded)
+    except (api_agent.AgentError, ValueError) as exc:
+        return {"budget_limits": None, "budget_error": str(exc)}
+    report: dict[str, Any] = {"budget_limits": _json_safe(dict(sorted(limits.items())))}
+    violations = getattr(api_agent, "budget_cap_violations", None)
+    if callable(violations):
+        report["budget_cap_warnings"] = _json_safe(violations(loaded))
+    return report
 
 
 def main() -> int:
@@ -36,6 +117,11 @@ def main() -> int:
     parser.add_argument("--host", choices=("claude", "codex"), required=True)
     parser.add_argument("--verify-runtime", action="store_true", help="Run bounded client and authenticated token-count checks")
     parser.add_argument("--after-repair", action="store_true", help="Permit a fresh probe after correcting an auth/client incident")
+    parser.add_argument(
+        "--skip-jira-auth-check",
+        action="store_true",
+        help="Do not call Jira /myself; credentials must still be present. Reported in skipped_checks.",
+    )
     args = parser.parse_args()
     plugin = Path(args.plugin_root).expanduser().resolve()
     repo = Path(args.repo).expanduser().resolve()
@@ -80,12 +166,21 @@ def main() -> int:
         except (ContextError, HealthError) as exc:
             status = {"state": "incompatible", "reason": str(exc)}
         routes.append({"role": role, "provider": route["provider"], "model": route["model"], **status})
-    execution_ready = all(item["state"] == "healthy" for item in routes)
+    jira = jira_readiness(repo, config, skip_live=args.skip_jira_auth_check)
+    budgets = budget_report(config)
+    execution_ready = (
+        all(item["state"] == "healthy" for item in routes)
+        and jira["state"] == "ready"
+        and budgets["budget_limits"] is not None
+    )
     print(json.dumps({
         "status": "ready" if execution_ready else "blocked",
         "installation_status": "ready",
         "execution_ready": execution_ready,
         "routes": routes,
+        "jira": jira,
+        "skipped_checks": ["jira-auth"] if args.skip_jira_auth_check else [],
+        **budgets,
         "captain_mode": "controller-only",
         "host": args.host,
         "plugin_root": str(plugin),

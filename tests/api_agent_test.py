@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -32,6 +33,65 @@ CLEAN_REVIEW = json.dumps(
     },
     separators=(",", ":"),
 )
+
+
+BLOCKING_REVIEW = json.dumps(
+    {
+        "schema_version": 1,
+        "gate": "code-review",
+        "verdict": "FAIL",
+        "checks": [{"name": "diff", "status": "pass"}],
+        "findings": [
+            {
+                "component": "src/app.py:handler",
+                "disposition": "blocking",
+                "severity": "high",
+                "title": "unchecked input",
+                "explanation": "handler trusts the request body",
+                "regression": False,
+            }
+        ],
+    },
+    separators=(",", ":"),
+)
+
+
+DEFAULT_TEST_BUDGETS = """    max_usd_per_run: 1.00
+    max_usd_per_ticket: 2.00
+    max_usd_per_sprint: 5.00
+    max_output_tokens_per_turn: 100
+    max_tool_rounds: 3
+    max_tool_output_chars: 2000
+    tool_timeout_seconds: 10
+    provider_read_timeout_seconds: 777
+    max_pre_ack_retries: 2
+    retry_backoff_seconds: 0"""
+DEFAULT_TEST_PRICING = """      input_per_mtok: 1
+      cache_write_per_mtok: 2
+      cache_read_per_mtok: 0.1
+      output_per_mtok: 10"""
+# Shaped like the gpt-6-astra review incident: a 32768-token output allowance
+# reserved about $2.66 per request against a $5 review envelope.
+INCIDENT_PRICING = """      input_per_mtok: 10
+      cache_write_per_mtok: 10
+      cache_read_per_mtok: 1
+      output_per_mtok: 75"""
+
+
+def incident_budgets(**overrides):
+    values = {
+        "max_usd_per_run": "10.00",
+        "max_usd_per_ticket": "30.00",
+        "max_usd_per_sprint": "300.00",
+        "max_output_tokens_per_turn": "32768",
+        "max_tool_rounds": "40",
+        "max_tool_output_chars": "2000",
+        "tool_timeout_seconds": "10",
+        "max_pre_ack_retries": "0",
+        "retry_backoff_seconds": "0",
+    }
+    values.update({key: str(value) for key, value in overrides.items()})
+    return "\n".join(f"    {key}: {value}" for key, value in values.items())
 
 
 class FakeTransport:
@@ -109,7 +169,9 @@ class ApiAgentTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def config(self, provider="anthropic", model="test-model", extra=""):
+    def config(
+        self, provider="anthropic", model="test-model", extra="", budgets="", pricing=""
+    ):
         path = self.root / ".orchestration" / "config.yaml"
         roles = (
             extra
@@ -124,22 +186,10 @@ llm:
   model: {model}
   fallback: none
   budgets:
-    max_usd_per_run: 1.00
-    max_usd_per_ticket: 2.00
-    max_usd_per_sprint: 5.00
-    max_output_tokens_per_turn: 100
-    max_tool_rounds: 3
-    max_tool_output_chars: 2000
-    tool_timeout_seconds: 10
-    provider_read_timeout_seconds: 777
-    max_pre_ack_retries: 2
-    retry_backoff_seconds: 0
+{budgets or DEFAULT_TEST_BUDGETS}
   pricing:
     {model}:
-      input_per_mtok: 1
-      cache_write_per_mtok: 2
-      cache_read_per_mtok: 0.1
-      output_per_mtok: 10
+{pricing or DEFAULT_TEST_PRICING}
   roles:
 {roles}
 self_check:
@@ -185,7 +235,12 @@ self_check:
         return json.loads(permit.stdout)["review_phase_permit"]
 
     def agent(
-        self, transport, provider="anthropic", role="code-reviewer", run_id="test-run"
+        self,
+        transport,
+        provider="anthropic",
+        role="code-reviewer",
+        run_id="test-run",
+        **config,
     ):
         review = {}
         if role in {"design-reviewer", "code-reviewer", "security-reviewer"}:
@@ -198,7 +253,7 @@ self_check:
             worker = self.attempt_capability(run_id=run_id, role=role)
         return api_agent.ApiAgent(
             root=self.root,
-            config_path=self.config(provider=provider),
+            config_path=self.config(provider=provider, **config),
             role=role,
             ticket="PROJ-1",
             sprint="SPRINT-1",
@@ -1711,28 +1766,506 @@ self_check:
         self.assertGreater(api_agent.Decimal(agent.ledger.summary()["cost_usd"]), 0)
 
     def test_tool_exhaustion_releases_review_permit(self):
-        transport = FakeTransport(
-            [
+        tool_use = {
+            "id": "msg_tools",
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 10, "output_tokens": 2},
+            "content": [
                 {
-                    "id": "msg_tools",
-                    "stop_reason": "tool_use",
-                    "usage": {"input_tokens": 10, "output_tokens": 2},
-                    "content": [
-                        {
-                            "type": "tool_use",
-                            "id": "tool_1",
-                            "name": "git_status",
-                            "input": {},
-                        }
-                    ],
+                    "type": "tool_use",
+                    "id": "tool_1",
+                    "name": "git_status",
+                    "input": {},
                 }
-            ]
-        )
+            ],
+        }
+        # The forced final verdict turn still asked for tools: no second final
+        # turn and no verdict, so the run stays blocked and the permit returns.
+        transport = FakeTransport([tool_use, dict(tool_use, id="msg_final_tools")])
         agent = self.agent(transport)
         agent.state["tool_rounds"] = agent.budgets["max_tool_rounds"]
-        with self.assertRaisesRegex(api_agent.BudgetError, "max_tool_rounds"):
+        with self.assertRaisesRegex(api_agent.BudgetError, "final verdict turn"):
             agent.run({"model": "test-model", "max_tokens": 100})
+        self.assertEqual(
+            len([call for call in transport.calls if call[1] == "messages"]), 2
+        )
+        self.assertEqual(agent.state["status"], "budget_blocked")
+        self.assertEqual(agent.state["final_turn"], "max_tool_rounds")
         self.assertTrue(self.phase_permit())
+
+    def test_final_verdict_turn_counter_failure_releases_review_permit(self):
+        transport = FakeTransport([self._anthropic_tool_turn(0, 10, 2)])
+        agent = self.agent(transport, run_id="final-counter-failure")
+        agent.state["tool_rounds"] = agent.budgets["max_tool_rounds"]
+        with mock.patch.object(
+            agent,
+            "_count",
+            side_effect=[10, api_agent.AgentError("counter unavailable")],
+        ):
+            with self.assertRaisesRegex(api_agent.AgentError, "counter unavailable"):
+                agent.run({"model": "test-model", "max_tokens": 100})
+        self.assertTrue(self.phase_permit())
+
+    @staticmethod
+    def _anthropic_tool_turn(index, input_tokens=20000, output_tokens=400):
+        return {
+            "id": f"msg_tool_{index}",
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": f"tool_{index}",
+                    "name": "git_status",
+                    "input": {},
+                }
+            ],
+        }
+
+    def _review_permit_record(self):
+        ledgers = list((self.root / ".orchestration/.review-ledger").glob("*.json"))
+        self.assertEqual(len(ledgers), 1)
+        permits = json.loads(ledgers[0].read_text(encoding="utf-8"))["review_permits"]
+        return permits[-1]
+
+    def test_review_budget_incident_forces_bounded_final_verdict(self):
+        # Nineteen $0.23 tool rounds fit a $5 review once each turn reserves a
+        # realistic output bound; the refused twentieth becomes the verdict turn.
+        # A forced FAIL keeps its blocking findings authoritative.
+        responses = [self._anthropic_tool_turn(index) for index in range(19)]
+        responses.append(
+            {
+                "id": "msg_verdict",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 20000, "output_tokens": 300},
+                "content": [{"type": "text", "text": BLOCKING_REVIEW}],
+            }
+        )
+        transport = FakeTransport(responses, count=20000)
+        agent = self.agent(
+            transport,
+            run_id="incident-review",
+            budgets=incident_budgets(),
+            pricing=INCIDENT_PRICING,
+        )
+        result = agent.run(
+            {
+                "model": "test-model",
+                "max_tokens": 32768,
+                "system": [],
+                "messages": [{"role": "user", "content": "review"}],
+            }
+        )
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["final_turn"], "budget")
+        self.assertEqual(result["review"]["verdict"], "FAIL")
+        self.assertEqual(agent.state["final_turn"], "budget")
+        self.assertIn(
+            "max_usd_per_code_review_phase", agent.state["final_turn_reason"]
+        )
+        message_calls = [call[2] for call in transport.calls if call[1] == "messages"]
+        self.assertEqual(len(message_calls), 20)
+        # Every ordinary review turn is bounded by the review output cap.
+        self.assertEqual({call["max_tokens"] for call in message_calls[:-1]}, {8192})
+        final = message_calls[-1]
+        self.assertEqual(final["max_tokens"], 4096)
+        self.assertEqual(final["tool_choice"], {"type": "none"})
+        final_blocks = final["messages"][-1]["content"]
+        self.assertEqual(final_blocks[0]["type"], "tool_result")
+        self.assertIn("final structured review JSON", final_blocks[-1]["text"])
+        # Reservations are the true worst case of what was submitted.
+        reservations = [
+            api_agent.Decimal(event["projected_cost_usd"])
+            for event in agent.ledger._events()
+            if event["kind"] == "reservation"
+        ]
+        self.assertEqual(reservations[0], agent.pricing.worst_case(20000, 8192))
+        self.assertEqual(reservations[-1], agent.pricing.worst_case(20000, 4096))
+        phase = agent.ledger.phase_totals(agent.ledger._events(), "PROJ-1")
+        self.assertLessEqual(
+            phase["code_review"]["spent_usd"], api_agent.Decimal("5")
+        )
+        self.assertEqual(phase["code_review"]["reserved_usd"], 0)
+        # The first request tells the reviewer what it can afford.
+        brief = message_calls[0]["messages"][0]["content"][0]["text"]
+        self.assertIn("code_review phase ceiling $5.00", brief)
+        self.assertIn("already spent or reserved $0.00", brief)
+        self.assertIn("remaining $5.00", brief)
+        self.assertIn("$0.6144", brief)
+        self.assertIn("final verdict turn", brief)
+        permit = self._review_permit_record()
+        self.assertTrue(permit.get("completion_receipt"))
+        self.assertFalse(permit.get("cancelled_at"))
+
+    def test_forced_final_turn_pass_is_not_authoritative(self):
+        # A PASS written only because budget ran out may rest on partial
+        # evidence, so it must not clear a gate: no receipt, permit released.
+        responses = [self._anthropic_tool_turn(index) for index in range(19)]
+        responses.append(
+            {
+                "id": "msg_verdict",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 20000, "output_tokens": 300},
+                "content": [{"type": "text", "text": CLEAN_REVIEW}],
+            }
+        )
+        transport = FakeTransport(responses, count=20000)
+        agent = self.agent(
+            transport,
+            run_id="incident-forced-pass",
+            budgets=incident_budgets(),
+            pricing=INCIDENT_PRICING,
+        )
+        with self.assertRaisesRegex(api_agent.BudgetError, "not authoritative"):
+            agent.run(
+                {
+                    "model": "test-model",
+                    "max_tokens": 32768,
+                    "system": [],
+                    "messages": [{"role": "user", "content": "review"}],
+                }
+            )
+        self.assertEqual(agent.state["status"], "budget_blocked")
+        self.assertEqual(agent.state["final_turn"], "budget")
+        self.assertEqual(agent.state["review"]["verdict"], "PASS")
+        permit = self._review_permit_record()
+        self.assertFalse(permit.get("completion_receipt"))
+        self.assertTrue(permit.get("cancelled_at"))
+
+    def test_full_output_allowance_refuses_review_at_half_budget(self):
+        # Reserving the whole 32768-token allowance reproduces the incident:
+        # the ordinary turn is refused after about $2.50 of real work. The
+        # forced verdict turn still fits, but here it asks for tools again.
+        responses = [self._anthropic_tool_turn(index) for index in range(40)]
+        transport = FakeTransport(responses, count=20000)
+        agent = self.agent(
+            transport,
+            run_id="incident-refusal",
+            budgets=incident_budgets(max_output_tokens_per_review_turn=32768),
+            pricing=INCIDENT_PRICING,
+        )
+        with self.assertRaisesRegex(api_agent.BudgetError, "final verdict turn"):
+            agent.run(
+                {
+                    "model": "test-model",
+                    "max_tokens": 32768,
+                    "messages": [{"role": "user", "content": "review"}],
+                }
+            )
+        message_calls = [call[2] for call in transport.calls if call[1] == "messages"]
+        self.assertEqual(len(message_calls), 12)
+        self.assertEqual(message_calls[0]["max_tokens"], 32768)
+        self.assertEqual(agent.state["final_turn"], "budget")
+        self.assertIn(
+            "max_usd_per_code_review_phase", agent.state["final_turn_reason"]
+        )
+        self.assertEqual(message_calls[-1]["max_tokens"], 4096)
+        self.assertEqual(message_calls[-1]["tool_choice"], {"type": "none"})
+        self.assertLess(api_agent.Decimal(agent.state["cost_usd"]), api_agent.Decimal("3"))
+        self.assertTrue(self.phase_permit())
+
+    def test_final_verdict_turn_is_refused_when_it_cannot_fit(self):
+        transport = FakeTransport(
+            [self._anthropic_tool_turn(0, output_tokens=5334)], count=20000
+        )
+        agent = self.agent(
+            transport,
+            run_id="final-refused",
+            budgets=incident_budgets(max_usd_per_code_review_phase="1.00"),
+            pricing=INCIDENT_PRICING,
+        )
+        with self.assertRaisesRegex(
+            api_agent.BudgetError, "max_usd_per_code_review_phase"
+        ):
+            agent.run(
+                {
+                    "model": "test-model",
+                    "max_tokens": 32768,
+                    "messages": [{"role": "user", "content": "review"}],
+                }
+            )
+        self.assertEqual(
+            len([call for call in transport.calls if call[1] == "messages"]), 1
+        )
+        self.assertEqual(agent.state["status"], "budget_blocked")
+        self.assertEqual(agent.state["final_turn"], "budget")
+        self.assertEqual(agent.ledger.summary()["open_reservations"], [])
+        self.assertTrue(self.phase_permit())
+
+    def test_reviewer_output_cap_bounds_submitted_request_and_reservation(self):
+        transport = self._completed_transport()
+        agent = self.agent(
+            transport,
+            run_id="review-cap",
+            budgets=incident_budgets(max_output_tokens_per_review_turn=6000),
+            pricing=INCIDENT_PRICING,
+        )
+        agent.run({"model": "test-model", "max_tokens": 32768})
+        submitted = [call[2] for call in transport.calls if call[1] == "messages"][0]
+        self.assertEqual(submitted["max_tokens"], 6000)
+        reservation = next(
+            event
+            for event in agent.ledger._events()
+            if event["kind"] == "reservation"
+        )
+        self.assertEqual(
+            api_agent.Decimal(reservation["projected_cost_usd"]),
+            agent.pricing.worst_case(100, 6000),
+        )
+        defaults = api_agent.budgets_from_config({})
+        self.assertEqual(defaults["max_output_tokens_per_review_turn"], 4096)
+        self.assertEqual(defaults["final_verdict_output_tokens"], 4096)
+        raised = api_agent.budgets_from_config(
+            {"llm": {"budgets": {"max_output_tokens_per_turn": 32768}}}
+        )
+        self.assertEqual(raised["max_output_tokens_per_review_turn"], 8192)
+        self.assertEqual(raised["final_verdict_output_tokens"], 4096)
+        bounded = api_agent.budgets_from_config(
+            {
+                "llm": {
+                    "budgets": {
+                        "max_output_tokens_per_turn": 2000,
+                        "max_output_tokens_per_review_turn": 50000,
+                        "final_verdict_output_tokens": 9000,
+                    }
+                }
+            }
+        )
+        self.assertEqual(bounded["max_output_tokens_per_review_turn"], 2000)
+        self.assertEqual(bounded["final_verdict_output_tokens"], 2000)
+        for key in (
+            "max_output_tokens_per_review_turn",
+            "final_verdict_output_tokens",
+        ):
+            with self.assertRaises(api_agent.AgentError):
+                api_agent.budgets_from_config({"llm": {"budgets": {key: 0}}})
+
+    def test_final_verdict_turn_disables_tools_for_each_provider(self):
+        def chat_tool_turn(index):
+            return {
+                "id": f"chat_{index}",
+                "choices": [
+                    {
+                        "finish_reason": "tool_calls",
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": f"call_{index}",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "git_status",
+                                        "arguments": "{}",
+                                    },
+                                }
+                            ],
+                        },
+                    }
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2},
+            }
+
+        tool_turns = {
+            "anthropic": lambda index: self._anthropic_tool_turn(index, 10, 2),
+            "openai": lambda index: {
+                "id": f"resp_{index}",
+                "status": "completed",
+                "usage": {"input_tokens": 10, "output_tokens": 2},
+                "output": [
+                    {
+                        "type": "function_call",
+                        "id": f"fc_{index}",
+                        "call_id": f"call_{index}",
+                        "name": "git_status",
+                        "arguments": "{}",
+                    }
+                ],
+            },
+            "azure_adm": chat_tool_turn,
+            "bedrock_mantle": chat_tool_turn,
+            "bedrock": lambda index: {
+                "id": f"aws-{index}",
+                "stopReason": "tool_use",
+                "usage": {"inputTokens": 10, "outputTokens": 2},
+                "output": {
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "toolUse": {
+                                    "toolUseId": f"tool-{index}",
+                                    "name": "git_status",
+                                    "input": {},
+                                }
+                            }
+                        ],
+                    }
+                },
+            },
+        }
+        chat_verdict = {
+            "id": "chat_verdict",
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": BLOCKING_REVIEW},
+                }
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2},
+        }
+        verdicts = {
+            "anthropic": {
+                "id": "msg_verdict",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 10, "output_tokens": 2},
+                "content": [{"type": "text", "text": BLOCKING_REVIEW}],
+            },
+            "openai": {
+                "id": "resp_verdict",
+                "status": "completed",
+                "usage": {"input_tokens": 10, "output_tokens": 2},
+                "output_text": BLOCKING_REVIEW,
+                "output": [],
+            },
+            "azure_adm": chat_verdict,
+            "bedrock_mantle": chat_verdict,
+            "bedrock": {
+                "id": "aws-verdict",
+                "stopReason": "end_turn",
+                "usage": {"inputTokens": 10, "outputTokens": 2},
+                "output": {
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"text": BLOCKING_REVIEW}],
+                    }
+                },
+            },
+        }
+        requests = {
+            "anthropic": {
+                "model": "test-model",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "review"}],
+            },
+            "openai": {
+                "model": "test-model",
+                "max_output_tokens": 100,
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "review"}],
+                    }
+                ],
+            },
+            "azure_adm": {
+                "model": "test-model",
+                "max_completion_tokens": 100,
+                "messages": [{"role": "user", "content": "review"}],
+            },
+            "bedrock_mantle": {
+                "model": "test-model",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "review"}],
+            },
+            "bedrock": {
+                "modelId": "test-model",
+                "inferenceConfig": {"maxTokens": 100},
+                "messages": [{"role": "user", "content": [{"text": "review"}]}],
+            },
+        }
+        endpoints = {
+            "anthropic": "messages",
+            "openai": "responses",
+            "azure_adm": "chat/completions",
+            "bedrock_mantle": "chat/completions",
+            "bedrock": "converse",
+        }
+        budgets = DEFAULT_TEST_BUDGETS.replace(
+            "max_tool_rounds: 3", "max_tool_rounds: 1"
+        ).replace(
+            "max_output_tokens_per_turn: 100",
+            "max_output_tokens_per_turn: 100\n    final_verdict_output_tokens: 60",
+        )
+        for provider, endpoint in endpoints.items():
+            # Each provider gets a fresh review ledger and usage ledger.
+            for directory in (".orchestration/.review-ledger", ".orchestration/.llm-usage"):
+                if (self.root / directory).is_dir():
+                    shutil.rmtree(self.root / directory)
+            with self.subTest(provider=provider):
+                transport = FakeTransport(
+                    [
+                        tool_turns[provider](1),
+                        tool_turns[provider](2),
+                        verdicts[provider],
+                    ]
+                )
+                agent = self.agent(
+                    transport,
+                    provider=provider,
+                    run_id=f"final-{provider}",
+                    budgets=budgets,
+                )
+                result = agent.run(json.loads(json.dumps(requests[provider])))
+                self.assertEqual(result["status"], "completed")
+                self.assertEqual(result["final_turn"], "max_tool_rounds")
+                self.assertEqual(agent.state["tool_rounds"], 1)
+                calls = [call[2] for call in transport.calls if call[1] == endpoint]
+                self.assertEqual(len(calls), 3)
+                final = json.dumps(calls[-1])
+                self.assertIn("final structured review JSON", final)
+                self.assertIn("not executed", final)
+                if provider == "bedrock":
+                    self.assertEqual(calls[-1]["inferenceConfig"]["maxTokens"], 60)
+                    # Converse cannot disable tools while the transcript holds
+                    # toolUse blocks; a returned tool call fails closed instead.
+                    self.assertIn("toolConfig", calls[-1])
+                else:
+                    cap_key = {
+                        "anthropic": "max_tokens",
+                        "openai": "max_output_tokens",
+                        "azure_adm": "max_completion_tokens",
+                        "bedrock_mantle": "max_tokens",
+                    }[provider]
+                    self.assertEqual(calls[-1][cap_key], 60)
+                    self.assertEqual(
+                        calls[-1]["tool_choice"],
+                        {"type": "none"} if provider == "anthropic" else "none",
+                    )
+                self.assertIn("ORKA BUDGET NOTE", json.dumps(calls[0]))
+                self.assertTrue(self._review_permit_record().get("completion_receipt"))
+
+    def test_report_open_reservations_follow_report_filters(self):
+        moment = api_agent.dt.datetime.now(api_agent.dt.timezone.utc).isoformat()
+        reservations = [
+            {
+                "kind": "reservation",
+                "timestamp": moment,
+                "reservation_id": f"resv_other_{index}",
+                "run_id": f"other-{index}",
+                "role": "implementer",
+                "ticket": "OTHER-1",
+                "sprint": "SPRINT-1",
+                "provider": "anthropic",
+                "model": "test-model",
+                "projected_cost_usd": "1",
+            }
+            for index in range(9)
+        ]
+        self._write_ledger(
+            [self._usage_event("implementer", "0.100000"), *reservations]
+        )
+        scoped = api_agent.build_report(self.root, self._report_args(ticket="PROD-1"))
+        self.assertEqual(scoped["open_reservations"], [])
+        self.assertEqual(scoped["open_reservations_ledger_wide"], 9)
+        text = api_agent.format_report(scoped)
+        self.assertNotIn("open reservations: 9", text)
+        self.assertIn("0 match these filters (9 ledger-wide)", text)
+        other = api_agent.build_report(self.root, self._report_args(ticket="OTHER-1"))
+        self.assertEqual(len(other["open_reservations"]), 9)
+        unfiltered = api_agent.build_report(self.root, self._report_args())
+        self.assertEqual(len(unfiltered["open_reservations"]), 9)
+        self.assertIn("open reservations: 9 ", api_agent.format_report(unfiltered))
 
     def test_token_count_failure_can_retry_without_outstanding_permit(self):
         transport = FakeTransport([], count=0)
@@ -1934,6 +2467,182 @@ self_check:
         reconciled = api_agent.reconcile_run(args, self.root)
         self.assertEqual(reconciled["status"], "reconciled_not_found")
         self.assertEqual(reconciled["usage"]["open_reservations"], [])
+
+    def _needs_reconcile_review(self, run_id):
+        agent = self.agent(
+            FakeTransport([api_agent.ProviderAmbiguous("503 after submission")]),
+            run_id=run_id,
+        )
+        token = agent.review_authorization
+        with self.assertRaises(api_agent.ProviderAmbiguous):
+            agent.run(
+                {
+                    "model": "test-model",
+                    "max_tokens": 100,
+                    "system": [],
+                    "messages": [{"role": "user", "content": "review"}],
+                }
+            )
+        self.assertEqual(agent.state["status"], "needs_reconcile")
+        return agent, token
+
+    def _reconcile_args(self, run_id, outcome="not-found", **usage):
+        return type(
+            "Args",
+            (),
+            {
+                "run_id": run_id,
+                "outcome": outcome,
+                "evidence": "provider dashboard search at 2026-09-17T12:00Z",
+                "response_id": usage.pop("response_id", None),
+                "input_tokens": usage.get("input_tokens", 0),
+                "cache_write_tokens": 0,
+                "cache_read_tokens": 0,
+                "output_tokens": usage.get("output_tokens", 0),
+                "config": str(self.root / ".orchestration" / "config.yaml"),
+            },
+        )()
+
+    def _review_permit(self, token, pr="1"):
+        from review_permit import ledger_path
+
+        ledger = json.loads(
+            ledger_path(self.root, ".orchestration/.review-ledger", pr).read_text(
+                encoding="utf-8"
+            )
+        )
+        return next(p for p in ledger["review_permits"] if p["token"] == token)
+
+    def _ledger_cli(self, *args):
+        return subprocess.run(
+            [sys.executable, str(ROOT / "scripts/review-ledger.py"), *args],
+            cwd=self.root,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_started_review_refusal_names_permit_run_and_recovery(self):
+        _, token = self._needs_reconcile_review("refusal-run")
+        head = self._review_permit(token)["head"]
+        refused = self._ledger_cli(
+            "permit-review", "1", "--role", "code-reviewer", "--head", head
+        )
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn(token[:14], refused.stderr)
+        self.assertNotIn(token, refused.stderr)
+        self.assertIn("run refusal-run", refused.stderr)
+        self.assertIn("api_agent.py reconcile --run-id refusal-run", refused.stderr)
+        self.assertIn("cancel-permit", refused.stderr)
+
+    def test_reconcile_not_found_cancels_started_review_permit(self):
+        agent, token = self._needs_reconcile_review("not-found-review")
+        binding = json.loads(agent.state_path.read_text(encoding="utf-8"))[
+            "review_permit"
+        ]
+        self.assertEqual(binding["pr"], "1")
+        self.assertEqual(binding["role"], "code-reviewer")
+        self.assertNotIn(token, json.dumps(binding))
+        reconciled = api_agent.reconcile_run(
+            self._reconcile_args("not-found-review"), self.root
+        )
+        self.assertEqual(reconciled["status"], "reconciled_not_found")
+        self.assertEqual(reconciled["usage"]["open_reservations"], [])
+        self.assertEqual(reconciled["review_permit"]["status"], "cancelled")
+        permit = self._review_permit(token)
+        self.assertTrue(permit["cancelled_at"])
+        self.assertIn("not-found", permit["cancellation_reason"])
+        self.assertFalse(permit["completion_receipt"])
+        self.assertNotEqual(self.phase_permit(), token)
+
+    def test_reconcile_completed_cancels_permit_without_a_receipt(self):
+        _, token = self._needs_reconcile_review("completed-review")
+        reconciled = api_agent.reconcile_run(
+            self._reconcile_args(
+                "completed-review",
+                outcome="completed",
+                response_id="msg_found",
+                input_tokens=40,
+                output_tokens=5,
+            ),
+            self.root,
+        )
+        self.assertEqual(reconciled["status"], "reconciled_completed")
+        self.assertGreater(api_agent.Decimal(reconciled["cost_usd"]), 0)
+        self.assertEqual(reconciled["review_permit"]["status"], "cancelled")
+        self.assertIn("re-run", reconciled["review_permit"]["message"])
+        permit = self._review_permit(token)
+        self.assertTrue(permit["cancelled_at"])
+        self.assertFalse(permit["completion_receipt"])
+        self.assertNotEqual(self.phase_permit(), token)
+
+    def test_reconcile_reports_an_already_cancelled_permit(self):
+        agent, token = self._needs_reconcile_review("already-cancelled")
+        api_agent.cancel_unresolved_review_permit(
+            shared_root=self.root,
+            ledger_dir=".orchestration/.review-ledger",
+            pr="1",
+            token=token,
+            reason="operator cleanup",
+            timestamp="earlier",
+        )
+        reconciled = api_agent.reconcile_run(
+            self._reconcile_args("already-cancelled"), self.root
+        )
+        self.assertEqual(reconciled["status"], "reconciled_not_found")
+        self.assertEqual(reconciled["usage"]["open_reservations"], [])
+        self.assertEqual(reconciled["review_permit"]["status"], "already_cancelled")
+        self.assertEqual(self._review_permit(token)["cancelled_at"], "earlier")
+
+    def test_failed_money_reconciliation_never_cancels_the_permit(self):
+        _, token = self._needs_reconcile_review("money-first")
+        with self.assertRaisesRegex(api_agent.AgentError, "response-id"):
+            api_agent.reconcile_run(
+                self._reconcile_args("money-first", outcome="completed"), self.root
+            )
+        permit = self._review_permit(token)
+        self.assertTrue(permit["started_at"])
+        self.assertFalse(permit.get("cancelled_at"))
+
+    def test_cancel_permit_fails_closed_until_provider_work_is_reconciled(self):
+        agent, token = self._needs_reconcile_review("legacy-review")
+        # A run state written before permit binding cannot cancel on reconcile.
+        state = json.loads(agent.state_path.read_text(encoding="utf-8"))
+        state.pop("review_permit")
+        agent.state_path.write_text(json.dumps(state), encoding="utf-8")
+        refused = self._ledger_cli(
+            "cancel-permit", "1", "--phase-permit", token, "--reason", "stuck"
+        )
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("open usage reservation", refused.stderr)
+        self.assertIn("legacy-review", refused.stderr)
+        self.assertFalse(self._review_permit(token).get("cancelled_at"))
+
+        reconciled = api_agent.reconcile_run(
+            self._reconcile_args("legacy-review"), self.root
+        )
+        self.assertEqual(reconciled["review_permit"]["status"], "unbound")
+        self.assertIn("cancel-permit", reconciled["review_permit"]["message"])
+        self.assertTrue(self._review_permit(token)["started_at"])
+
+        cancelled = self._ledger_cli(
+            "cancel-permit",
+            "1",
+            "--phase-permit",
+            token,
+            "--role",
+            "code-reviewer",
+            "--reason",
+            "provider confirmed no request",
+        )
+        self.assertEqual(cancelled.returncode, 0, cancelled.stderr)
+        self.assertEqual(
+            json.loads(cancelled.stdout)["permit_cancelled"]["status"], "cancelled"
+        )
+        permit = self._review_permit(token)
+        self.assertEqual(permit["cancellation_reason"], "provider confirmed no request")
+        self.assertTrue(permit["cancelled_at"])
+        self.assertFalse(permit["completion_receipt"])
+        self.assertNotEqual(self.phase_permit(), token)
 
     def test_bulk_reservation_reconciliation_requires_and_preserves_evidence(self):
         ledger = api_agent.UsageLedger(self.root)

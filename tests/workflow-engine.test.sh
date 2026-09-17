@@ -39,6 +39,18 @@ cp "$FIX/legacy-v1.yaml" "$TMP/invalid-trust-profile.yaml"
 printf '\nworker_trust_profile: omnipotent-worker\n' >> "$TMP/invalid-trust-profile.yaml"
 run_fail "invalid worker trust profile" "$ENGINE" --config "$TMP/invalid-trust-profile.yaml" validate-config
 
+cp "$FIX/legacy-v1.yaml" "$TMP/budget-above-caps.yaml"
+printf '\nllm:\n  budgets:\n    max_usd_per_run: 200\n    max_usd_per_ticket: 400\n    max_usd_per_sprint: 4000\n    max_usd_per_code_review_phase: 8\n' >> "$TMP/budget-above-caps.yaml"
+BUDGET_OUT="$("$ENGINE" --config "$TMP/budget-above-caps.yaml" validate-config 2>"$TMP/budget-warnings.txt")"
+eq "budget values above hard caps stay non-fatal" "0" "$?"
+eq "budget cap warnings keep the validation result on stdout" "OK schema_version=1" "$BUDGET_OUT"
+BUDGET_WARNINGS="$(cat "$TMP/budget-warnings.txt")"
+eq "each budget value above its hard cap is reported" "WARNING llm.budgets.max_usd_per_run=200 exceeds the hard cap 10.00; Orka enforces 10.00
+WARNING llm.budgets.max_usd_per_ticket=400 exceeds the hard cap 30.00; Orka enforces 30.00
+WARNING llm.budgets.max_usd_per_sprint=4000 exceeds the hard cap 300.00; Orka enforces 300.00" "$BUDGET_WARNINGS"
+eq "budgets within hard caps produce no warnings" "" \
+  "$("$ENGINE" --config "$FIX/legacy-v1.yaml" validate-config 2>&1 >/dev/null)"
+
 eq "branch role resolves Gecktopia candidate template" "release/2026.08.05" \
   "$("$ENGINE" --config "$FIX/gecktopia-adr-008.yaml" branch-name candidate --var candidate_id=2026.08.05)"
 eq "branch role resolves custom simple topic template" "work/ABC-1-thing" \
@@ -168,6 +180,112 @@ cd "$ROOT" || exit 1
 
 run_fail "legacy config refuses configurable transition commands" \
   "$ENGINE" --config "$FIX/legacy-v1.yaml" plan-transition freeze
+
+# --- Prettier-formatted flow sequences -----------------------------------------
+# Prettier rewraps long flow lists onto the line after the key, or across lines.
+# js-yaml accepts every form below, so the engine must parse each one exactly as
+# it parses the equivalent one-line list.
+parsed_json() {
+  python3 - "$ENGINE" "$1" 2>&1 <<'PY'
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("orka_engine_under_test", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+print(json.dumps(module.load_simple_yaml(__import__("pathlib").Path(sys.argv[2])), sort_keys=True))
+PY
+}
+
+cp "$FIX/legacy-v1.yaml" "$TMP/flow-one-line.yaml"
+cat >> "$TMP/flow-one-line.yaml" <<'YAML'
+llm:
+  roles:
+    implementer:
+      allowed_tools: [read_file, search, git_diff, git_status, run_check, apply_patch]
+      effort: high
+security_required_when: [migrations/, "SECURITY DEFINER", 'a, b', "x [y]", "c # d"]
+security_required_source_branches: ["hotfix/**"]
+YAML
+cp "$FIX/legacy-v1.yaml" "$TMP/flow-prettier.yaml"
+cat >> "$TMP/flow-prettier.yaml" <<'YAML'
+llm:
+  roles:
+    implementer:
+      allowed_tools:
+        [read_file, search, git_diff, git_status, run_check, apply_patch]
+      effort: high
+security_required_when: # comment after the key
+  [
+    migrations/, # inline comment inside the list
+    "SECURITY DEFINER",
+
+    # a full-line comment inside the list
+    'a, b',
+    "x [y]",
+    "c # d",
+  ]
+security_required_source_branches: [
+    "hotfix/**",
+  ]
+YAML
+cp "$FIX/legacy-v1.yaml" "$TMP/flow-wrapped.yaml"
+cat >> "$TMP/flow-wrapped.yaml" <<'YAML'
+llm:
+  roles:
+    implementer:
+      allowed_tools: [read_file, search, git_diff,
+        git_status, run_check, apply_patch,]
+      effort: high
+security_required_when: [migrations/, "SECURITY DEFINER",
+  'a, b', "x [y]",
+  "c # d"]
+security_required_source_branches:
+  - hotfix/**
+YAML
+run_ok "one-line flow sequences validate" "$ENGINE" --config "$TMP/flow-one-line.yaml" validate-config
+run_ok "Prettier next-line flow sequence under a role map validates" "$ENGINE" --config "$TMP/flow-prettier.yaml" validate-config
+run_ok "flow sequence wrapped across lines validates" "$ENGINE" --config "$TMP/flow-wrapped.yaml" validate-config
+eq "quoted flow items keep commas, brackets, and hashes" \
+  '["migrations/", "SECURITY DEFINER", "a, b", "x [y]", "c # d"]' \
+  "$(parsed_json "$TMP/flow-one-line.yaml" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["security_required_when"]))')"
+eq "Prettier next-line form parses identically to the one-line form" \
+  "$(parsed_json "$TMP/flow-one-line.yaml")" "$(parsed_json "$TMP/flow-prettier.yaml")"
+eq "wrapped flow form with trailing comma parses identically to the one-line form" \
+  "$(parsed_json "$TMP/flow-one-line.yaml")" "$(parsed_json "$TMP/flow-wrapped.yaml")"
+printf 'diff --git a/x b/x\n+++ b/db/migrations/1.sql\n+select 1\n' > "$TMP/flow.diff"
+eq "security gate reads Prettier triggers identically to one-line triggers" \
+  "$("$ENGINE" --config "$TMP/flow-one-line.yaml" security-gate --source-branch hotfix/a --target-branch develop --diff-file "$TMP/flow.diff")" \
+  "$("$ENGINE" --config "$TMP/flow-prettier.yaml" security-gate --source-branch hotfix/a --target-branch develop --diff-file "$TMP/flow.diff")"
+
+cp "$FIX/legacy-v1.yaml" "$TMP/flow-unterminated.yaml"
+cat >> "$TMP/flow-unterminated.yaml" <<'YAML'
+security_required_when: [migrations/,
+  auth
+gates:
+  - code-review
+YAML
+run_fail "unterminated flow sequence is refused" "$ENGINE" --config "$TMP/flow-unterminated.yaml" validate-config
+unterminated_err="$("$ENGINE" --config "$TMP/flow-unterminated.yaml" validate-config 2>&1 >/dev/null)"
+case "$unterminated_err" in
+  *"line 13"*unterminated*) ok "unterminated flow sequence refusal names the opening line" ;;
+  *) fail_case "unterminated flow sequence refusal names the opening line: $unterminated_err" ;;
+esac
+cp "$FIX/legacy-v1.yaml" "$TMP/flow-eof.yaml"
+printf 'gates: [code-review,\n  security-review\n' >> "$TMP/flow-eof.yaml"
+run_fail "flow sequence left open at end of file is refused" "$ENGINE" --config "$TMP/flow-eof.yaml" validate-config
+cp "$FIX/legacy-v1.yaml" "$TMP/flow-map.yaml"
+printf 'merge_guard: {block_squash: true}\n' >> "$TMP/flow-map.yaml"
+flow_map_err="$("$ENGINE" --config "$TMP/flow-map.yaml" validate-config 2>&1 >/dev/null)"
+case "$flow_map_err" in
+  *"line 13"*"flow mapping"*hint:*) ok "flow mapping is refused with its line and a block-form hint" ;;
+  *) fail_case "flow mapping is refused with its line and a block-form hint: $flow_map_err" ;;
+esac
+cp "$FIX/legacy-v1.yaml" "$TMP/flow-nested.yaml"
+printf 'gates: [code-review, [security-review]]\n' >> "$TMP/flow-nested.yaml"
+nested_err="$("$ENGINE" --config "$TMP/flow-nested.yaml" validate-config 2>&1 >/dev/null)"
+case "$nested_err" in
+  *"line 13"*nested*hint:*) ok "nested flow sequence is refused with its line and a hint" ;;
+  *) fail_case "nested flow sequence is refused with its line and a hint: $nested_err" ;;
+esac
 
 if rg -n "Vercel|Supabase|TestFlight|Play Console|Jira|GECK" "$ROOT/scripts/orchestration-engine.py" >/dev/null; then
   fail_case "provider or ticket prefix leaked into core engine"

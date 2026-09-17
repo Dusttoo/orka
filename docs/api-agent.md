@@ -133,8 +133,12 @@ IDs are separately bounded by `max_reviewer_runs_per_ticket`; design attempts
 use the durable `max_design_rounds` ledger and do not consume that later gate
 capacity. Tool rounds and reconciled provider continuations inside one stable
 run ID do not consume extra run slots. Repository configuration may
-tighten the compiled incident ceilings but cannot raise or disable them. There
-is deliberately no same-user CLI approval bypass.
+tighten the compiled incident ceilings but cannot disable them. The only values
+it can raise are the design, code-review, and security-review phase envelopes,
+and only up to their $10 hard cap (see [Phase spending envelopes](#phase-spending-envelopes)).
+Values above a hard cap are clamped; `orchestration-engine.py validate-config`
+prints a `WARNING` for each one. There is deliberately no same-user CLI approval
+bypass.
 
 With `issue-budget`, a host operator may authorize one ticket to continue to an exact absolute
 ceiling with the separately installed root authority. This raises only that
@@ -160,6 +164,43 @@ and `--worker-ref` exactly as returned and bound by `sprint-controller.py
 reserve`. Reviewer output is usable only after the API runner creates a
 digest-bound completion receipt; native reviewers use `review-ledger.py
 complete-review` after writing their structured result.
+
+### Reviewer turns and the final verdict turn
+
+Design, code, and security reviewer turns submit, and therefore reserve, at most
+`max_output_tokens_per_review_turn` output tokens (default 8192, never above
+`max_output_tokens_per_turn`). Implementer turns keep the full
+`max_output_tokens_per_turn` allowance. Every reservation is still the worst
+case of the exact request submitted.
+
+The first reviewer request starts with an `ORKA BUDGET NOTE`: the phase ceiling,
+what the phase has already spent or reserved, the remaining capacity across the
+configured phase, run, ticket, and sprint ceilings, the per-turn output
+reservation, and the tool-round limit. The note does not query host budget
+grants, so it can understate capacity but never overstate it; admission remains
+authoritative.
+
+When the next tool continuation is refused by a dollar ceiling, or
+`max_tool_rounds` is reached, the reviewer gets one final verdict turn instead
+of losing its work:
+
+- The request keeps the transcript, disables tools (`tool_choice` none; Bedrock
+  Converse cannot express this, so a tool call there fails closed), appends an
+  instruction to return the final structured review JSON from the evidence
+  gathered, and caps output at `final_verdict_output_tokens` (default 4096, never
+  above the review turn bound).
+- At the tool-round limit, pending tool calls are answered as not executed.
+- The request is admitted like any other. If it does not fit either, the run is
+  `budget_blocked` as before.
+- A FAIL is validated and receives a completion receipt exactly like a normal
+  review, so its blocking findings reach the repair brief. A PASS is never
+  authoritative: it may rest on partial evidence, so the run ends
+  `budget_blocked`, keeps the verdict in its state for inspection, creates no
+  receipt, and releases the permit for a fresh review under a larger budget.
+  The run state and result record `final_turn` (`budget` or `max_tool_rounds`)
+  and `final_turn_reason`.
+- There is never a second final turn. A final turn that returns tool calls is
+  `budget_blocked`, and the review permit is released.
 
 After every response, actual uncached input, cache writes, cache reads, output,
 and reasoning usage is recorded under `.orchestration/.llm-usage/usage.jsonl`.
@@ -210,6 +251,9 @@ run outcomes: completed 44, budget_blocked 1, invalid_output 1
   window before grouping. `--top N` keeps the N costliest groups; TOTAL still
   covers every group, and the table says how many were hidden.
 - `--format json` emits the same report for a dashboard or a checkpoint.
+- Open reservations follow the same filters and window. When other open
+  reservations exist, the report shows the ledger-wide count separately
+  (`open_reservations_ledger_wide` in JSON).
 
 `cache_hit` is the share of billed input served from cache
 (`cache_read / (input + cache_read + cache_write)`). It is the fastest signal
@@ -247,6 +291,32 @@ If the provider completed the request, use `--outcome completed`, its response
 id, and the provider-reported token counts. This settles actual cost, but the
 controller must still inspect the recovered result before advancing workflow
 state. Never release an uncertain reservation merely to make budget available.
+
+A reviewer run records its review permit binding (PR, role, exact head, ledger
+directory, logical review id, and a SHA-256 digest and short prefix of the
+token, never the token itself) in its run marker. Reconciling that run closes
+the money first and then cancels the started permit, reported under
+`review_permit` in the output and `review_permit_reconciliation` in the run
+state. Both outcomes cancel: a `completed` reconciliation settles cost but has
+no validated structured review or completion receipt, so it can never yield a
+PASS and the review must be re-run under a new permit. A money failure leaves
+the permit untouched. A permit that is already cancelled, superseded, or
+completed is reported without failing reconciliation, and rerunning after a
+crash is safe. `reconcile-reservations` cancels bound permits the same way.
+
+Run markers written before this binding report `review_permit.status:
+unbound`. Once the reservation is reconciled, release the permit explicitly:
+
+```text
+scripts/review-ledger.py cancel-permit PR --phase-permit TOKEN \
+  --role code-reviewer --reason "provider lookup found no request"
+```
+
+`cancel-permit` refuses while any usage reservation for the permit's run or
+logical review is still open, and refuses unstarted (reissue it with
+`permit-review`), completed, cancelled, or superseded permits. It records the
+reason and time on the permit and never creates a receipt. Confirm no reviewer
+process for that permit is still running before using it.
 
 For several historical reservations, first generate a bounded manifest inside
 the repository:
@@ -395,13 +465,17 @@ a logical identity is counted conservatively by execution ID.
 
 ### Phase spending envelopes
 
-`llm.budgets` accepts four positive dollar limits. The defaults and compiled
-maximums are $5 for `max_usd_per_design_phase` (scoping plus design review), $12
-for `max_usd_per_implementation_phase`, and $5 each for
+`llm.budgets` accepts four positive dollar limits. The defaults are $5 for
+`max_usd_per_design_phase` (scoping plus design review), $12 for
+`max_usd_per_implementation_phase`, and $5 each for
 `max_usd_per_code_review_phase` and `max_usd_per_security_review_phase`.
 The starter configuration retains its stricter $2 overall ticket limit.
-Repository configuration can tighten the phase ceilings. A ticket budget grant does
-not expand a phase envelope.
+Repository configuration can tighten every phase ceiling. It can raise the
+design, code-review, and security-review envelopes up to a $10 hard cap, equal
+to the compiled `max_usd_per_run`, so one run still cannot exceed the run
+ceiling. The implementation envelope cannot be raised above $12. Larger values
+are clamped to the hard cap and reported by `validate-config`. A ticket budget
+grant does not expand a phase envelope.
 
 Each envelope counts settled usage plus unresolved reservations across all runs
 for that ticket. Rejection or reconciliation can restore unused reserved capacity;
@@ -409,7 +483,9 @@ actual spending is never erased. Phase exhaustion does not latch a ticket pause
 or consume another phase's allowance. Ticket and sprint ceilings still apply to
 the combined cost. Envelopes are limits, not prepaid allocations. After a
 controller-verified design approval, unused design allowance transfers to
-implementation once, provided no design reservations remain unresolved. The
+implementation once, provided no design reservations remain unresolved. Only
+allowance within the $5 design default transfers, so raising the design phase
+cannot enlarge implementation. The
 transfer removes that allowance from design and leaves review allowances and
 aggregate ticket/sprint ceilings unchanged. If uncertain design work still has
 a reservation, a later verified progress replay can retry the transfer after

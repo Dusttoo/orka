@@ -6,6 +6,8 @@
 #
 #   1. flat scalars           key: value
 #   2. block lists            key:\n  - item\n  - item
+#      flow lists             key: [a, b]  (also Prettier's next-line and wrapped
+#                             forms; delegated to the engine's shared parser)
 #   3. self_check list-of-map self_check:\n  - name: x\n    run: y
 #
 # Anything deeper is read semantically by the agents from the YAML, not here.
@@ -65,13 +67,40 @@ orch_get() {
   if [ -n "$v" ]; then printf '%s' "$v"; else printf '%s' "$def"; fi
 }
 
-# orch_list <key> -- items of a top-level block list, one per line. Strips a
-# trailing inline comment and surrounding quotes on each item. Emits nothing if
-# the key is absent or is not a block list.
+# orch_list <key> -- items of a top-level list, one per line. Block lists are
+# read here (trailing inline comment and surrounding quotes stripped). Flow
+# lists -- `key: [a, b]`, Prettier's `key:` followed by an indented `[a, b]`, or
+# a list wrapped across lines -- are read by the engine's shared parser so they
+# resolve exactly as the engine resolves them; a malformed flow list is refused
+# (non-zero exit) rather than silently read as empty. Emits nothing if the key
+# is absent or is not a list.
 orch_list() {
   local key="$1" f
   f="$(orch_config_file)"
   [ -f "$f" ] || return 0
+  if orch_list_is_flow "$key" "$f"; then
+    python3 - "$(orch_engine)" "$f" "$key" <<'PY'
+import importlib.util, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("orch_list_config_parser", sys.argv[1])
+engine = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(engine)
+try:
+    data = engine.load_simple_yaml(Path(sys.argv[2]))
+except engine.EngineError as exc:
+    print(f"orch_list: REFUSED: invalid config syntax in {sys.argv[2]}: {exc}", file=sys.stderr)
+    hint = getattr(exc, "hint", "")
+    if hint:
+        print(f"  hint: {hint}", file=sys.stderr)
+    raise SystemExit(2)
+value = data.get(sys.argv[3]) if isinstance(data, dict) else None
+for item in value if isinstance(value, list) else []:
+    if item is None:
+        continue
+    print(str(item).lower() if isinstance(item, bool) else item)
+PY
+    return
+  fi
   awk -v key="$key" '
     $0 ~ "^" key ":[[:space:]]*(#.*)?$" { inblk=1; next }
     inblk {
@@ -89,6 +118,27 @@ orch_list() {
       inblk = 0                                            # anything else ends it
     }
   ' "$f"
+}
+
+# orch_list_is_flow <key> <file> -- true when the top-level <key> holds a flow
+# list: an inline value starting with `[`, or an empty value whose first
+# non-blank, non-comment line below it starts with `[`.
+orch_list_is_flow() {
+  awk -v key="$1" '
+    !found && $0 ~ "^" key ":" {
+      rest = substr($0, length(key) + 2)
+      sub(/^[[:space:]]+/, "", rest)
+      if (rest ~ /^\[/) { flow = 1; exit }
+      if (rest == "" || rest ~ /^#/) { found = 1; next }
+      exit
+    }
+    found {
+      if ($0 ~ /^[[:space:]]*$/ || $0 ~ /^[[:space:]]*#/) next
+      if ($0 ~ /^[[:space:]]+\[/) flow = 1
+      exit
+    }
+    END { exit(flow ? 0 : 1) }
+  ' "$2"
 }
 
 # orch_named <block> <name> <field> -- within a top-level list-of-maps `block:`,

@@ -94,12 +94,83 @@ class PhaseBudgetTests(unittest.TestCase):
         with self.assertRaisesRegex(BudgetError, "max_usd_per_implementation_phase"):
             self.reserve(".6", role="implementer")
 
-    def test_caps_cannot_be_disabled_or_increased_in_configuration(self):
+    def test_caps_cannot_be_disabled_or_increased_past_hard_caps(self):
         for value in (0, -1):
             with self.assertRaises(AgentError):
                 budgets_from_config({"llm": {"budgets": {"max_usd_per_design_phase": value}}})
         limits = budgets_from_config({"llm": {"budgets": {"max_usd_per_design_phase": 999}}})
-        self.assertEqual(limits["max_usd_per_design_phase"], Decimal("5"))
+        self.assertEqual(limits["max_usd_per_design_phase"], Decimal("10"))
+        defaults = budgets_from_config({})
+        for key in ("max_usd_per_design_phase", "max_usd_per_code_review_phase",
+                    "max_usd_per_security_review_phase"):
+            self.assertEqual(defaults[key], Decimal("5"))
+        self.assertEqual(defaults["max_usd_per_implementation_phase"], Decimal("12"))
+
+    def test_review_and_design_phases_raise_only_to_hard_cap(self):
+        raised = budgets_from_config({"llm": {"budgets": {
+            "max_usd_per_code_review_phase": 8, "max_usd_per_security_review_phase": 50,
+            "max_usd_per_design_phase": "9.5", "max_usd_per_implementation_phase": 50,
+            "max_usd_per_run": 200}}})
+        self.assertEqual(raised["max_usd_per_code_review_phase"], Decimal("8"))
+        self.assertEqual(raised["max_usd_per_security_review_phase"], Decimal("10"))
+        self.assertEqual(raised["max_usd_per_design_phase"], Decimal("9.5"))
+        self.assertEqual(raised["max_usd_per_implementation_phase"], Decimal("12"))
+        self.assertEqual(raised["max_usd_per_run"], Decimal("10"))
+        limits = self.ledger.phase_limits([], "T-1", raised)
+        self.assertEqual(limits["code_review"], Decimal("8"))
+        self.assertEqual(limits["security_review"], Decimal("10"))
+        self.assertEqual(limits["implementation"], Decimal("12"))
+        # A hand-built limits map cannot bypass the hard cap either.
+        forged = dict(raised, max_usd_per_code_review_phase=Decimal("40"),
+                      max_usd_per_implementation_phase=Decimal("40"))
+        limits = self.ledger.phase_limits([], "T-1", forged)
+        self.assertEqual(limits["code_review"], Decimal("10"))
+        self.assertEqual(limits["implementation"], Decimal("12"))
+        self.assertTrue(self.ledger.reserve(projected=Decimal("7.5"), limits=raised,
+            run_id="review-1", ticket="T-1", sprint="1", provider="anthropic",
+            model="test", role="code-reviewer"))
+        with self.assertRaisesRegex(BudgetError, "max_usd_per_code_review_phase"):
+            self.ledger.reserve(projected=Decimal("0.6"), limits=raised, run_id="review-2",
+                ticket="T-1", sprint="1", provider="anthropic", model="test",
+                role="code-reviewer")
+        self.assertTrue(self.ledger.reserve(projected=Decimal("0.5"), limits=raised,
+            run_id="review-2", ticket="T-1", sprint="1", provider="anthropic",
+            model="test", role="code-reviewer"))
+
+    def test_raised_design_phase_cannot_enlarge_implementation_transfer(self):
+        limits = budgets_from_config({"llm": {"budgets": {"max_usd_per_design_phase": 10}}})
+        self.ledger.settle(self.ledger.reserve(projected=Decimal("1"), limits=limits,
+            run_id="design", ticket="T-1", sprint="1", provider="anthropic", model="test",
+            role="design-reviewer"), run_id="design", ticket="T-1", sprint="1",
+            provider="anthropic", model="test", response_id="d", usage={},
+            cost=Decimal("1"), role="design-reviewer")
+        self.assertTrue(self.ledger.transfer_design_budget("T-1", limits, "pass"))
+        effective = self.ledger.phase_limits(self.ledger.snapshot(), "T-1", limits)
+        # Only the compiled $5 design default can move: 12 + (5 - 1).
+        self.assertEqual(effective["implementation"], Decimal("16"))
+        self.assertEqual(effective["design"], Decimal("6"))
+
+    def test_budget_cap_violations_report_silent_reductions(self):
+        from api_agent import budget_cap_violations
+        self.assertEqual(budget_cap_violations({}), [])
+        self.assertEqual(budget_cap_violations({"llm": {"budgets": {
+            "max_usd_per_run": 5, "max_usd_per_code_review_phase": 8}}}), [])
+        violations = budget_cap_violations({"llm": {"budgets": {
+            "max_usd_per_run": 200, "max_usd_per_ticket": 400, "max_usd_per_sprint": 4000,
+            "max_usd_per_code_review_phase": 50, "max_usd_per_implementation_phase": 13,
+            "max_output_tokens_per_turn": 4096, "max_output_tokens_per_review_turn": 8192}}})
+        by_key = {item["key"]: item for item in violations}
+        self.assertEqual(by_key["max_usd_per_run"],
+                         {"key": "max_usd_per_run", "configured": "200",
+                          "effective": "10.00", "cap": "10.00"})
+        self.assertEqual(by_key["max_usd_per_ticket"]["effective"], "30.00")
+        self.assertEqual(by_key["max_usd_per_sprint"]["effective"], "300.00")
+        self.assertEqual(by_key["max_usd_per_code_review_phase"]["cap"], "10")
+        self.assertEqual(by_key["max_usd_per_implementation_phase"]["effective"], "12")
+        # Derived output bounds follow their documented minimum, not a hard cap.
+        self.assertEqual([item["key"] for item in violations], [
+            "max_usd_per_run", "max_usd_per_ticket", "max_usd_per_sprint",
+            "max_usd_per_implementation_phase", "max_usd_per_code_review_phase"])
 
     def test_snapshot_waits_for_complete_append(self):
         self.ledger.directory.mkdir(parents=True)

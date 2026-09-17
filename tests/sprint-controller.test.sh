@@ -185,6 +185,26 @@ CHECKPOINT="$(find "$TMP/repo/.orchestration/.sprint-state" -name '42-*.json' -p
 BEFORE_FAILED_FETCH="$(shasum -a 256 "$CHECKPOINT" | awk '{print $1}')"
 run_fail "production sync fails closed without Jira credentials" env -u JIRA_API_TOKEN -u JIRA_BASE_URL \
   "$CONTROLLER" sync --inventory-template inventory.json
+check_sync_refuses_readable_jira_env() {
+  local config="$TMP/repo/.orchestration/config.yaml" env_file="$TMP/repo/.orchestration/.env"
+  cp "$config" "$TMP/config-before-jira-env.yaml"
+  sed -i.bak 's#^jira_base_url:.*#jira_base_url: https://jira.example#' "$config" && rm "$config.bak"
+  printf 'JIRA_API_TOKEN=sync-secret-token\n' > "$env_file"
+  chmod 644 "$env_file"
+  env -u JIRA_API_TOKEN -u JIRA_EMAIL "$CONTROLLER" sync --inventory-template inventory.json \
+    > /dev/null 2> "$TMP/jira-env-sync.err"
+  local rc=$?
+  mv "$TMP/config-before-jira-env.yaml" "$config"
+  rm -f "$env_file"
+  [ "$rc" -ne 0 ] && grep -q 'chmod 600' "$TMP/jira-env-sync.err" \
+    && grep -q '\.orchestration/\.env' "$TMP/jira-env-sync.err" \
+    && ! grep -q 'sync-secret-token' "$TMP/jira-env-sync.err"
+}
+if check_sync_refuses_readable_jira_env; then
+  ok "sync loads Jira credentials from the shared env file and refuses readable files"
+else
+  fail_case "sync loads Jira credentials from the shared env file and refuses readable files"
+fi
 AFTER_FAILED_FETCH="$(shasum -a 256 "$CHECKPOINT" | awk '{print $1}')"
 if [ "$BEFORE_FAILED_FETCH" = "$AFTER_FAILED_FETCH" ]; then
   ok "failed provider inspection preserves the prior checkpoint"

@@ -6,21 +6,127 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import importlib.util
 import json
 import os
 import re
+import stat
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any, Callable
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urljoin, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from context_pipeline import sanitize_jira_response
+from runtime_state import shared_repository_root
 
 Fetch = Callable[[str, str, int, int, str, list[str]], dict[str, Any]]
 MAX_PAGES = 10_000
 MAX_ITEMS = 1_000_000
 DEFAULT_PRIORITY_ORDER = ["Highest", "High", "Medium", "Low", "Lowest"]
+JIRA_CREDENTIAL_KEYS = ("JIRA_API_TOKEN", "JIRA_EMAIL")
+CREDENTIAL_FILE = Path(".orchestration/.env")
+
+
+def credential_file(start: Path) -> Path:
+    """The one supported Jira credential file, shared by every worktree."""
+    return shared_repository_root(Path(start)) / CREDENTIAL_FILE
+
+
+def read_credential_file(path: Path) -> dict[str, str]:
+    """Parse Jira keys from KEY=value data; never evaluate shell syntax.
+
+    Like ssh private keys, a secrets file readable or writable by group/other
+    (or owned by someone else) is refused instead of silently trusted.
+    """
+    try:
+        info = os.stat(path)
+    except FileNotFoundError:
+        return {}
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError(f"Jira credential file {path} is not a regular file")
+    if hasattr(os, "getuid") and info.st_uid != os.getuid():
+        raise ValueError(
+            f"Jira credential file {path} is not owned by the current user"
+        )
+    if info.st_mode & 0o077:
+        raise ValueError(
+            f"Jira credential file {path} is accessible by group or others "
+            f"(mode {stat.S_IMODE(info.st_mode):04o}); run chmod 600 {path}"
+        )
+    parsed: dict[str, str] = {}
+    lines = path.read_text(encoding="utf-8").splitlines()
+    for line_no, raw in enumerate(lines, 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)", line)
+        if not match:
+            raise ValueError(f"invalid {path} line {line_no}; expected KEY=value")
+        key, value = match.groups()
+        if key not in JIRA_CREDENTIAL_KEYS:
+            continue
+        if value.startswith('"'):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                value = None
+            if not isinstance(value, str):
+                raise ValueError(f"invalid quoted value in {path} line {line_no}")
+        elif value.startswith("'"):
+            if len(value) < 2 or not value.endswith("'"):
+                raise ValueError(f"unterminated quoted value in {path} line {line_no}")
+            value = value[1:-1]
+        else:
+            value = re.split(r"\s+#", value, maxsplit=1)[0].rstrip()
+        if any(char in value for char in "\x00\r\n"):
+            raise ValueError(f"invalid control character in {path} line {line_no}")
+        parsed[key] = value
+    return parsed
+
+
+def resolve_jira_credentials(
+    start: Path, environ: dict[str, str] | None = None
+) -> dict[str, Any]:
+    """Resolve Jira credentials identically for captain preflight and sync.
+
+    A non-empty process environment value wins per key; otherwise the value
+    comes from the shared repository's `.orchestration/.env`. The file is read
+    only when the environment leaves a key unset. Values are never logged.
+    """
+    env = os.environ if environ is None else environ
+    path = credential_file(start)
+    needs_file = any(not env.get(key) for key in JIRA_CREDENTIAL_KEYS)
+    from_file = read_credential_file(path) if needs_file else {}
+    values: dict[str, str] = {}
+    sources: dict[str, str] = {}
+    for key in JIRA_CREDENTIAL_KEYS:
+        if env.get(key):
+            values[key], sources[key] = env[key], "environment"
+        elif from_file.get(key):
+            values[key], sources[key] = from_file[key], "file"
+    if not values.get("JIRA_API_TOKEN"):
+        raise ValueError(
+            "JIRA_API_TOKEN is required; export it or add it to "
+            f"{CREDENTIAL_FILE} in the shared repository root ({path})"
+        )
+    return {
+        "token": values["JIRA_API_TOKEN"],
+        "email": values.get("JIRA_EMAIL", ""),
+        "sources": sources,
+        "file": str(path),
+    }
+
+
+def authorization_header(credentials: dict[str, Any]) -> str:
+    token, email = str(credentials["token"]), str(credentials.get("email") or "")
+    if email:
+        return "Basic " + base64.b64encode(f"{email}:{token}".encode()).decode()
+    return "Bearer " + token
 
 
 def write_json(path: Path, value: Any) -> None:
@@ -134,21 +240,58 @@ def sanitize_page(value: Any, fields: list[str]) -> dict[str, Any]:
     return {key: child for key, child in sanitized.items() if key in allowed}
 
 
-def network_fetcher(base_url: str) -> Fetch:
+def verify_jira_identity(
+    base_url: str, credentials: dict[str, Any], *, opener: Any = None
+) -> dict[str, str]:
+    """Make one authenticated `GET /rest/api/3/myself` against canonical policy."""
+    approved = validate_base_url(base_url)
+    endpoint = urljoin(base_url.rstrip("/") + "/", "rest/api/3/myself")
+    if url_origin(endpoint) != approved:
+        raise ValueError("Jira request escaped the approved origin")
+    opener = opener or build_opener(ApprovedOriginRedirectHandler(approved))
+    request = Request(
+        endpoint,
+        headers={
+            "Accept": "application/json",
+            "Authorization": authorization_header(credentials),
+        },
+    )
+    try:
+        with opener.open(request, timeout=30) as response:
+            if url_origin(response.geturl()) != approved:
+                raise ValueError("Jira response escaped the approved origin")
+            value = json.loads(response.read())
+    except HTTPError as exc:
+        hint = " (check JIRA_API_TOKEN and JIRA_EMAIL)" if exc.code in (401, 403) else ""
+        raise ValueError(
+            f"Jira rejected the authenticated identity check with HTTP {exc.code}{hint}"
+        ) from None
+    except (URLError, OSError) as exc:
+        reason = getattr(exc, "reason", exc)
+        raise ValueError(f"could not reach Jira at {approved}: {reason}") from None
+    except json.JSONDecodeError:
+        raise ValueError("Jira identity check returned invalid JSON") from None
+    account = (
+        value.get("accountId") or value.get("key") or value.get("name")
+        if isinstance(value, dict)
+        else None
+    )
+    if not account:
+        raise ValueError("Jira identity check did not return an account identity")
+    return {"account_id": str(account)}
+
+
+def network_fetcher(
+    base_url: str, credentials: dict[str, Any] | None = None
+) -> Fetch:
     approved = validate_base_url(base_url)
     endpoint = urljoin(base_url.rstrip("/") + "/", "rest/api/3/search/jql")
     if url_origin(endpoint) != approved:
         raise ValueError("Jira request escaped the approved origin")
     # Credentials are read only after canonical policy has established the trust anchor.
-    token = os.environ.get("JIRA_API_TOKEN", "")
-    if not token:
-        raise ValueError("JIRA_API_TOKEN is required")
-    email = os.environ.get("JIRA_EMAIL", "")
-    authorization = (
-        "Basic " + base64.b64encode(f"{email}:{token}".encode()).decode()
-        if email
-        else "Bearer " + token
-    )
+    if credentials is None:
+        credentials = resolve_jira_credentials(Path.cwd())
+    authorization = authorization_header(credentials)
     opener = build_opener(ApprovedOriginRedirectHandler(approved))
 
     def fetch(
@@ -600,20 +743,27 @@ def ticket_project_from_config(path: Path) -> str:
 
 
 def list_config(path: Path, key: str, default: list[str]) -> list[str]:
+    """Read a top-level list through the shared engine parser.
+
+    Block lists, one-line flow lists, and Prettier-wrapped flow lists resolve
+    identically; a malformed list fails closed instead of silently defaulting.
+    """
     if not path.is_file():
         return list(default)
-    lines = path.read_text(encoding="utf-8").splitlines()
-    values: list[str] = []
-    active = False
-    for raw in lines:
-        if raw.startswith(f"{key}:"):
-            active = True
-            continue
-        if active and raw and not raw[0].isspace():
-            break
-        match = re.fullmatch(r"\s+-\s+([^#]+?)(?:\s+#.*)?", raw)
-        if active and match:
-            values.append(match.group(1).strip().strip("\"'"))
+    engine_path = Path(__file__).with_name("orchestration-engine.py")
+    spec = importlib.util.spec_from_file_location("orka_inventory_config_parser", engine_path)
+    if spec is None or spec.loader is None:
+        raise ValueError("could not load orchestration configuration parser")
+    engine = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(engine)
+    try:
+        parsed = engine.load_simple_yaml(path)
+    except engine.EngineError as exc:
+        raise ValueError(f"invalid config syntax in {path}: {exc}") from exc
+    value = parsed.get(key) if isinstance(parsed, dict) else None
+    if not isinstance(value, list):
+        return list(default)
+    values = [str(item).strip() for item in value if item is not None and str(item).strip()]
     return values or list(default)
 
 
@@ -689,11 +839,11 @@ def run_adapter(
     else:
         if not base_url:
             raise ValueError("jira_base_url is required canonical Jira policy")
-        authority, approved, fetch = (
-            "provider-network",
-            validate_base_url(base_url),
-            network_fetcher(base_url),
-        )
+        # config lives at <checkout>/.orchestration/config.yaml; credentials
+        # resolve from that checkout's shared repository root, as in preflight.
+        approved = validate_base_url(base_url)
+        credentials = resolve_jira_credentials(config.parent.parent)
+        authority, fetch = "provider-network", network_fetcher(base_url, credentials)
     inventory, artifact = build_inventory(
         template,
         fetch,
@@ -731,7 +881,13 @@ def run_fixture_adapter(
 
 
 def main() -> int:
-    return run_adapter(parser().parse_args())
+    try:
+        return run_adapter(parser().parse_args())
+    except ValueError as exc:
+        # Messages never contain credential values; keep the reason visible
+        # to the controller operator instead of burying it in a traceback.
+        print(f"jira_inventory_fetch: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

@@ -59,7 +59,234 @@ def strip_comment(line: str) -> str:
     return line
 
 
-def parse_scalar(value: str) -> Any:
+class ConfigSyntaxError(EngineError):
+    """A config line the dependency-free YAML subset cannot represent.
+
+    `hint` names the unsupported construct and the supported spelling so
+    validate-config can tell the operator what to write instead.
+    """
+
+    def __init__(self, line: int, message: str, hint: str = "") -> None:
+        self.line = line
+        self.message = message
+        self.hint = hint
+        super().__init__(f"line {line}: {message}")
+
+
+FLOW_SEQUENCE_FORMS = (
+    "one line `key: [a, b]`, the next line `key:` then an indented `[a, b]`, "
+    "or continuation lines indented deeper than the key"
+)
+HINT_UNTERMINATED_FLOW = (
+    "flow sequence `[`...`]` must be closed; supported list forms are "
+    + FLOW_SEQUENCE_FORMS
+    + ", or a block list (`key:` then `  - a` lines)"
+)
+HINT_FLOW_MAPPING = (
+    "flow mappings `{a: 1}` are not supported (only the empty map `{}` is); "
+    "write a block mapping: `key:` then one indented `child: value` per line"
+)
+HINT_NESTED_FLOW = (
+    "nested flow collections are not supported; quote an item that contains "
+    "brackets or braces (`\"x [y]\"`) or use a block list of one-line flow lists"
+)
+HINT_FLOW_ITEM = (
+    "flow sequence items are comma-separated scalars; remove the extra comma "
+    "or quote the item, e.g. `key: [a, \"b, c\"]`"
+)
+HINT_FLOW_TRAILING = (
+    "nothing may follow the closing `]` except a comment; quote the whole value "
+    "if it is a string that starts with `[`, e.g. `run: \"[ -f x ] && y\"`"
+)
+HINT_FLOW_QUOTE = (
+    "multi-line quoted scalars are not supported; keep each quoted flow item "
+    "on one line, e.g. `key: [\"a, b\", c]`"
+)
+HINT_BLOCK_SCALAR = (
+    "block scalars (`|` or `>`) are not supported; write the value on one line, "
+    "quoted if it contains `: ` or ` #`"
+)
+HINT_MULTILINE_PLAIN = (
+    "multi-line plain values are not supported; keep the value on one line, or "
+    "leave the key's value empty and indent its child keys or list below it"
+)
+BLOCK_SCALAR_INDICATORS = {"|", ">", "|-", ">-", "|+", ">+"}
+
+
+def _flow_scan(fragment: str, state: dict[str, Any], lineno: int) -> str:
+    """Scan one physical fragment of a flow sequence, strictly.
+
+    Returns the fragment with any trailing comment removed and updates `state`
+    (depth, quote, item_start, closed, trailing). Quotes open only at the start
+    of an item, as in YAML, so apostrophes inside plain items stay literal.
+    """
+    out: list[str] = []
+    index = 0
+    size = len(fragment)
+    while index < size:
+        ch = fragment[index]
+        quote = state["quote"]
+        if quote:
+            out.append(ch)
+            if quote == '"' and ch == "\\" and index + 1 < size:
+                out.append(fragment[index + 1])
+                index += 2
+                continue
+            if ch == quote:
+                if quote == "'" and index + 1 < size and fragment[index + 1] == "'":
+                    out.append("'")
+                    index += 2
+                    continue
+                state["quote"] = ""
+            index += 1
+            continue
+        if ch == "#" and (index == 0 or fragment[index - 1].isspace()):
+            break
+        if state["closed"]:
+            if not ch.isspace():
+                state["trailing"] = True
+            out.append(ch)
+            index += 1
+            continue
+        if ch.isspace():
+            out.append(ch)
+            index += 1
+            continue
+        if ch in {"'", '"'} and state["item_start"]:
+            state["quote"] = ch
+            state["item_start"] = False
+            out.append(ch)
+            index += 1
+            continue
+        if ch == "[":
+            if state["depth"] == 0:
+                state["depth"] = 1
+                state["item_start"] = True
+                out.append(ch)
+                index += 1
+                continue
+            raise ConfigSyntaxError(
+                lineno, "nested flow sequences are not supported", HINT_NESTED_FLOW
+            )
+        if ch in {"{", "}"}:
+            raise ConfigSyntaxError(
+                lineno,
+                "flow mappings inside a flow sequence are not supported",
+                HINT_NESTED_FLOW,
+            )
+        if ch == "]":
+            state["depth"] = 0
+            state["closed"] = True
+            out.append(ch)
+            index += 1
+            continue
+        if ch == ",":
+            state["item_start"] = True
+        else:
+            state["item_start"] = False
+        out.append(ch)
+        index += 1
+    if state["quote"]:
+        raise ConfigSyntaxError(
+            lineno, "quoted flow sequence item is not closed on its line", HINT_FLOW_QUOTE
+        )
+    return "".join(out).rstrip()
+
+
+def _new_flow_state() -> dict[str, Any]:
+    return {"depth": 0, "quote": "", "item_start": False, "closed": False, "trailing": False}
+
+
+def _flow_depth_lenient(text: str) -> int:
+    """Bracket depth of a one-line value, tolerant of anything a legacy string holds."""
+    depth = 0
+    quote = ""
+    item_start = True
+    index = 0
+    while index < len(text):
+        ch = text[index]
+        if quote:
+            if quote == '"' and ch == "\\":
+                index += 2
+                continue
+            if ch == quote:
+                quote = ""
+            index += 1
+            continue
+        if ch == "#" and (index == 0 or text[index - 1].isspace()):
+            break
+        if ch in {"'", '"'} and item_start:
+            quote = ch
+        elif ch == "[":
+            depth += 1
+            item_start = True
+        elif ch == "]":
+            depth -= 1
+        elif ch == ",":
+            item_start = True
+        elif not ch.isspace():
+            item_start = False
+        index += 1
+    return depth
+
+
+def parse_flow_sequence(value: str, lineno: int = 0) -> list[Any]:
+    """Parse a complete one-line flow sequence `[a, "b, c", 'd',]` strictly."""
+    state = _new_flow_state()
+    clean = _flow_scan(value.strip(), state, lineno)
+    if not state["closed"]:
+        raise ConfigSyntaxError(
+            lineno, "unterminated flow sequence '['", HINT_UNTERMINATED_FLOW
+        )
+    if state["trailing"]:
+        raise ConfigSyntaxError(
+            lineno, "unexpected content after flow sequence ']'", HINT_FLOW_TRAILING
+        )
+    inner = clean.strip()[1:-1]
+    items: list[str] = []
+    current: list[str] = []
+    quote = ""
+    item_start = True
+    index = 0
+    while index < len(inner):
+        ch = inner[index]
+        if quote:
+            current.append(ch)
+            if quote == '"' and ch == "\\" and index + 1 < len(inner):
+                current.append(inner[index + 1])
+                index += 2
+                continue
+            if ch == quote:
+                if quote == "'" and index + 1 < len(inner) and inner[index + 1] == "'":
+                    current.append("'")
+                    index += 2
+                    continue
+                quote = ""
+            index += 1
+            continue
+        if ch == ",":
+            items.append("".join(current).strip())
+            current = []
+            item_start = True
+            index += 1
+            continue
+        if ch in {"'", '"'} and item_start:
+            quote = ch
+        if not ch.isspace():
+            item_start = False
+        current.append(ch)
+        index += 1
+    last = "".join(current).strip()
+    if last or items:
+        # A single trailing comma is allowed (`[a, b,]`); an empty list stays empty.
+        if last:
+            items.append(last)
+    if any(item == "" for item in items):
+        raise ConfigSyntaxError(lineno, "empty flow sequence item", HINT_FLOW_ITEM)
+    return [parse_scalar(item) for item in items]
+
+
+def parse_scalar(value: str, lineno: int = 0) -> Any:
     value = value.strip()
     if value == "":
         return ""
@@ -73,10 +300,14 @@ def parse_scalar(value: str) -> Any:
     if low in {"null", "none", "~"}:
         return None
     if value.startswith("[") and value.endswith("]"):
-        inner = value[1:-1].strip()
-        if not inner:
-            return []
-        return [parse_scalar(part.strip()) for part in inner.split(",")]
+        return parse_flow_sequence(value, lineno)
+    if value.startswith("{") and value.endswith("}"):
+        if value[1:-1].strip() == "":
+            return {}
+        if ":" in value:
+            raise ConfigSyntaxError(
+                lineno, "flow mappings ('{a: 1}') are not supported", HINT_FLOW_MAPPING
+            )
     return value
 
 
@@ -98,19 +329,150 @@ def split_key_value(text: str) -> tuple[str, str] | None:
     return None
 
 
+def _flow_value_offset(body: str) -> tuple[int, bool] | None:
+    """Locate a value in `body` that opens a flow sequence.
+
+    Returns (offset of the value within body, whether the owner line is a key or
+    dash whose value is empty so a flow sequence may follow on the next line).
+    `None` means the line neither holds nor introduces a flow sequence.
+    """
+    rest_offset = 0
+    if body.startswith("- "):
+        rest_offset = len(body) - len(body[2:].lstrip())
+    rest = body[rest_offset:]
+    if rest.startswith("["):
+        return rest_offset, False
+    kv = split_key_value(rest)
+    if kv is None:
+        return None
+    _key, val = kv
+    if val == "":
+        return len(body), True
+    if val.startswith("["):
+        return len(body) - len(val), False
+    return None
+
+
+def logical_config_lines(text: str) -> list[tuple[int, str, bool]]:
+    """Fold every multi-line flow sequence into one logical config line.
+
+    Returns (1-based line number, text, folded) tuples. Unfolded lines are the
+    original physical lines, untouched, so line-oriented readers see exactly
+    what they saw before. Folded lines are comment-free and carry the owner
+    line's indentation and key, e.g. `      allowed_tools: [read_file, search]`,
+    whether the source put the list on the key's line, on the next more-indented
+    line (Prettier), or across several lines. Readers must not strip comments
+    from folded lines again.
+    """
+    lines = text.splitlines()
+    out: list[tuple[int, str, bool]] = []
+    index = 0
+    while index < len(lines):
+        original = lines[index]
+        lineno = index + 1
+        clean = strip_comment(original).rstrip()
+        if not clean.strip():
+            out.append((lineno, original, False))
+            index += 1
+            continue
+        indent = len(clean) - len(clean.lstrip(" "))
+        body = clean[indent:]
+        located = _flow_value_offset(body)
+        if located is None:
+            out.append((lineno, original, False))
+            index += 1
+            continue
+        offset, empty_value = located
+        owner_indent = indent
+        start_index = index
+        if empty_value:
+            probe = index + 1
+            while probe < len(lines) and not strip_comment(lines[probe]).strip():
+                probe += 1
+            if probe >= len(lines):
+                out.append((lineno, original, False))
+                index += 1
+                continue
+            next_clean = strip_comment(lines[probe]).rstrip()
+            next_indent = len(next_clean) - len(next_clean.lstrip(" "))
+            if next_indent <= indent or not next_clean.lstrip(" ").startswith("["):
+                out.append((lineno, original, False))
+                index += 1
+                continue
+            head = body.rstrip() + " "
+            start_index = probe
+            first_fragment = lines[probe][next_indent:]
+        else:
+            head = body[:offset]
+            first_fragment = original[indent + offset :]
+            if _flow_depth_lenient(first_fragment) <= 0:
+                # Closed (or legacy string) on its own line: unchanged behaviour.
+                out.append((lineno, original, False))
+                index += 1
+                continue
+        state = _new_flow_state()
+        fragments = [_flow_scan(first_fragment, state, start_index + 1)]
+        cursor = start_index + 1
+        while not state["closed"]:
+            if cursor >= len(lines):
+                raise ConfigSyntaxError(
+                    start_index + 1,
+                    "unterminated flow sequence '[' (reached end of file)",
+                    HINT_UNTERMINATED_FLOW,
+                )
+            physical = lines[cursor]
+            if not physical.strip() or physical.strip().startswith("#"):
+                cursor += 1
+                continue
+            cont_indent = len(physical) - len(physical.lstrip(" "))
+            cont_body = physical[cont_indent:]
+            closer_at_owner = cont_indent == owner_indent and cont_body.startswith("]")
+            if cont_indent <= owner_indent and not closer_at_owner:
+                raise ConfigSyntaxError(
+                    start_index + 1,
+                    f"unterminated flow sequence '[' (line {cursor + 1} is not "
+                    "indented deeper than its key)",
+                    HINT_UNTERMINATED_FLOW,
+                )
+            fragment = _flow_scan(cont_body, state, cursor + 1)
+            if fragment:
+                fragments.append(fragment)
+            cursor += 1
+        if state["trailing"]:
+            raise ConfigSyntaxError(
+                cursor, "unexpected content after flow sequence ']'", HINT_FLOW_TRAILING
+            )
+        joined = " ".join(fragment.strip() for fragment in fragments if fragment.strip())
+        out.append((lineno, " " * indent + head + joined, True))
+        index = cursor
+    return out
+
+
+def config_text_lines(text: str) -> list[tuple[int, str]]:
+    """Comment-stripped logical lines (line number, text) for indentation readers."""
+    result: list[tuple[int, str]] = []
+    for lineno, line, folded in logical_config_lines(text):
+        result.append((lineno, line if folded else strip_comment(line).rstrip()))
+    return result
+
+
 def load_simple_yaml(path: Path) -> Any:
-    raw: list[tuple[int, str]] = []
-    for original in path.read_text(encoding="utf-8").splitlines():
-        line = strip_comment(original).rstrip()
+    raw: list[tuple[int, str, int, bool]] = []
+    for lineno, line, folded in logical_config_lines(path.read_text(encoding="utf-8")):
+        if not folded:
+            line = strip_comment(line).rstrip()
         if not line.strip():
             continue
         indent = len(line) - len(line.lstrip(" "))
-        raw.append((indent, line.lstrip(" ")))
+        raw.append((indent, line.lstrip(" "), lineno, folded))
+
+    def scalar(value: str, lineno: int) -> Any:
+        return parse_scalar(value, lineno)
 
     def parse_block(index: int, indent: int) -> tuple[Any, int]:
         if index >= len(raw):
             return {}, index
-        cur_indent, text = raw[index]
+        cur_indent, text, lineno, _folded = raw[index]
         if cur_indent < indent:
             return {}, index
         if text.startswith("- "):
@@ -120,7 +482,7 @@ def load_simple_yaml(path: Path) -> Any:
     def parse_map(index: int, indent: int) -> tuple[dict[str, Any], int]:
         result: dict[str, Any] = {}
         while index < len(raw):
-            cur_indent, text = raw[index]
+            cur_indent, text, lineno, _folded = raw[index]
             if cur_indent < indent:
                 break
             if cur_indent > indent:
@@ -129,7 +491,7 @@ def load_simple_yaml(path: Path) -> Any:
                 break
             kv = split_key_value(text)
             if kv is None:
-                raise EngineError(f"cannot parse line: {text}")
+                raise ConfigSyntaxError(lineno, f"cannot parse line: {text}")
             key, val = kv
             index += 1
             if val == "":
@@ -139,13 +501,13 @@ def load_simple_yaml(path: Path) -> Any:
                 else:
                     result[key] = {}
             else:
-                result[key] = parse_scalar(val)
+                result[key] = scalar(val, lineno)
         return result, index
 
     def parse_list(index: int, indent: int) -> tuple[list[Any], int]:
         result: list[Any] = []
         while index < len(raw):
-            cur_indent, text = raw[index]
+            cur_indent, text, lineno, _folded = raw[index]
             if cur_indent < indent:
                 break
             if cur_indent != indent or not text.startswith("- "):
@@ -159,9 +521,12 @@ def load_simple_yaml(path: Path) -> Any:
                     item = None
                 result.append(item)
                 continue
+            if rest.startswith("["):
+                result.append(scalar(rest, lineno))
+                continue
             kv = split_key_value(rest)
             if kv is None:
-                result.append(parse_scalar(rest))
+                result.append(scalar(rest, lineno))
                 continue
             key, val = kv
             item: dict[str, Any] = {}
@@ -172,9 +537,9 @@ def load_simple_yaml(path: Path) -> Any:
                 else:
                     item[key] = {}
             else:
-                item[key] = parse_scalar(val)
+                item[key] = scalar(val, lineno)
             while index < len(raw) and raw[index][0] > cur_indent:
-                next_indent, next_text = raw[index]
+                next_indent, next_text, next_lineno, _next_folded = raw[index]
                 if next_text.startswith("- "):
                     nested, index = parse_block(index, next_indent)
                     if isinstance(nested, list):
@@ -182,7 +547,7 @@ def load_simple_yaml(path: Path) -> Any:
                     continue
                 kv2 = split_key_value(next_text)
                 if kv2 is None:
-                    raise EngineError(f"cannot parse line: {next_text}")
+                    raise ConfigSyntaxError(next_lineno, f"cannot parse line: {next_text}")
                 k2, v2 = kv2
                 index += 1
                 if v2 == "":
@@ -192,7 +557,7 @@ def load_simple_yaml(path: Path) -> Any:
                     else:
                         item[k2] = {}
                 else:
-                    item[k2] = parse_scalar(v2)
+                    item[k2] = scalar(v2, next_lineno)
             result.append(item)
         return result, index
 
@@ -200,7 +565,21 @@ def load_simple_yaml(path: Path) -> Any:
         return {}
     parsed, index = parse_block(0, raw[0][0])
     if index != len(raw):
-        raise EngineError("could not parse full config")
+        _indent, text, lineno, _folded = raw[index]
+        previous = raw[index - 1][1] if index > 0 else ""
+        previous_kv = split_key_value(previous[2:] if previous.startswith("- ") else previous)
+        previous_value = previous_kv[1] if previous_kv else previous
+        if previous_value in BLOCK_SCALAR_INDICATORS:
+            hint = HINT_BLOCK_SCALAR
+        elif previous_value.startswith("{"):
+            hint = HINT_FLOW_MAPPING
+        elif text.startswith("[") or previous_value.startswith("["):
+            hint = HINT_UNTERMINATED_FLOW
+        else:
+            hint = HINT_MULTILINE_PLAIN
+        raise ConfigSyntaxError(
+            lineno, f"could not parse full config: unexpected indentation: {text}", hint
+        )
     return parsed
 
 
@@ -232,7 +611,11 @@ def load_config(args: argparse.Namespace) -> dict[str, Any]:
     try:
         data = load_simple_yaml(path)
     except EngineError as exc:
-        fail(f"invalid config syntax in {path}: {exc}")
+        hint = getattr(exc, "hint", "")
+        fail(
+            f"invalid config syntax in {path}: {exc}"
+            + (f"\n  hint: {hint}" if hint else "")
+        )
     if not isinstance(data, dict):
         fail("config root must be a mapping")
     data["_config_path"] = str(path)
@@ -663,12 +1046,34 @@ def require_config(args: argparse.Namespace) -> dict[str, Any]:
     return cfg
 
 
+def budget_cap_warnings(cfg: dict[str, Any]) -> list[str]:
+    """Explain configured LLM budgets that Orka clamps to a lower hard cap."""
+    llm = cfg.get("llm")
+    if not isinstance(llm, dict) or not isinstance(llm.get("budgets"), dict):
+        return []
+    scripts = str(Path(__file__).resolve().parent)
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    try:
+        # Lazy: only configurations with LLM budgets load the API runner.
+        import api_agent
+    except Exception as exc:  # advisory only; never block validation
+        return [f"WARNING could not check llm.budgets hard caps: {exc}"]
+    return [
+        f"WARNING llm.budgets.{item['key']}={item['configured']} exceeds the hard cap "
+        f"{item['cap']}; Orka enforces {item['effective']}"
+        for item in api_agent.budget_cap_violations(cfg)
+    ]
+
+
 def cmd_validate(args: argparse.Namespace) -> None:
     cfg = load_config(args)
     try:
         validate_config(cfg)
     except EngineError as exc:
         fail(str(exc))
+    for warning in budget_cap_warnings(cfg):
+        print(warning, file=sys.stderr)
     print(f"OK schema_version={schema_version(cfg)}")
 
 

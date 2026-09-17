@@ -17,6 +17,44 @@ scripts/orchestration-engine.py adapter-plan --host codex <transition>
 scripts/orchestration-engine.py transition <candidate-id> <transition> ...
 ```
 
+## YAML Subset And Formatters
+
+Orka parses `.orchestration/config.yaml` without a YAML dependency, and every
+reader (the engine, `lib-config.sh`, the context pipeline, and the sprint
+controller) shares one parser for lists. Prettier output is supported, so a
+repository can format the config with the same tooling as the rest of its YAML.
+These list forms parse identically:
+
+```yaml
+llm:
+  roles:
+    implementer:
+      allowed_tools: [read_file, search, git_diff, git_status, run_check, apply_patch]
+    code-reviewer:
+      allowed_tools:
+        [read_file, search, git_diff, git_status, run_check, apply_patch]
+    sprint-worker:
+      allowed_tools:
+        [
+          read_file,
+          search, # comments and a trailing comma are allowed
+          git_diff,
+        ]
+security_required_when:
+  - migrations/
+  - "SECURITY DEFINER"
+security_required_source_branches: ["hotfix/**", "release/*"]
+```
+
+Continuation lines of a wrapped flow list must be indented deeper than its key
+(a lone closing `]` may sit at the key's indentation). Quote items that contain
+`,`, `[`, `]`, or ` #`. `validate-config` refuses what the subset does not
+support, naming the line and printing a `hint:` with the supported spelling:
+non-empty flow mappings such as `{block_squash: true}` (write a block mapping;
+`{}` is accepted), nested flow lists, block scalars (`|`, `>`), multi-line quoted
+or plain values, an unterminated `[`, and text after a closing `]` (quote a
+string value that starts with `[`).
+
 ## Schema Versioning
 
 Configs without `schema_version`, or with `schema_version: 1`, use the legacy

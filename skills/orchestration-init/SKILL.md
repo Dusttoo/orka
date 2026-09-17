@@ -43,7 +43,10 @@ working directory.
    If any role uses API execution, instruct the user to put the relevant
    `ANTHROPIC_API_KEY` and/or `OPENAI_API_KEY` in `.orchestration/.env` beside
    the config. Container environment values take precedence. Never display or
-   copy secret values.
+   copy secret values. If `ticket.kind: jira`, the same file (in the shared
+   repository root) may hold `JIRA_API_TOKEN` and, for Jira Cloud, `JIRA_EMAIL`;
+   tell the user to `chmod 600 .orchestration/.env`, because sprint preflight and
+   sync refuse a group- or world-readable credential file.
 3. Confirm a repo rules document exists. Prefer both `CLAUDE.md` and `AGENTS.md`
    in `rules_docs`; if missing, offer to create a starter so the project's real
    conventions have a place to live.

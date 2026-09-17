@@ -164,3 +164,38 @@ Controller-managed direct `codex exec` workers can use the shared admission ledg
 through the Responses gateway. This requires API credentials and explicit model
 pricing. See [native worker spending and supervision](sprint-controller.md#native-worker-spending-and-supervision)
 for supported requests, nested launcher behavior, and compatibility limits.
+
+### Compaction under the metered gateway
+
+Codex compacts a long context in one of three ways. Only the first two are
+metered.
+
+- **Local compaction.** A normal streamed `POST /v1/responses` request whose
+  turn metadata says `request_kind: compaction`. It is metered like any other
+  turn, with the output cap enforced. Offline runs of codex-cli 0.154.0 against
+  a loopback gateway always used this path for automatic mid-turn compaction.
+  That covered `remote_compaction_v2` on and off, `gpt-5.5` and `gpt-5.6-sol`,
+  and runs with and without the model catalog cache.
+- **Remote compaction** (`POST /v1/responses/compact`). The 0.154.0 binary
+  contains this client. The gateway meters it through the same path as
+  Responses: stateless, standard-tier, client-tools-only checks; an input token
+  count; a worst-case reservation; submission with the reservation as the
+  idempotency key; and settlement from the returned `usage`. A response without
+  valid `usage` keeps its reservation instead of being settled on a guess, and
+  so does an ambiguous submission. Rejections (400, 401, 403, 404, 413, 422,
+  429) release it. The compact endpoint receives only the fields Codex sent, so
+  the output cap is applied only if the client supplied `max_output_tokens`.
+  Settlement always records the provider's actual usage.
+- **Responses compaction v2** (`context_management` on `/v1/responses`). This is
+  stateful and is not metered. `launch_arguments` keeps
+  `features.remote_compaction_v2=false` so Codex does not choose it.
+
+Codex does not document an option that forces local compaction. Orka therefore
+meters remote compaction instead of relying on client heuristics.
+
+Any other endpoint or unmeterable request shape is rejected before provider
+traffic. The rejection stops only the lane that sent it, with a
+`client_incompatible: native gateway does not meter POST <path>` stop reason.
+It never becomes a provider-wide hold. See
+[provider health](sprint-controller.md) for the route-scoped hold and for using
+`health-check --role sprint-worker --after-repair` to clear it.

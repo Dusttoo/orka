@@ -89,6 +89,30 @@ class NativeGatewayTests(unittest.TestCase):
         self.assertTrue(self.gateway.stopped.is_set())
         self.assertEqual(self.transport.paid, 1)
 
+    def test_unmeterable_client_request_holds_only_its_route(self):
+        from provider_health import ProviderHealth
+        gateway = NativeGateway(self.root, self.config, "T-1", "1", "native-2", self.transport, route_scope="claude-route")
+        endpoint = gateway.start()
+        self.addCleanup(gateway.close)
+        request = urllib.request.Request(endpoint + "/v1/messages",
+            data=json.dumps({**self.payload, "tools": [{"type": "web_search_20250305"}]}).encode(),
+            headers={"x-api-key": gateway.token, "Content-Type": "application/json"})
+        with self.assertRaises(urllib.error.HTTPError) as rejected:
+            urllib.request.urlopen(request, timeout=2)
+        rejected.exception.close()
+        self.assertTrue(gateway.reason.startswith("client_incompatible:"))
+        health = ProviderHealth(self.root)
+        self.assertEqual(health.status("anthropic")["state"], "unverified")
+        self.assertEqual(health.status("anthropic", route="claude-route")["state"], "incompatible")
+        self.assertEqual(self.gateway.request("/v1/messages", self.payload)["id"], "msg_1")
+        # Provider evidence is still shared by every route and lane.
+        with patch.object(self.transport, "request", side_effect=ProviderHTTPError(401, "denied")):
+            with self.assertRaises(ProviderHTTPError):
+                gateway.model_request("anthropic", "/messages", {})
+        self.assertEqual(health.status("anthropic", route="other")["state"], "authentication")
+        with self.assertRaisesRegex(native_gateway.ProviderAdmissionError, "authentication"):
+            self.gateway.model_request("anthropic", "/messages", {})
+
     def test_rejected_startup_is_distinct_from_paid_or_uncertain_work(self):
         with patch.object(self.transport, "request", side_effect=ProviderHTTPError(429, "limited")):
             with self.assertRaises(ProviderHTTPError):

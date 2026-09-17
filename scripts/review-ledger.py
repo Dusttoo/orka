@@ -18,6 +18,7 @@ import argparse
 import contextlib
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -31,9 +32,12 @@ from typing import Any, Iterator
 import context_pipeline
 from review_permit import (
     ReviewPermitError,
-    complete as complete_review_permit,
+    cancel_unresolved as cancel_unresolved_review_permit,
+    complete_with_status as complete_review_permit,
     consume_completion,
+    logical_review_id,
     subject_ledger_candidates,
+    token_prefix,
 )
 from operator_authority import (
     AuthorityError,
@@ -61,6 +65,9 @@ ROLE_GATES = {
     "code-reviewer": "code-review",
     "security-reviewer": "security-review",
 }
+# templates/config.yaml ships both review gates; a missing `gates:` key keeps both.
+DEFAULT_REVIEW_GATES = ("code-review", "security-review")
+FULL_SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 
 # Round 1 sweeps the whole diff with full authority to block. Later rounds still
 # sweep the whole diff, but only ledger findings and regressions in the delta may
@@ -106,6 +113,84 @@ def config_scalar(path: Path, key: str, default: str) -> str:
         if match and match.group(1):
             return unquote(match.group(1))
     return default
+
+
+def config_list(path: Path, key: str) -> list[str] | None:
+    """Read a top-level list through the engine's shared parser; None when absent.
+
+    Block lists, one-line flow lists, and Prettier-wrapped flow lists resolve
+    exactly as every other Orka command reads them. A config the parser refuses
+    fails closed rather than silently changing the required gate set.
+    """
+    if not path.exists():
+        return None
+    engine_path = Path(__file__).with_name("orchestration-engine.py")
+    spec = importlib.util.spec_from_file_location("orka_ledger_config_parser", engine_path)
+    if spec is None or spec.loader is None:
+        raise LedgerError("could not load orchestration configuration parser")
+    engine = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(engine)
+    try:
+        parsed = engine.load_simple_yaml(path)
+    except engine.EngineError as exc:
+        raise LedgerError(f"invalid config syntax in {path}: {exc}") from exc
+    value = parsed.get(key) if isinstance(parsed, dict) else None
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        return [str(value)]
+    return [str(item).strip() for item in value if item is not None and str(item).strip()]
+
+
+def configured_review_gates() -> set[str]:
+    """Return the configured `gates:` this ledger enforces.
+
+    A missing or empty key fails closed to the template's gate set rather than
+    to whichever permits happened to be issued. Gates the ledger does not own
+    (for example visual QA) are left to their own stages. Code review is the
+    mandatory independent verdict, so a list that omits it (a typo, or only
+    non-ledger gates) cannot remove it; only security review is optional.
+    """
+    try:
+        cfg = canonical_config_path(project_root())
+        configured = config_list(cfg, "gates")
+    except RuntimeStateError as exc:
+        raise LedgerError(str(exc)) from exc
+    except OSError as exc:
+        raise LedgerError(f"cannot read configured review gates: {exc}") from exc
+    return (set(configured or DEFAULT_REVIEW_GATES) & set(ROLE_GATES.values())) | {
+        "code-review"
+    }
+
+
+def resolve_commit(value: str) -> str:
+    """Resolve a hexadecimal commit id to its single full lowercase object id."""
+    candidate = str(value).strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{7,64}", candidate):
+        raise LedgerError(f"commit id {value!r} must be 7-64 hexadecimal characters")
+    try:
+        resolved = (
+            subprocess.run(
+                ["git", "rev-parse", "--verify", "--quiet", f"{candidate}^{{commit}}"],
+                cwd=project_root(),
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            .stdout.strip()
+            .lower()
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise LedgerError(
+            f"commit id {candidate} does not resolve to exactly one repository commit"
+        ) from exc
+    # A peeled tag or a hex-named ref resolves to a different object id; only
+    # the commit the abbreviation actually names is accepted.
+    if not FULL_SHA.fullmatch(resolved) or not resolved.startswith(candidate):
+        raise LedgerError(
+            f"commit id {candidate} does not resolve to exactly one repository commit"
+        )
+    return resolved
 
 
 # --- component keys -----------------------------------------------------------
@@ -701,6 +786,11 @@ def _current_generation_heads(state: dict[str, Any]) -> set[str]:
         and entry.get("head")
         and _round_is_authoritative(state, entry)
     )
+    heads.update(
+        str(item.get("head") or "").lower()
+        for item in _current_security_decisions(state)
+        if item.get("head")
+    )
     rebinds = [
         item
         for item in state.get("generation_rebinds", [])
@@ -712,6 +802,35 @@ def _current_generation_heads(state: dict[str, Any]) -> set[str]:
         heads.add(str(rebinds[0].get("head") or "").lower())
         heads.discard("")
     return heads
+
+
+def _current_security_decisions(state: dict[str, Any]) -> list[dict[str, Any]]:
+    generation = int(state.get("review_generation", 1))
+    return [
+        item
+        for item in state.get("security_gate_decisions", [])
+        if int(item.get("review_generation", 0)) == generation
+    ]
+
+
+def _security_gate_decision(state: dict[str, Any]) -> str:
+    """Classify the current generation's recorded security-gate decisions.
+
+    Only `not-required` waives a configured security gate. A decision is never
+    carried across a repair or rebind: the new head has a new diff, so the
+    generation stays fail-closed until its own decision is recorded.
+    """
+    decisions = _current_security_decisions(state)
+    if not decisions:
+        return "missing"
+    if any(item.get("required") is not False for item in decisions):
+        return "required"
+    heads = _current_generation_heads(state)
+    if state.get("repair_pending_review") and state.get("repair_attempts"):
+        heads.add(str(state["repair_attempts"][-1].get("head") or "").lower())
+    if len(heads) != 1:
+        return "head-mismatch"
+    return "not-required"
 
 
 def decide(state: dict[str, Any]) -> dict[str, Any]:
@@ -763,13 +882,24 @@ def decide(state: dict[str, Any]) -> dict[str, Any]:
         for entry in current_entries
     }
     generation_heads = _current_generation_heads(state)
-    required_gates = {
+    # Configured gates are required even when no permit was issued for them;
+    # issued permits can only add to that set, never shrink it.
+    configured_gates = configured_review_gates()
+    security_decision = (
+        _security_gate_decision(state)
+        if "security-review" in configured_gates
+        else "not-configured"
+    )
+    if security_decision == "not-required":
+        configured_gates.discard("security-review")
+    required_gates = set(configured_gates)
+    required_gates.update(
         ROLE_GATES[item["role"]]
         for item in state.get("review_permits", [])
         if item.get("role") in ROLE_GATES
         and int(item.get("review_generation", 1)) == generation
         and not item.get("superseded_at")
-    }
+    )
     required_gates.update(
         gate
         for item in state.get("generation_rebinds", [])
@@ -831,6 +961,7 @@ def decide(state: dict[str, Any]) -> dict[str, Any]:
         "generation_head_conflict": len(generation_heads) > 1,
         "review_generation": generation,
         "required_gates": sorted(required_gates),
+        "security_gate_decision": security_decision,
         "missing_gates": missing_gates,
         "rebound_generation_pending_review": rebound_generation_pending_review,
         "cap_reached": cap_reached,
@@ -1042,7 +1173,11 @@ def apply_gate_claims(
         component["last_round"] = round_no
         component["rounds"].append(round_no)
         if key in finding_details:
+            # Keep every gate's explanation: two gates can block the same
+            # normalized component for unrelated defects. `finding` remains the
+            # latest detail for older readers.
             component["finding"] = finding_details[key]
+            component.setdefault("findings_by_gate", {})[gate] = finding_details[key]
         if gate not in component["gates"]:
             component["gates"].append(gate)
         component["claims"][gate] = {
@@ -1084,7 +1219,24 @@ def cmd_record(args: argparse.Namespace) -> None:
             )
         try:
             structured = json.loads(Path(args.result).read_text(encoding="utf-8"))
-            context_pipeline.validate_review_output(structured, args.gate)
+            validated = context_pipeline.validate_review_output(structured, args.gate)
+            # A ci_verified check replaces the blocking finding a not_run check
+            # would force, so record is the chokepoint that binds it to CI
+            # results captured for the exact head.
+            if any(
+                check["status"] == context_pipeline.CI_VERIFIED_STATUS
+                for check in validated["checks"]
+            ):
+                if not args.ci_evidence or not args.head:
+                    raise LedgerError(
+                        "ci_verified checks require --ci-evidence captured for the exact head"
+                    )
+                context_pipeline.validate_review_output(
+                    structured,
+                    args.gate,
+                    reviewed_head=args.head,
+                    ci_evidence=context_pipeline.read_ci_evidence_file(args.ci_evidence),
+                )
         except (OSError, json.JSONDecodeError, context_pipeline.ContextError) as exc:
             raise LedgerError(f"invalid structured review result: {exc}") from exc
         args.verdict = structured["verdict"]
@@ -1177,6 +1329,16 @@ def cmd_record(args: argparse.Namespace) -> None:
             if state.get("repair_pending_review") and state.get("repair_attempts")
             else None
         )
+        recorded_head = args.head.lower() if args.head else ""
+        if pending_attempt is not None:
+            if not args.head:
+                raise LedgerError("recording a repaired-head review requires --head")
+            recorded_head = resolve_commit(args.head)
+            if not _repair_head_matches(str(pending_attempt["head"]), recorded_head):
+                raise LedgerError(
+                    f"review head {recorded_head} does not match repaired head "
+                    f"{pending_attempt['head']}"
+                )
         if pending_attempt is not None:
             staged = pending_attempt.setdefault("gate_claims", {})
             if args.gate in staged:
@@ -1241,7 +1403,7 @@ def cmd_record(args: argparse.Namespace) -> None:
                 "round": round_no,
                 "generation": generation,
                 "gate": args.gate,
-                "head": args.head.lower() if args.head else "",
+                "head": recorded_head,
                 "scope_mode": scope,
                 "claimed_verdict": args.verdict,
                 "effective_verdict": effective,
@@ -1252,17 +1414,10 @@ def cmd_record(args: argparse.Namespace) -> None:
                 "authoritative": bool(args.result),
             }
         )
-        if state.get("repair_pending_review") and state.get("repair_attempts"):
-            attempt = state["repair_attempts"][-1]
-            if not args.head:
-                raise LedgerError("recording a repaired-head review requires --head")
-            if args.head.lower() != attempt["head"]:
-                raise LedgerError(
-                    f"review head {args.head.lower()} does not match repaired head {attempt['head']}"
-                )
-            attempt.setdefault("reviewed_gates", [])
-            if args.gate not in attempt["reviewed_gates"]:
-                attempt["reviewed_gates"].append(args.gate)
+        if pending_attempt is not None:
+            pending_attempt.setdefault("reviewed_gates", [])
+            if args.gate not in pending_attempt["reviewed_gates"]:
+                pending_attempt["reviewed_gates"].append(args.gate)
         save(path, state)
 
         result = {
@@ -1278,6 +1433,24 @@ def cmd_record(args: argparse.Namespace) -> None:
             **decide(state),
         }
         emit(result)
+
+
+def _repair_head_matches(stored: str, head: str) -> bool:
+    """Match a full review head against a repair attempt's stored head.
+
+    Before 1.7.0, record-repair stored the report head verbatim, so a ledger may
+    hold an abbreviation. Accept its full expansion only when the abbreviation
+    is a prefix of that head and git resolves it unambiguously to the same commit.
+    """
+    stored = stored.lower()
+    if stored == head:
+        return True
+    if FULL_SHA.fullmatch(stored) or not head.startswith(stored):
+        return False
+    try:
+        return resolve_commit(stored) == head
+    except LedgerError:
+        return False
 
 
 def _load_repair_report(path: str) -> dict[str, Any]:
@@ -1314,6 +1487,47 @@ def _load_repair_report(path: str) -> dict[str, Any]:
     return report
 
 
+GATE_ORDER = ("design-review", "code-review", "security-review")
+
+
+def component_findings(
+    component: dict[str, Any],
+) -> list[tuple[str | None, dict[str, Any]]]:
+    """Every gate's explanation for one component, in stable gate order.
+
+    Gates whose claim on the component has since resolved are omitted while
+    another gate still holds it open. Ledgers written before per-gate details
+    existed carry only `finding`, which renders unlabelled.
+    """
+    by_gate = component.get("findings_by_gate")
+    by_gate = by_gate if isinstance(by_gate, dict) else {}
+    claims = component.get("claims") if isinstance(component.get("claims"), dict) else {}
+    open_gates = [
+        gate for gate in by_gate if (claims.get(gate) or {}).get("status") == "open"
+    ]
+    gates = sorted(
+        open_gates or list(by_gate),
+        key=lambda gate: (
+            GATE_ORDER.index(gate) if gate in GATE_ORDER else len(GATE_ORDER),
+            gate,
+        ),
+    )
+    result: list[tuple[str | None, dict[str, Any]]] = [
+        (gate, by_gate[gate]) for gate in gates
+    ]
+    legacy = component.get("finding")
+    if legacy and legacy not in by_gate.values():
+        result.append((None, legacy))
+    return result
+
+
+def finding_lines(component: dict[str, Any], indent: str = "  ") -> list[str]:
+    return [
+        f"{indent}{f'[{gate}] ' if gate else ''}{finding['title']}: {finding['explanation']}"
+        for gate, finding in component_findings(component)
+    ]
+
+
 def cmd_repair_brief(args: argparse.Namespace) -> None:
     state = load(ledger_path(args))
     plan = decide(state)
@@ -1331,9 +1545,7 @@ def cmd_repair_brief(args: argparse.Namespace) -> None:
     ]
     for component in sorted(open_components(state), key=lambda item: item["key"]):
         lines.append(f"- `{component['key']}`")
-        finding = component.get("finding")
-        if finding:
-            lines.append(f"  {finding['title']}: {finding['explanation']}")
+        lines.extend(finding_lines(component))
         lines.append(
             "  Closure must be demonstrated by a named regression test or equivalent evidence."
         )
@@ -1351,6 +1563,9 @@ def cmd_repair_brief(args: argparse.Namespace) -> None:
 def cmd_record_repair(args: argparse.Namespace) -> None:
     path = ledger_path(args)
     report = _load_repair_report(args.report)
+    # Permits and receipts bind the full `git rev-parse HEAD`; an abbreviation
+    # stored here could never match them. The report schema is unchanged.
+    repaired_head = resolve_commit(report["head"])
     with locked(path):
         state = load(path)
         state.setdefault("review_generation", 1)
@@ -1382,6 +1597,8 @@ def cmd_record_repair(args: argparse.Namespace) -> None:
             )
         review_plan = decide(state)
         gate_verdicts = review_plan["gate_verdicts"]
+        # `required_gates` already includes the configured gates; decide()
+        # recomputes them on every read, so this stored set is a floor only.
         required_gates = set(gate_verdicts) | set(review_plan["required_gates"])
         if state.get("repair_attempts"):
             required_gates.update(
@@ -1390,7 +1607,7 @@ def cmd_record_repair(args: argparse.Namespace) -> None:
         attempt = {
             "attempt": len(state.setdefault("repair_attempts", [])) + 1,
             "recorded_at": now(),
-            "head": report["head"].lower(),
+            "head": repaired_head,
             "findings": [
                 {**item, "component": normalize_key(item["component"])}
                 for item in report["findings"]
@@ -1427,14 +1644,18 @@ def cmd_complete_repair_review(args: argparse.Namespace) -> None:
         if not state.get("repair_pending_review") or not state.get("repair_attempts"):
             raise LedgerError("no repaired head is awaiting review completion")
         attempt = state["repair_attempts"][-1]
-        missing = sorted(
-            set(attempt["required_gates"]) - set(attempt["reviewed_gates"])
+        # Ledgers written before configured gates were enforced may store a
+        # short set; never finalize on the stored value alone.
+        required = sorted(
+            set(attempt["required_gates"]) | set(decide(state)["required_gates"])
         )
+        missing = sorted(set(required) - set(attempt["reviewed_gates"]))
         if missing:
             raise LedgerError(
                 f"repair review is incomplete; missing gates: {', '.join(missing)}"
             )
-        for gate in attempt["required_gates"]:
+        attempt["required_gates"] = required
+        for gate in required:
             staged = attempt.get("gate_claims", {}).get(gate)
             if not staged:
                 raise LedgerError(f"repair review has no staged claims for gate: {gate}")
@@ -1466,6 +1687,49 @@ def cmd_complete_repair_review(args: argparse.Namespace) -> None:
         state["repair_pending_review"] = False
         save(path, state)
         emit({"repair_review_completed": attempt["attempt"], **decide(state)})
+
+
+def cmd_correct_repair_head(args: argparse.Namespace) -> None:
+    """Expand a pending repair attempt's abbreviated head to its full commit id.
+
+    This needs no operator capability because it cannot change which commit is
+    reviewed: it accepts only the single commit that git already resolves the
+    stored abbreviation to, and refuses a completed attempt or a full stored head.
+    """
+    reason = args.reason.strip()
+    if not reason:
+        raise LedgerError("repair head correction requires a non-empty audit reason")
+    requested = args.head.strip().lower()
+    if not FULL_SHA.fullmatch(requested):
+        raise LedgerError("repair head correction requires the full commit id")
+    path = ledger_path(args)
+    with locked(path):
+        state = load(path)
+        attempt = (
+            state["repair_attempts"][-1]
+            if state.get("repair_pending_review") and state.get("repair_attempts")
+            else None
+        )
+        if attempt is None or attempt.get("completed_at"):
+            raise LedgerError("no pending repair attempt is awaiting review")
+        stored = str(attempt.get("head") or "").lower()
+        if FULL_SHA.fullmatch(stored):
+            raise LedgerError("the pending repair head is already a full commit id")
+        if not requested.startswith(stored) or resolve_commit(stored) != requested:
+            raise LedgerError(
+                f"{requested} is not the unambiguous expansion of repair head {stored}"
+            )
+        attempt["head"] = requested
+        event = {
+            "attempt": attempt["attempt"],
+            "from_head": stored,
+            "head": requested,
+            "reason": reason,
+            "recorded_at": now(),
+        }
+        state.setdefault("repair_head_corrections", []).append(event)
+        save(path, state)
+        emit({"repair_head_corrected": event, "head": requested, **decide(state)})
 
 
 def cmd_metrics(args: argparse.Namespace) -> None:
@@ -1846,9 +2110,7 @@ def cmd_handoff(args: argparse.Namespace) -> None:
                 f"- `{component['key']}` -- {component['strikes']} strike(s), "
                 f"rounds {component['rounds']}, gates {', '.join(component['gates'])}"
             )
-            if component.get("finding"):
-                finding = component["finding"]
-                lines.append(f"  {finding['title']}: {finding['explanation']}")
+            lines.extend(finding_lines(component))
     else:
         lines.append("- none")
     lines += ["", "## Round history"]
@@ -1978,6 +2240,13 @@ def cmd_alias(args: argparse.Namespace) -> None:
                         int(right.get("last_round", 0)),
                     ),
                 }
+        merged_findings = merged.get("findings_by_gate")
+        if isinstance(merged_findings, dict) and merged_findings:
+            canonical_findings = canonical.setdefault("findings_by_gate", {})
+            for gate, finding in merged_findings.items():
+                canonical_findings.setdefault(gate, finding)
+        if merged.get("finding") and not canonical.get("finding"):
+            canonical["finding"] = merged["finding"]
         canonical["first_round"] = min(canonical["first_round"], merged["first_round"])
         if merged["status"] == "open":
             canonical["status"] = "open"
@@ -2073,8 +2342,72 @@ def exact_repository_head(requested: str) -> str:
     except (OSError, subprocess.CalledProcessError) as exc:
         raise LedgerError("cannot bind review generation to repository HEAD") from exc
     if requested.lower() != actual:
-        raise LedgerError("review generation head must exactly match the full repository HEAD")
+        # Reviewers read the local tree, so the binding stays local. The hint
+        # names the safe way to check out the PR head without moving this one.
+        raise LedgerError(
+            f"review generation head {requested.lower()} must exactly match the full "
+            f"repository HEAD {actual}; run review-ledger from a review worktree at "
+            f"that head (git worktree add --detach <path> {requested.lower()})"
+        )
     return actual
+
+
+def _load_security_gate_decision(path: str) -> dict[str, Any]:
+    try:
+        decision = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise LedgerError(f"cannot read security-gate decision: {exc}") from exc
+    if not isinstance(decision, dict) or set(decision) != {
+        "required",
+        "source_branch",
+        "target_branch",
+        "reasons",
+    }:
+        raise LedgerError(
+            "security-gate decision requires exactly required, source_branch, "
+            "target_branch, and reasons from orchestration-engine.py security-gate"
+        )
+    if not isinstance(decision["required"], bool):
+        raise LedgerError("security-gate decision required must be a boolean")
+    for key in ("source_branch", "target_branch"):
+        if not isinstance(decision[key], str) or not decision[key].strip():
+            raise LedgerError(f"security-gate decision {key} must be non-empty text")
+    reasons = decision["reasons"]
+    if not isinstance(reasons, list) or any(not isinstance(item, dict) for item in reasons):
+        raise LedgerError("security-gate decision reasons must be an array of objects")
+    if decision["required"] != bool(reasons):
+        raise LedgerError("security-gate decision required contradicts its reasons")
+    return decision
+
+
+def cmd_record_security_gate(args: argparse.Namespace) -> None:
+    """Bind one `orchestration-engine.py security-gate` decision to a generation.
+
+    The decision is bound to the current generation and its exact head. A
+    repair or rebind starts a generation without one, so a configured security
+    gate stays required until that head's own decision is recorded.
+    """
+    actual_head = exact_repository_head(args.head)
+    decision = _load_security_gate_decision(args.decision)
+    path = ledger_path(args)
+    with locked(path):
+        state = load(path)
+        heads = _current_generation_heads(state)
+        if state.get("repair_pending_review") and state.get("repair_attempts"):
+            heads.add(str(state["repair_attempts"][-1].get("head") or "").lower())
+        if heads and actual_head not in heads:
+            raise LedgerError(
+                "the current review generation is already bound to another exact head"
+            )
+        entry = {
+            "review_generation": int(state.get("review_generation", 1)),
+            "head": actual_head,
+            **decision,
+            "recorded_at": now(),
+        }
+        state.setdefault("security_gate_decisions", []).append(entry)
+        save(path, state)
+        emit({"security_gate_recorded": entry, **decide(state)})
 
 
 def cmd_rebind_generation(args: argparse.Namespace) -> None:
@@ -2206,8 +2539,15 @@ def cmd_permit_review(args: argparse.Namespace) -> None:
                     "the current gate has a completed review awaiting ledger recording"
                 )
             if existing.get("started_at"):
+                run = str(existing.get("run_id") or "")
                 raise LedgerError(
-                    "the current gate has a started review requiring reconciliation"
+                    "the current gate has a started review requiring reconciliation "
+                    f"(permit {token_prefix(str(existing.get('token') or ''))}, "
+                    f"run {run or 'unrecorded'}). Reconcile provider work first with "
+                    f"`api_agent.py reconcile --run-id {run or '<run-id>'} --outcome "
+                    "not-found|completed --evidence ...`, which also cancels the permit; "
+                    f"if it remains started, run `review-ledger.py cancel-permit {args.pr} "
+                    "--phase-permit <token> --reason ...`"
                 )
             # Issuance is idempotent until provider or desktop execution starts.
             # This lets a caller correct locally invalid structured output without
@@ -2246,6 +2586,64 @@ def cmd_permit_review(args: argparse.Namespace) -> None:
     )
 
 
+def cmd_cancel_permit(args: argparse.Namespace) -> None:
+    """Operator recovery for a started review permit whose run cannot finish.
+
+    Fails closed while any usage reservation for that run or logical review is
+    still open: provider work is then uncertain and must be reconciled first.
+    """
+    root = shared_repository_root(project_root())
+    path = ledger_path(args)
+
+    def no_open_provider_work(permit: dict[str, Any]) -> None:
+        # Imported lazily: the usage ledger lives with the API runner.
+        from api_agent import UsageLedger
+
+        run_id = str(permit.get("run_id") or "")
+        review_id = logical_review_id(permit)
+        _, open_items = UsageLedger._totals(UsageLedger(root).snapshot())
+        blocking = sorted(
+            str(item.get("run_id") or item.get("reservation_id"))
+            for item in open_items.values()
+            if (run_id and str(item.get("run_id") or "") == run_id)
+            or item.get("logical_review_id") == review_id
+        )
+        if blocking:
+            raise ReviewPermitError(
+                "provider work for this review is still uncertain: open usage "
+                f"reservation(s) for run(s) {', '.join(blocking)}; reconcile with "
+                "`api_agent.py reconcile` before cancelling the permit"
+            )
+
+    try:
+        outcome = cancel_unresolved_review_permit(
+            shared_root=root,
+            ledger_dir=str(path.parent.relative_to(root)),
+            pr=args.pr,
+            token=args.phase_permit,
+            role=args.role,
+            reason=args.reason,
+            timestamp=now(),
+            guard=no_open_provider_work,
+        )
+    except (OSError, ValueError, json.JSONDecodeError, ReviewPermitError) as exc:
+        raise LedgerError(str(exc)) from exc
+    refusals = {
+        "not_started": "the permit was never started; permit-review reissues it "
+        "idempotently, so no cancellation is needed",
+        "completed": "the permit already has a completion receipt; record its result "
+        "instead of cancelling",
+        "already_cancelled": "the permit is already cancelled",
+        "superseded": "the permit was superseded by a newer review generation",
+    }
+    if outcome["status"] in refusals:
+        raise LedgerError(
+            f"cannot cancel permit {outcome['token_prefix']}: "
+            + refusals[outcome["status"]]
+        )
+    emit({"permit_cancelled": outcome, "reason": args.reason.strip()})
+
+
 def cmd_complete_review(args: argparse.Namespace) -> None:
     """Atomically attest a native desktop review only after its result exists."""
     try:
@@ -2273,8 +2671,18 @@ def cmd_complete_review(args: argparse.Namespace) -> None:
             .stdout.strip()
             .lower()
         )
+        if gate:
+            try:
+                context_pipeline.validate_review_output(
+                    result, gate, reviewed_head=actual_head
+                )
+            except context_pipeline.ContextError as exc:
+                raise LedgerError(
+                    "invalid completed review result: "
+                    f"{exc}; correct the result and retry with the same phase permit"
+                ) from exc
         root = shared_repository_root(project_root())
-        receipt = complete_review_permit(
+        receipt, already_completed = complete_review_permit(
             shared_root=root,
             ledger_dir=str(ledger_path(args).parent.relative_to(root)),
             pr=args.pr,
@@ -2292,7 +2700,14 @@ def cmd_complete_review(args: argparse.Namespace) -> None:
         ReviewPermitError,
     ) as exc:
         raise LedgerError(str(exc)) from exc
-    emit({"completion_receipt": receipt, "head": actual_head, "role": args.role})
+    emit(
+        {
+            "completion_receipt": receipt,
+            "already_completed": already_completed,
+            "head": actual_head,
+            "role": args.role,
+        }
+    )
 
 
 def parser() -> argparse.ArgumentParser:
@@ -2354,6 +2769,10 @@ def parser() -> argparse.ArgumentParser:
     record_parser.add_argument(
         "--phase-permit", help="single-use permit with a completed review receipt"
     )
+    record_parser.add_argument(
+        "--ci-evidence",
+        help="exact-head check-runs JSON; required when the result has ci_verified checks",
+    )
     record_parser.set_defaults(func=cmd_record)
 
     migrate_parser = commands.add_parser(
@@ -2393,6 +2812,26 @@ def parser() -> argparse.ArgumentParser:
     repair_parser.add_argument("pr")
     repair_parser.add_argument("--report", required=True)
     repair_parser.set_defaults(func=cmd_record_repair)
+
+    correct_head_parser = commands.add_parser(
+        "correct-repair-head",
+        help="expand a pending repair attempt's abbreviated head to its full commit id",
+    )
+    correct_head_parser.add_argument("pr")
+    correct_head_parser.add_argument("--head", required=True)
+    correct_head_parser.add_argument("--reason", required=True)
+    correct_head_parser.set_defaults(func=cmd_correct_repair_head)
+
+    security_gate_parser = commands.add_parser(
+        "record-security-gate",
+        help="bind an orchestration-engine.py security-gate decision to this generation",
+    )
+    security_gate_parser.add_argument("pr")
+    security_gate_parser.add_argument("--head", required=True)
+    security_gate_parser.add_argument(
+        "--decision", required=True, help="JSON output of orchestration-engine.py security-gate"
+    )
+    security_gate_parser.set_defaults(func=cmd_record_security_gate)
 
     rebind_parser = commands.add_parser(
         "rebind-generation",
@@ -2447,6 +2886,17 @@ def parser() -> argparse.ArgumentParser:
     complete.add_argument("--phase-permit", required=True)
     complete.add_argument("--result", required=True)
     complete.set_defaults(func=cmd_complete_review)
+    cancel = commands.add_parser(
+        "cancel-permit",
+        help="cancel a started review permit after its provider work is reconciled",
+    )
+    cancel.add_argument("pr")
+    cancel.add_argument("--phase-permit", required=True)
+    cancel.add_argument(
+        "--role", choices=("design-reviewer", "code-reviewer", "security-reviewer")
+    )
+    cancel.add_argument("--reason", required=True)
+    cancel.set_defaults(func=cmd_cancel_permit)
 
     resolve_parser = commands.add_parser("resolve", help="manually close a component")
     resolve_parser.add_argument("pr")

@@ -383,9 +383,22 @@ provider-routing overrides are rejected. Supply a configured model explicitly.
 
 The Codex adapter supports stateless standard-tier Responses with local function
 and custom tools, namespaces, and client-executed tool search. It rejects hosted
-paid tools, remote compaction endpoints, stateful continuation, background responses,
-premium tiers, and unpriced models. Local compaction uses ordinary metered
-Responses requests. Model discovery is not provided. Installed-client checks
+paid tools, stateful continuation, background responses, premium tiers, and
+unpriced models. Local compaction uses ordinary metered Responses requests.
+Remote compaction (`POST /v1/responses/compact`) is metered through the same
+count, reserve, submit, and settle path; see [Codex compaction](codex.md#compaction-under-the-metered-gateway).
+Model discovery is not provided.
+
+A request the gateway cannot meter (another endpoint, a hosted tool, a stateful
+or premium-tier request) is a client incompatibility, not a provider incident.
+The gateway stops only the lane that sent it, with a `client_incompatible:` stop
+reason naming the sanitized endpoint, and the supervisor marks that lane
+`recoverable` with its attempt token intact. The incident is recorded under the
+lane's sprint-worker route identity, which includes the installed client
+revision. It holds new launches and recovery for that route until
+`health-check --role sprint-worker --after-repair` passes or the client binary
+changes. Running sibling lanes, other routes, and `execution: api` roles on the
+same provider are not held. Installed-client checks
 exercise a local-tool round trip and forced local compaction; authenticated
 readiness probes verify the connection without claiming a live generation test. Launch separate metered API
 reviewers from the credential-owning controller, not from this worker's temporary
@@ -718,6 +731,52 @@ Probe credentials use the same environment precedence as the runtime; an invalid
 process-environment key will still override a corrected repository `.env`.
 Never print credential values. No credential is changed by these commands.
 
+Preflight output also carries `budget_limits`: the effective limits from
+`api_agent.budgets_from_config` after non-overridable caps, with USD values as
+strings. A configured `max_usd_per_run: 200` reports `"10.00"`. When the
+installed runtime provides `budget_cap_violations`, its entries appear as
+`budget_cap_warnings`. An invalid budget block reports `budget_error` and blocks
+execution.
+
+### Jira credentials
+
+`execution_ready: true` also requires the Jira access that
+`sprint-controller.py sync --inventory-template` uses. Preflight reports it under
+`jira` and blocks with a specific `reason` when `ticket.kind` is not `jira`, when
+`ticket.project`, `sprint_id`, or an HTTPS `jira_base_url` is missing, or when
+`JIRA_API_TOKEN` cannot be resolved. `JIRA_EMAIL` is optional: with it the
+adapter sends Basic auth (Jira Cloud API tokens), without it a Bearer token
+(Data Center personal access tokens); `auth_mode` shows which. With credentials
+present, preflight calls `GET <jira_base_url>/rest/api/3/myself` through the
+same approved-origin client as sync. HTTP 401/403, network failures, and
+responses without an account identity set `live_check: failed` and block.
+`--skip-jira-auth-check` skips only that call; it is listed in
+`skipped_checks` and still requires the credentials to be present.
+
+Orka supports one Jira credential file, in the shared repository root (the main
+checkout, also used by every linked worktree). Put `JIRA_API_TOKEN` in `.orchestration/.env`
+and, for Jira Cloud, add `JIRA_EMAIL`:
+
+```dotenv
+JIRA_EMAIL=you@example.com
+JIRA_API_TOKEN=your-jira-api-token
+```
+
+- The file is parsed as `KEY=value` data (optional `export`, single or JSON
+  double quotes, trailing ` # comments`). Shell syntax is rejected, nothing is
+  expanded, and only the two Jira names are read for Jira.
+- A non-empty process environment value takes precedence per key; the file is
+  consulted only when a key is unset. `credential_sources` reports
+  `environment` or `file` for each key, never a value.
+- Like ssh keys, the file must be a regular file owned by the current user and
+  not accessible by group or others. Otherwise both preflight and sync refuse
+  it; run `chmod 600 .orchestration/.env`.
+- Preflight and the controller-owned Jira adapter call the same resolver, so
+  they cannot disagree. Files elsewhere, such as a host-specific
+  `~/.config/.../jira.env`, are not read; export them or move the keys.
+- `.orchestration/.env` also holds API provider keys and must be gitignored.
+  `orchestration-init` adds it to `.gitignore`.
+
 Native Codex launches are also bound to a controller-selected checkout. For a
 preserved-PR recovery, the controller replaces every caller-provided `--cd`
 with the authenticated recovery worktree and passes the same path separately to
@@ -745,6 +804,24 @@ incident. Transient incidents allow at most three failed automatic probes.
 Authentication/client holds need actual repair and an explicit
 `health-check --role <role> --after-repair`. Successful probes expire after five
 minutes. `plan.provider_holds` keeps these issues distinct from ticket decisions.
+
+Client incompatibilities are route-scoped. A native gateway that receives a
+request it cannot meter, or an installed-client check that fails during a
+probe, records the incident under `scoped_incidents` for that route identity.
+Its `plan.provider_holds` entry has `"scope": "route"`, and it is never listed
+in `plan.health_probes`. A plain `health-check` for that role returns the hold
+without probing. Once the cause is understood (for example, the client was
+upgraded or its configuration fixed), run
+`health-check --role <role> --after-repair`. A passing probe clears only that
+route's incident. Authentication (401/403), rate limits (429/529), and transport
+incidents remain provider-wide and still hold every route and API role.
+
+A provider-wide `{"state": "incompatible", ...}` record written before route
+scoping existed has no scope. Orka cannot tell whether it came from a gateway
+endpoint rejection or a provider or client probe, so it still holds every route
+of that provider, including API roles. Clear it with
+`health-check --role <role> --after-repair` after confirming the cause. No file
+edit or migration is needed.
 
 Admission scoping is mandatory even when automatic decomposition is disabled.
 The authenticated inventory now includes sanitized descriptions and extracts

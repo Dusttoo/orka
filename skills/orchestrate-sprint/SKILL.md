@@ -12,7 +12,15 @@ and Claude Code follow the same state machine.
 
 Before interpreting the sprint request, run `captain-preflight.py` from this
 exact plugin root with `--repo . --host claude|codex --verify-runtime`. Continue only when it
-returns `status: ready`, `execution_ready: true`, and `captain_mode: controller-only`. Installation readiness alone is insufficient. A failed route probe creates one shared provider hold; do not reserve tickets to test it. If the script or
+returns `status: ready`, `execution_ready: true`, and `captain_mode: controller-only`. Installation readiness alone is insufficient.
+Preflight also authenticates to Jira (`GET /rest/api/3/myself`) with the
+credentials sync will use: `JIRA_API_TOKEN` (plus `JIRA_EMAIL` for Jira Cloud)
+from the environment, or else from the gitignored, `chmod 600`
+`.orchestration/.env` in the shared repository root. If `jira.state` is
+`blocked`, report its `reason` as `user_action` without printing values. Use
+`--skip-jira-auth-check` only when the operator explicitly asks, and report it
+from `skipped_checks`. Record `budget_limits` (and any `budget_cap_warnings`)
+in the first status event. A failed route probe creates one shared provider hold; do not reserve tickets to test it. If the script or
 this exact skill is absent, stop as `user_action`: never infer the plugin's
 purpose, invent a similarly named skill, or operate sprint tickets directly.
 Record the returned plugin version and runtime fingerprint in the first

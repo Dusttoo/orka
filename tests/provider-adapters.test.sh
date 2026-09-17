@@ -23,6 +23,11 @@ if python3 -m unittest \
 else
   bad "provider-native batch normalization unit matrix"
 fi
+if python3 "$ROOT/tests/jira_inventory_fetch_test.py" >/dev/null 2>&1; then
+  ok "Jira adapter credential, identity, and pagination unit matrix"
+else
+  bad "Jira adapter credential, identity, and pagination unit matrix"
+fi
 
 cat > "$TMP/inventory.json" <<'JSON'
 {"project":"PROJ","sprint":{"id":"1","name":"one"},"source_query":"parents","subtask_source_query":"children","subtask_keys":[],"tickets":[{"key":"PROJ-1","status":"Ready","subtasks":[]},{"key":"PROJ-2","status":"Ready","subtasks":[]}]}

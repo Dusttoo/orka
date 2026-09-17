@@ -19,6 +19,14 @@
 # The legacy shell parser supports two shapes only: flat `key: value` scalars, and
 # simple block lists / list-of-maps under a top-level key (see self_check).
 # Do not introduce deeper nesting under a shell-read key.
+#
+# Lists may be block lists (`key:` then `  - item`) or flow lists. Flow lists may
+# use Prettier's formatting: `key: [a, b]`, `key:` with `[a, b]` on the next more
+# indented line, or `[` ... `]` wrapped across lines indented deeper than the key,
+# with trailing commas and comments. Quote items containing `,` `[` `]` or ` #`.
+# Still unsupported (validate-config refuses them with a hint): non-empty flow
+# maps `{a: 1}`, nested flow lists, block scalars `|` / `>`, multi-line quoted or
+# plain values, and text after a closing `]` (quote such a string instead).
 
 # --- Schema version ------------------------------------------------------- both
 # schema_version: 1 is the legacy ticket pipeline. Existing repositories keep
@@ -71,7 +79,11 @@ llm:
     pause_usd_per_ticket: 1.50    # hard operator-action stop; no same-user CLI bypass
     max_usd_per_ticket: 2.00
     max_usd_per_sprint: 20.00
-    # Independent phase envelopes; all remain subject to the ticket/sprint caps.
+    # Independent phase envelopes; all remain subject to the run/ticket/sprint
+    # caps. Design and review phases may be raised to a $10 hard cap;
+    # implementation cannot exceed $12. Run, ticket, sprint, and pause values
+    # cannot exceed their compiled caps ($10/$30/$300/$20). Larger values are
+    # clamped, and validate-config prints a WARNING for each.
     max_usd_per_design_phase: 5.00 # includes ticket scoping
     max_usd_per_implementation_phase: 12.00
     max_usd_per_code_review_phase: 5.00
@@ -82,6 +94,11 @@ llm:
     # code/security-review allowance. Completely released, nonexecuted requests
     # do not consume reviewer capacity; accepted or uncertain work still does.
     max_output_tokens_per_turn: 4096
+    # Reviewer turns reserve this smaller output bound (never above the turn
+    # cap). When the budget or max_tool_rounds ends a review's tool loop, one
+    # tool-free final verdict turn with this output cap returns the verdict.
+    max_output_tokens_per_review_turn: 8192
+    final_verdict_output_tokens: 4096
     max_tool_rounds: 8
     max_tool_output_chars: 12000
     tool_timeout_seconds: 300
@@ -332,7 +349,9 @@ ticket:
 # issue on the opposite side is its prerequisite. Adjust for your Jira scheme.
 sprint_id: active
 # Canonical credential trust anchor. This must be repository policy, never a
-# caller-selected environment value.
+# caller-selected environment value. Credentials never go here: export them or
+# set JIRA_API_TOKEN in the gitignored, chmod 600 .orchestration/.env of the
+# shared repository root (add JIRA_EMAIL there too for Jira Cloud).
 jira_base_url: ""
 # Jira Cloud commonly exposes sprint identity through a custom field such as
 # customfield_10020. Configure its exact REST field id here; the adapter derives

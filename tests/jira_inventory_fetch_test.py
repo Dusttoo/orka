@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import shutil
 import sys
 import tempfile
 import unittest
 from unittest import mock
 from pathlib import Path
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request
 
@@ -432,6 +434,176 @@ class JiraInventoryFetchTest(unittest.TestCase):
         )
         self.assertEqual(set(page), {"startAt", "total", "isLast", "issues"})
         self.assertEqual(page["issues"][0]["fields"], {"summary": "small"})
+
+    def credential_root(self) -> Path:
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        (root / ".orchestration").mkdir()
+        return root
+
+    def write_env(self, root: Path, text: str, mode: int = 0o600) -> Path:
+        path = root / ".orchestration/.env"
+        path.write_text(text, encoding="utf-8")
+        path.chmod(mode)
+        return path
+
+    def test_credentials_load_from_shared_env_file_without_shell_evaluation(
+        self,
+    ) -> None:
+        root = self.credential_root()
+        self.write_env(
+            root,
+            "# Jira\n"
+            "export JIRA_API_TOKEN='file-token'\n"
+            'JIRA_EMAIL="captain@example.com"\n'
+            "PATH=/untrusted\n"
+            "ANTHROPIC_API_KEY=ignored-here\n",
+        )
+        with mock.patch.dict(jira.os.environ, {"PATH": "/usr/bin"}, clear=True):
+            credentials = jira.resolve_jira_credentials(root)
+            self.assertEqual(jira.os.environ["PATH"], "/usr/bin")
+            self.assertNotIn("JIRA_API_TOKEN", jira.os.environ)
+        self.assertEqual(credentials["token"], "file-token")
+        self.assertEqual(credentials["email"], "captain@example.com")
+        self.assertEqual(
+            credentials["sources"],
+            {"JIRA_API_TOKEN": "file", "JIRA_EMAIL": "file"},
+        )
+        self.assertTrue(jira.authorization_header(credentials).startswith("Basic "))
+        self.write_env(root, "source ../secrets\n")
+        with (
+            mock.patch.dict(jira.os.environ, {}, clear=True),
+            self.assertRaisesRegex(ValueError, "expected KEY=value"),
+        ):
+            jira.resolve_jira_credentials(root)
+
+    def test_environment_credentials_take_precedence_over_env_file(self) -> None:
+        root = self.credential_root()
+        self.write_env(
+            root, "JIRA_API_TOKEN=file-token\nJIRA_EMAIL=file@example.com\n"
+        )
+        with mock.patch.dict(
+            jira.os.environ,
+            {"JIRA_API_TOKEN": "env-token", "JIRA_EMAIL": "env@example.com"},
+            clear=True,
+        ):
+            credentials = jira.resolve_jira_credentials(root)
+        self.assertEqual(credentials["token"], "env-token")
+        self.assertEqual(credentials["email"], "env@example.com")
+        self.assertEqual(
+            credentials["sources"],
+            {"JIRA_API_TOKEN": "environment", "JIRA_EMAIL": "environment"},
+        )
+
+    def test_group_or_world_readable_env_file_is_refused(self) -> None:
+        root = self.credential_root()
+        for mode in (0o640, 0o604):
+            with self.subTest(mode=oct(mode)):
+                path = self.write_env(root, "JIRA_API_TOKEN=file-token\n", mode=mode)
+                with (
+                    mock.patch.dict(jira.os.environ, {}, clear=True),
+                    self.assertRaises(ValueError) as caught,
+                ):
+                    jira.resolve_jira_credentials(root)
+                message = str(caught.exception)
+                self.assertIn("chmod 600", message)
+                self.assertIn(str(path.resolve()), message)
+                self.assertNotIn("file-token", message)
+
+    def test_missing_token_names_both_supported_sources(self) -> None:
+        root = self.credential_root()
+        with (
+            mock.patch.dict(jira.os.environ, {}, clear=True),
+            self.assertRaises(ValueError) as caught,
+        ):
+            jira.resolve_jira_credentials(root)
+        self.assertIn("JIRA_API_TOKEN is required", str(caught.exception))
+        self.assertIn(".orchestration/.env", str(caught.exception))
+
+    def test_production_adapter_reads_the_shared_env_file(self) -> None:
+        root = self.credential_root()
+        self.write_env(root, "JIRA_API_TOKEN=file-token\n")
+        config = root / ".orchestration/config.yaml"
+        config.write_text(
+            "ticket:\n  kind: jira\n  project: PROJ\nsprint_id: active\n"
+            "jira_base_url: https://jira.example\n",
+            encoding="utf-8",
+        )
+        template = root / "inventory.json"
+        template.write_text("{}", encoding="utf-8")
+        seen: dict[str, object] = {}
+
+        def fake_fetcher(base_url, credentials=None):
+            seen["credentials"] = credentials
+            raise ValueError("stop before network")
+
+        args = jira.parser().parse_args(
+            [
+                "--inventory-template",
+                str(template),
+                "--artifact",
+                str(root / "artifact.json"),
+                "--output",
+                str(root / "out.json"),
+            ]
+        )
+        with (
+            mock.patch.dict(jira.os.environ, {}, clear=True),
+            mock.patch.object(jira, "network_fetcher", side_effect=fake_fetcher),
+            self.assertRaisesRegex(ValueError, "stop before network"),
+        ):
+            jira.run_adapter(args, config_override=config)
+        self.assertEqual(seen["credentials"]["token"], "file-token")
+
+    def test_identity_check_uses_approved_origin_and_reports_rejection(self) -> None:
+        class Response:
+            def __init__(self, url: str) -> None:
+                self.url = url
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def geturl(self) -> str:
+                return self.url
+
+            def read(self) -> bytes:
+                return b'{"accountId":"abc","emailAddress":"private@example.com"}'
+
+        class Opener:
+            def __init__(self, error: Exception | None = None) -> None:
+                self.requests: list[Request] = []
+                self.error = error
+
+            def open(self, request, timeout):
+                self.requests.append(request)
+                if self.error:
+                    raise self.error
+                return Response(request.full_url)
+
+        credentials = {"token": "secret", "email": "a@example.com", "sources": {}}
+        opener = Opener()
+        result = jira.verify_jira_identity(
+            "https://jira.example/", credentials, opener=opener
+        )
+        self.assertEqual(result, {"account_id": "abc"})
+        self.assertEqual(
+            opener.requests[0].full_url, "https://jira.example/rest/api/3/myself"
+        )
+        for error, fragment in (
+            (HTTPError("https://jira.example", 401, "Unauthorized", {}, None), "HTTP 401"),
+            (HTTPError("https://jira.example", 403, "Forbidden", {}, None), "HTTP 403"),
+            (URLError("offline"), "could not reach Jira"),
+        ):
+            with self.subTest(fragment=fragment):
+                with self.assertRaises(ValueError) as caught:
+                    jira.verify_jira_identity(
+                        "https://jira.example", credentials, opener=Opener(error)
+                    )
+                self.assertIn(fragment, str(caught.exception))
+                self.assertNotIn("secret", str(caught.exception))
 
 
 if __name__ == "__main__":

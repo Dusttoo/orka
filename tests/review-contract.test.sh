@@ -61,6 +61,14 @@ for file in agents/orchestration-code-reviewer.md agents/orchestration-security-
   require_text "$file" '"findings":[]' "clean reviews avoid narrative output"
 done
 
+for file in agents/orchestration-code-reviewer.md agents/orchestration-security-reviewer.md docs/reviewer-output.md; do
+  require_text "$file" 'ci_verified' "reviewers can cite exact-commit CI for checks they may not run"
+  require_text "$file" '"evidence":{"ci_check":' "CI-verified checks carry a structured evidence reference"
+  require_text "$file" 'otherwise `not_run`' "unverifiable checks stay not_run with a blocking finding"
+done
+require_text commands/gate.md "commits/<full-exact-head>/check-runs" "gate documents exact-head CI evidence capture"
+require_text commands/gate.md "--ci-evidence" "gate feeds exact-head CI evidence to API reviewers"
+
 require_text scripts/context_pipeline.py '"type": "json_schema"' "API providers receive a reviewer schema"
 require_text scripts/context_pipeline.py 'validate_review_output' "review output is validated mechanically"
 require_text docs/reviewer-output.md "Explanations are generated only for actual findings" \
@@ -106,6 +114,30 @@ for file in skills/orchestrate-ticket/SKILL.md skills/gate-pr/SKILL.md commands/
   require_text "$file" "brief" "orchestrator hands each reviewer its round brief"
   require_text "$file" "version_policy.py" "review workflows enforce repository minimum Orka version"
 done
+
+for file in skills/gate-pr/SKILL.md commands/gate.md docs/review-loop.md; do
+  require_text "$file" "api_agent.py reconcile --run-id <run>" \
+    "started review recovery reconciles the provider run first"
+  require_text "$file" "cancel-permit <pr> --phase-permit <token> --reason <text>" \
+    "started review recovery names the operator permit cancellation"
+  require_text "$file" "record-security-gate" \
+    "the security-gate decision is bound to the review generation"
+  require_text "$file" "git worktree add --detach" \
+    "reviews of a PR head outside the checkout use a detached worktree"
+done
+require_text docs/api-agent.md "cancel-permit" "reconciliation documents permit cancellation"
+require_text docs/api-agent.md "never creates a receipt" "permit cancellation never creates a receipt"
+require_text docs/review-loop.md "labelled by gate" "repair briefs keep every gate's explanation"
+for file in skills/gate-pr/SKILL.md commands/gate.md; do
+  require_text "$file" '`complete-review` is for desktop' \
+    "API reviewer runs record directly instead of re-completing their permit"
+  require_text "$file" "configured \`gates:\`" \
+    "configured gates are required regardless of issued permits"
+done
+require_text skills/orchestrate-ticket/SKILL.md "record-security-gate" \
+  "the Codex ticket pipeline binds its security-gate decision"
+require_text docs/review-loop.md "correct-repair-head" \
+  "abbreviated legacy repair heads have a documented recovery"
 
 require_text scripts/review-ledger.py "assert_minimum_version" \
   "review permits enforce repository minimum Orka version mechanically"

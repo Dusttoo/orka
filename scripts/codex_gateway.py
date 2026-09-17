@@ -9,7 +9,10 @@ import sys
 from pathlib import Path
 
 from api_agent import AgentError, BudgetError, Pricing, ProviderHTTPError, ProviderAdmissionError, normalize_usage
-from native_gateway import NativeGateway
+from native_gateway import ClientIncompatibleError, NativeGateway, unmetered_endpoint
+
+RESPONSES_PATH = "/v1/responses"
+COMPACT_PATH = "/v1/responses/compact"
 
 
 def response_events(response):
@@ -87,13 +90,15 @@ class CodexGateway(NativeGateway):
 
     def request(self, path, payload):
         self.raise_if_stopped()
-        if path != "/v1/responses":
-            raise AgentError("native Codex gateway supports /v1/responses only; compaction and other endpoints are not metered")
+        compact = path == COMPACT_PATH
+        if path != RESPONSES_PATH and not compact:
+            raise ClientIncompatibleError(unmetered_endpoint(path, (RESPONSES_PATH, COMPACT_PATH)))
         if (payload.get("background") or payload.get("previous_response_id") or payload.get("conversation")
                 or payload.get("context_management")
                 or payload.get("service_tier", "default") not in {"auto", "default", None}
+                or (compact and payload.get("stream") is not None and payload.get("stream") is not False)
                 or not client_tools_only(payload.get("tools", []))):
-            raise AgentError("native Codex requires stateless standard-tier requests with client tools only")
+            raise ClientIncompatibleError("native Codex requires stateless standard-tier requests with client tools only")
         for item in payload.get("input", []) if isinstance(payload.get("input"), list) else []:
             if isinstance(item, dict) and item.get("type") == "tool_search_output":
                 if item.get("execution") != "client" or not client_tools_only(item.get("tools")):
@@ -104,8 +109,16 @@ class CodexGateway(NativeGateway):
         if not isinstance(maximum, int) or isinstance(maximum, bool) or maximum <= 0:
             raise AgentError("max_output_tokens must be a positive integer")
         maximum = min(maximum, self.limits["max_output_tokens_per_turn"])
-        body = {**payload, "stream": False, "store": False, "background": False,
-                "service_tier": "default", "max_output_tokens": maximum}
+        if compact:
+            # Remote compaction is a unary, stateless Responses-shaped request.
+            # Forward only what the client sent: the endpoint's accepted
+            # parameters are not controller-owned, so no fields are injected.
+            body = dict(payload)
+            if "max_output_tokens" in body:
+                body["max_output_tokens"] = maximum
+        else:
+            body = {**payload, "stream": False, "store": False, "background": False,
+                    "service_tier": "default", "max_output_tokens": maximum}
         body.pop("client_metadata", None)
         count_body = {key: value for key, value in body.items() if key in {
             "model", "input", "instructions", "tools", "tool_choice", "text", "reasoning",
@@ -117,7 +130,8 @@ class CodexGateway(NativeGateway):
         reservation = self.ledger.reserve(projected=pricing.worst_case(count, maximum),
             limits=self.limits, model=model, origin=self.origin, **self.context)
         try:
-            response = self.model_request("openai", "responses", body, idempotency_key=reservation)
+            response = self.model_request("openai", "responses/compact" if compact else "responses",
+                                          body, idempotency_key=reservation)
         except ProviderAdmissionError:
             self.ledger.release(reservation, self.context["run_id"], "shared provider admission refused before submission")
             raise
@@ -126,7 +140,10 @@ class CodexGateway(NativeGateway):
                 self.ledger.release(reservation, self.context["run_id"], "native Codex request rejected")
             raise
         usage = response.get("usage")
-        if (not response.get("id") or response.get("status") not in {"completed", "incomplete"}
+        # A compaction result has output items but no response lifecycle status.
+        terminal = (isinstance(response.get("output"), list) if compact
+                    else response.get("status") in {"completed", "incomplete"})
+        if (not response.get("id") or not terminal
                 or not isinstance(usage, dict) or any(
                     not isinstance(usage.get(key), int) or isinstance(usage.get(key), bool) or usage[key] < 0
                     for key in ("input_tokens", "output_tokens"))):
