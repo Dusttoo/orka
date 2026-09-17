@@ -9,9 +9,25 @@ PREFLIGHT_REPO="$(mktemp -d)"
 INCOMPLETE_PLUGIN="$(mktemp -d)"
 UNSUPPORTED_ROUTE_REPO="$(mktemp -d)"
 FAKE_BIN="$(mktemp -d)"
-trap 'rm -rf "$PREFLIGHT_REPO" "$INCOMPLETE_PLUGIN" "$UNSUPPORTED_ROUTE_REPO" "$FAKE_BIN"' EXIT
+JIRA_REPO="$(mktemp -d)"
+trap 'rm -rf "$PREFLIGHT_REPO" "$INCOMPLETE_PLUGIN" "$UNSUPPORTED_ROUTE_REPO" "$FAKE_BIN" "$JIRA_REPO"' EXIT
 mkdir -p "$PREFLIGHT_REPO/.orchestration"
 cp "$ROOT/templates/config.yaml" "$PREFLIGHT_REPO/.orchestration/config.yaml"
+mkdir -p "$JIRA_REPO/.orchestration"
+python3 - "$ROOT/templates/config.yaml" "$JIRA_REPO/.orchestration/config.yaml" <<'PY'
+from pathlib import Path
+import sys
+source = Path(sys.argv[1]).read_text()
+for old, new in (
+    ("  kind: none ", "  kind: jira "),
+    ('  project: ""', "  project: PROJ"),
+    ('jira_base_url: ""', "jira_base_url: https://jira.example"),
+    ("    max_usd_per_run: 1.00", "    max_usd_per_run: 200"),
+):
+    assert old in source, old
+    source = source.replace(old, new, 1)
+Path(sys.argv[2]).write_text(source)
+PY
 mkdir -p "$UNSUPPORTED_ROUTE_REPO/.orchestration"
 python3 - "$ROOT/templates/config.yaml" "$UNSUPPORTED_ROUTE_REPO/.orchestration/config.yaml" <<'PY'
 from pathlib import Path
@@ -172,18 +188,142 @@ PY
 check "minimum version comparison accepts equal, newer, and cachebuster releases" \
   check_minimum_version_parser
 check_runtime_verified_subscription() {
-  PATH="$FAKE_BIN:$PATH" python3 "$ROOT/scripts/captain-preflight.py" \
-    --plugin-root "$ROOT" --repo "$PREFLIGHT_REPO" --host claude \
-    --verify-runtime > "$PREFLIGHT_REPO/subscription-preflight.json"
-  python3 - "$PREFLIGHT_REPO/subscription-preflight.json" <<'CHECK'
+  env -u JIRA_EMAIL JIRA_API_TOKEN=test-only-token PATH="$FAKE_BIN:$PATH" \
+    python3 "$ROOT/scripts/captain-preflight.py" \
+    --plugin-root "$ROOT" --repo "$JIRA_REPO" --host claude \
+    --verify-runtime --skip-jira-auth-check > "$JIRA_REPO/subscription-preflight.json"
+  python3 - "$JIRA_REPO/subscription-preflight.json" <<'CHECK'
 import json,sys
-v=json.load(open(sys.argv[1]))
+raw=open(sys.argv[1]).read()
+v=json.loads(raw)
 assert v['status']=='ready' and v['execution_ready']
 assert all(x['state']=='healthy' and x['mode']=='subscription' for x in v['routes'])
+assert v['jira']['state']=='ready' and v['jira']['live_check']=='skipped'
+assert v['skipped_checks']==['jira-auth']
+assert 'test-only-token' not in raw
 CHECK
 }
 check "verified preflight accepts model-less desktop subscription routes" \
   check_runtime_verified_subscription
+check_preflight_blocks_missing_jira_credentials() {
+  ! env -u JIRA_API_TOKEN -u JIRA_EMAIL PATH="$FAKE_BIN:$PATH" \
+    python3 "$ROOT/scripts/captain-preflight.py" \
+    --plugin-root "$ROOT" --repo "$JIRA_REPO" --host claude \
+    --verify-runtime > "$JIRA_REPO/missing-jira-preflight.json"
+  python3 - "$JIRA_REPO/missing-jira-preflight.json" <<'CHECK'
+import json,sys
+v=json.load(open(sys.argv[1]))
+assert v['status']=='blocked' and not v['execution_ready']
+assert all(x['state']=='healthy' for x in v['routes'])
+assert v['jira']['state']=='blocked'
+assert 'JIRA_API_TOKEN is required' in v['jira']['reason']
+assert '.orchestration/.env' in v['jira']['reason']
+CHECK
+}
+check "captain preflight blocks execution when Jira credentials are missing" \
+  check_preflight_blocks_missing_jira_credentials
+check_preflight_verifies_jira_credentials() {
+  python3 - "$ROOT/scripts/captain-preflight.py" "$JIRA_REPO/.orchestration/config.yaml" <<'PY'
+import importlib.util, json, shutil, sys, tempfile
+from pathlib import Path
+from unittest import mock
+from urllib.error import HTTPError, URLError
+spec = importlib.util.spec_from_file_location("captain_preflight", sys.argv[1])
+module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+repo = Path(tempfile.mkdtemp())
+try:
+    (repo / ".orchestration").mkdir()
+    config = repo / ".orchestration/config.yaml"
+    shutil.copy(sys.argv[2], config)
+    env = repo / ".orchestration/.env"
+    env.write_text("JIRA_API_TOKEN=file-secret-token\nJIRA_EMAIL=captain@example.com\n")
+    env.chmod(0o600)
+
+    class Response:
+        def __init__(self, url): self.url = url
+        def __enter__(self): return self
+        def __exit__(self, *_): return False
+        def geturl(self): return self.url
+        def read(self): return b'{"accountId":"acct-1"}'
+
+    class Opener:
+        def __init__(self, error=None): self.error, self.urls = error, []
+        def open(self, request, timeout):
+            self.urls.append(request.full_url)
+            assert request.headers["Authorization"].startswith("Basic ")
+            if self.error: raise self.error
+            return Response(request.full_url)
+
+    with mock.patch.dict(module.os.environ, {}, clear=True):
+        opener = Opener()
+        ok = module.jira_readiness(repo, config, skip_live=False, opener=opener)
+        assert ok["state"] == "ready" and ok["live_check"] == "passed", ok
+        assert opener.urls == ["https://jira.example/rest/api/3/myself"]
+        assert ok["credential_sources"] == {"JIRA_API_TOKEN": "file", "JIRA_EMAIL": "file"}
+        assert "file-secret-token" not in json.dumps(ok)
+        for error, fragment in (
+            (HTTPError("https://jira.example", 401, "Unauthorized", {}, None), "HTTP 401"),
+            (HTTPError("https://jira.example", 403, "Forbidden", {}, None), "HTTP 403"),
+            (URLError("offline"), "could not reach Jira"),
+        ):
+            bad = module.jira_readiness(repo, config, skip_live=False, opener=Opener(error))
+            assert bad["state"] == "blocked" and bad["live_check"] == "failed", bad
+            assert fragment in bad["reason"], bad
+            assert "file-secret-token" not in json.dumps(bad)
+        skipped_opener = Opener()
+        skipped = module.jira_readiness(repo, config, skip_live=True, opener=skipped_opener)
+        assert skipped["state"] == "ready" and skipped["live_check"] == "skipped"
+        assert skipped_opener.urls == []
+        env.chmod(0o644)
+        loose = module.jira_readiness(repo, config, skip_live=False, opener=Opener())
+        assert loose["state"] == "blocked" and "chmod 600" in loose["reason"], loose
+    with mock.patch.dict(module.os.environ, {"JIRA_API_TOKEN": "env-token"}, clear=True):
+        env.chmod(0o600)
+        config.write_text(config.read_text().replace("  kind: jira ", "  kind: none ", 1))
+        wrong_kind = module.jira_readiness(repo, config, skip_live=True)
+        assert wrong_kind["state"] == "blocked" and "ticket.kind: jira" in wrong_kind["reason"]
+finally:
+    shutil.rmtree(repo)
+PY
+}
+check "captain preflight authenticates Jira through an injectable transport" \
+  check_preflight_verifies_jira_credentials
+check_preflight_reports_effective_budget_limits() {
+  python3 - "$ROOT/scripts/captain-preflight.py" "$JIRA_REPO/.orchestration/config.yaml" "$JIRA_REPO/subscription-preflight.json" <<'PY'
+import importlib.util, json, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("captain_preflight", sys.argv[1])
+module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+cli = json.load(open(sys.argv[3]))
+assert cli["budget_limits"]["max_usd_per_run"] == "10.00", cli["budget_limits"]
+report = module.budget_report(Path(sys.argv[2]))
+assert report["budget_limits"]["max_usd_per_run"] == "10.00"
+assert {"key": "max_usd_per_run", "configured": "200", "effective": "10.00", "cap": "10.00"} in report["budget_cap_warnings"], report
+import api_agent
+helper = api_agent.budget_cap_violations
+del api_agent.budget_cap_violations
+try:
+    report = module.budget_report(Path(sys.argv[2]))
+finally:
+    api_agent.budget_cap_violations = helper
+assert "budget_cap_warnings" not in report
+json.dumps(report)
+PY
+}
+check "captain preflight reports effective budget limits and optional cap warnings" \
+  check_preflight_reports_effective_budget_limits
+check "Claude sprint preflight documents the Jira credential file" \
+  rg -q '\.orchestration/\.env' "$ROOT/commands/orchestrate-sprint.md"
+check "Codex sprint preflight documents the Jira credential file" \
+  rg -q '\.orchestration/\.env' "$ROOT/skills/orchestrate-sprint/SKILL.md"
+check "sprint controller docs define Jira credential loading" \
+  rg -q 'JIRA_API_TOKEN.*\.orchestration/\.env|\.orchestration/\.env.*JIRA_API_TOKEN' "$ROOT/docs/sprint-controller.md"
+check "template points Jira credentials at the gitignored env file" \
+  rg -q 'JIRA_API_TOKEN.*\.orchestration/\.env' "$ROOT/templates/config.yaml"
+check "Claude init names Jira credentials in the gitignored env file" \
+  rg -q 'JIRA_API_TOKEN' "$ROOT/commands/orchestration-init.md"
+check "Codex init names Jira credentials in the gitignored env file" \
+  rg -q 'JIRA_API_TOKEN' "$ROOT/skills/orchestration-init/SKILL.md"
 check_unsupported_claude_route() {
   ! PATH="$FAKE_BIN:$PATH" python3 "$ROOT/scripts/captain-preflight.py" \
     --plugin-root "$ROOT" --repo "$UNSUPPORTED_ROUTE_REPO" --host claude \

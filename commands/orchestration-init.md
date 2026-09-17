@@ -27,6 +27,10 @@ propose, confirm before writing.
    `.orchestration/.env` beside the config and add only the needed
    `ANTHROPIC_API_KEY` and/or `OPENAI_API_KEY`. Container environment variables
    may provide the same names and take precedence. Never print or copy key values.
+   If `ticket.kind: jira`, the same file (in the shared repository root) may hold
+   `JIRA_API_TOKEN` and, for Jira Cloud, `JIRA_EMAIL`; tell the user to
+   `chmod 600 .orchestration/.env`, because sprint preflight and sync refuse a
+   group- or world-readable credential file.
 
 3. **Project contract.** Confirm a `CLAUDE.md` (and ideally `AGENTS.md`) exists at the
    repo root -- the gate agents read it for the actual rules. If missing, offer

@@ -718,6 +718,52 @@ Probe credentials use the same environment precedence as the runtime; an invalid
 process-environment key will still override a corrected repository `.env`.
 Never print credential values. No credential is changed by these commands.
 
+Preflight output also carries `budget_limits`: the effective limits from
+`api_agent.budgets_from_config` after non-overridable caps, with USD values as
+strings. A configured `max_usd_per_run: 200` reports `"10.00"`. When the
+installed runtime provides `budget_cap_violations`, its entries appear as
+`budget_cap_warnings`. An invalid budget block reports `budget_error` and blocks
+execution.
+
+### Jira credentials
+
+`execution_ready: true` also requires the Jira access that
+`sprint-controller.py sync --inventory-template` uses. Preflight reports it under
+`jira` and blocks with a specific `reason` when `ticket.kind` is not `jira`, when
+`ticket.project`, `sprint_id`, or an HTTPS `jira_base_url` is missing, or when
+`JIRA_API_TOKEN` cannot be resolved. `JIRA_EMAIL` is optional: with it the
+adapter sends Basic auth (Jira Cloud API tokens), without it a Bearer token
+(Data Center personal access tokens); `auth_mode` shows which. With credentials
+present, preflight calls `GET <jira_base_url>/rest/api/3/myself` through the
+same approved-origin client as sync. HTTP 401/403, network failures, and
+responses without an account identity set `live_check: failed` and block.
+`--skip-jira-auth-check` skips only that call; it is listed in
+`skipped_checks` and still requires the credentials to be present.
+
+Orka supports one Jira credential file, in the shared repository root (the main
+checkout, also used by every linked worktree). Put `JIRA_API_TOKEN` in `.orchestration/.env`
+and, for Jira Cloud, add `JIRA_EMAIL`:
+
+```dotenv
+JIRA_EMAIL=you@example.com
+JIRA_API_TOKEN=your-jira-api-token
+```
+
+- The file is parsed as `KEY=value` data (optional `export`, single or JSON
+  double quotes, trailing ` # comments`). Shell syntax is rejected, nothing is
+  expanded, and only the two Jira names are read for Jira.
+- A non-empty process environment value takes precedence per key; the file is
+  consulted only when a key is unset. `credential_sources` reports
+  `environment` or `file` for each key, never a value.
+- Like ssh keys, the file must be a regular file owned by the current user and
+  not accessible by group or others. Otherwise both preflight and sync refuse
+  it; run `chmod 600 .orchestration/.env`.
+- Preflight and the controller-owned Jira adapter call the same resolver, so
+  they cannot disagree. Files elsewhere, such as a host-specific
+  `~/.config/.../jira.env`, are not read; export them or move the keys.
+- `.orchestration/.env` also holds API provider keys and must be gitignored.
+  `orchestration-init` adds it to `.gitignore`.
+
 Native Codex launches are also bound to a controller-selected checkout. For a
 preserved-PR recovery, the controller replaces every caller-provided `--cd`
 with the authenticated recovery worktree and passes the same path separately to

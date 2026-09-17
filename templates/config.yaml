@@ -349,7 +349,9 @@ ticket:
 # issue on the opposite side is its prerequisite. Adjust for your Jira scheme.
 sprint_id: active
 # Canonical credential trust anchor. This must be repository policy, never a
-# caller-selected environment value.
+# caller-selected environment value. Credentials never go here: export them or
+# set JIRA_API_TOKEN in the gitignored, chmod 600 .orchestration/.env of the
+# shared repository root (add JIRA_EMAIL there too for Jira Cloud).
 jira_base_url: ""
 # Jira Cloud commonly exposes sprint identity through a custom field such as
 # customfield_10020. Configure its exact REST field id here; the adapter derives
