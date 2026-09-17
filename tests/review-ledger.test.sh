@@ -976,6 +976,27 @@ if led correct-repair-head correct-abbreviated --head "$ABBREV_HEAD" --reason 'c
   bad "correct-repair-head refuses a completed repair attempt"
 else ok "correct-repair-head refuses a completed repair attempt"; fi
 
+# --- a desktop completion cannot mint a receipt for a started API review ------
+led open api-started >/dev/null
+STARTED_HEAD="$(git -C "$TMP" rev-parse HEAD)"
+STARTED_PERMIT="$(led permit-review api-started --role code-reviewer --head "$STARTED_HEAD" | field review_phase_permit)"
+python3 - "$TMP" "$STARTED_PERMIT" "$STARTED_HEAD" "$LEDGER" <<'PY'
+import importlib.util,sys
+from pathlib import Path
+spec=importlib.util.spec_from_file_location("review_permit",str(Path(sys.argv[4]).with_name("review_permit.py")))
+module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+module.consume(shared_root=Path(sys.argv[1]),ledger_dir=".orchestration/.review-ledger",pr="api-started",token=sys.argv[2],role="code-reviewer",head=sys.argv[3],timestamp="start")
+PY
+cat > "$TMP/api-started-forged.json" <<'JSON'
+{"schema_version":1,"gate":"code-review","verdict":"PASS","checks":[{"name":"review","status":"pass"}],"findings":[]}
+JSON
+if led complete-review api-started --role code-reviewer --phase-permit "$STARTED_PERMIT" \
+  --result "$TMP/api-started-forged.json" > /dev/null 2> "$TMP/api-started-error"; then
+  bad "complete-review refuses a permit an API run started"
+elif grep -q 'started by the API runner' "$TMP/api-started-error"; then
+  ok "complete-review refuses a permit an API run started"
+else bad "complete-review explains why a started API permit is refused"; fi
+
 # --- complete-review after an API runner already completed the permit ---------
 led open api-completed >/dev/null
 API_HEAD="$(git -C "$TMP" rev-parse HEAD)"

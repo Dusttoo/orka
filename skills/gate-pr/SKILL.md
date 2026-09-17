@@ -66,6 +66,8 @@ reviewers only: API execution creates the same completion receipt after
 successful provider output, so an API run goes straight to `record` with its
 token. Repeating `complete-review` with the identical result returns the
 existing receipt with `already_completed: true`; a different result is refused.
+`complete-review` refuses a permit an API run already started; recover it
+with `api_agent.py reconcile` instead.
 
 `permit-review` binds the local `git rev-parse HEAD`, because reviewers and
 receipts read the local tree. When the current checkout is not at the exact PR

@@ -130,6 +130,8 @@ the ledger state is identical from either checkout.
    on success, so go straight to `record` with the same token. A repeated
    `complete-review` with the identical result returns the existing receipt
    with `already_completed: true`; a different result is refused.
+   `complete-review` refuses a permit an API run already started; recover it
+   with `api_agent.py reconcile` instead.
 
    The validated result carries blocking, advisory, severity, regression, and
    finding explanations. The ledger increments strikes, auto-resolves components this gate

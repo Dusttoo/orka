@@ -231,6 +231,13 @@ def complete_with_status(
                     "digest; record the result the reviewer originally completed"
                 )
             return str(permit["completion_receipt"]), True
+        if desktop and permit.get("started_at"):
+            # A started permit belongs to the provider runner that consumed it;
+            # a desktop completion must not mint a receipt for that API review.
+            raise ReviewPermitError(
+                "review phase permit was started by the API runner; only that run "
+                "can complete it (reconcile the run, then cancel-permit if needed)"
+            )
         if not permit.get("started_at"):
             if not desktop:
                 raise ReviewPermitError(
