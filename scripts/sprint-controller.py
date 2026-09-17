@@ -4104,6 +4104,9 @@ def supervise_local(args: argparse.Namespace, _cfg: dict[str, Any]) -> None:
                 args.ticket,
                 args.sprint,
                 args.invocation_id,
+                route_scope=route_identity(
+                    llm_route_from_config(_cfg["config"], "sprint-worker")
+                ),
             )
             endpoint = gateway.start()
             child_env = claude_child_environment(child_env, gateway.token, endpoint)
@@ -4130,6 +4133,11 @@ def supervise_local(args: argparse.Namespace, _cfg: dict[str, Any]) -> None:
                 args.ticket,
                 args.sprint,
                 args.invocation_id,
+                # Client-incompatibility incidents hold only this route/client
+                # revision, never the provider, API roles, or running siblings.
+                route_scope=route_identity(
+                    llm_route_from_config(_cfg["config"], "sprint-worker")
+                ),
             )
             endpoint = gateway.start()
             child_env = child_environment(child_env, gateway.token, endpoint)
@@ -4282,9 +4290,13 @@ def supervise_local(args: argparse.Namespace, _cfg: dict[str, Any]) -> None:
                 shared_pressure = stop_reason.startswith(
                     "max_usd_per_sprint would be exceeded:"
                 )
+                # A client request the gateway cannot meter stops only this
+                # lane. Its route-scoped incident gates relaunch admission.
+                client_incompatible = stop_reason.startswith("client_incompatible:")
                 lane["state"] = (
                     "operator_decision"
                     if not shared_pressure
+                    and not client_incompatible
                     and ("budget" in stop_reason or "usd" in stop_reason)
                     else "recoverable"
                 )

@@ -383,9 +383,22 @@ provider-routing overrides are rejected. Supply a configured model explicitly.
 
 The Codex adapter supports stateless standard-tier Responses with local function
 and custom tools, namespaces, and client-executed tool search. It rejects hosted
-paid tools, remote compaction endpoints, stateful continuation, background responses,
-premium tiers, and unpriced models. Local compaction uses ordinary metered
-Responses requests. Model discovery is not provided. Installed-client checks
+paid tools, stateful continuation, background responses, premium tiers, and
+unpriced models. Local compaction uses ordinary metered Responses requests.
+Remote compaction (`POST /v1/responses/compact`) is metered through the same
+count, reserve, submit, and settle path; see [Codex compaction](codex.md#compaction-under-the-metered-gateway).
+Model discovery is not provided.
+
+A request the gateway cannot meter (another endpoint, a hosted tool, a stateful
+or premium-tier request) is a client incompatibility, not a provider incident.
+The gateway stops only the lane that sent it, with a `client_incompatible:` stop
+reason naming the sanitized endpoint, and the supervisor marks that lane
+`recoverable` with its attempt token intact. The incident is recorded under the
+lane's sprint-worker route identity, which includes the installed client
+revision. It holds new launches and recovery for that route until
+`health-check --role sprint-worker --after-repair` passes or the client binary
+changes. Running sibling lanes, other routes, and `execution: api` roles on the
+same provider are not held. Installed-client checks
 exercise a local-tool round trip and forced local compaction; authenticated
 readiness probes verify the connection without claiming a live generation test. Launch separate metered API
 reviewers from the credential-owning controller, not from this worker's temporary
@@ -791,6 +804,24 @@ incident. Transient incidents allow at most three failed automatic probes.
 Authentication/client holds need actual repair and an explicit
 `health-check --role <role> --after-repair`. Successful probes expire after five
 minutes. `plan.provider_holds` keeps these issues distinct from ticket decisions.
+
+Client incompatibilities are route-scoped. A native gateway that receives a
+request it cannot meter, or an installed-client check that fails during a
+probe, records the incident under `scoped_incidents` for that route identity.
+Its `plan.provider_holds` entry has `"scope": "route"`, and it is never listed
+in `plan.health_probes`. A plain `health-check` for that role returns the hold
+without probing. Once the cause is understood (for example, the client was
+upgraded or its configuration fixed), run
+`health-check --role <role> --after-repair`. A passing probe clears only that
+route's incident. Authentication (401/403), rate limits (429/529), and transport
+incidents remain provider-wide and still hold every route and API role.
+
+A provider-wide `{"state": "incompatible", ...}` record written before route
+scoping existed has no scope. Orka cannot tell whether it came from a gateway
+endpoint rejection or a provider or client probe, so it still holds every route
+of that provider, including API roles. Clear it with
+`health-check --role <role> --after-repair` after confirming the cause. No file
+edit or migration is needed.
 
 Admission scoping is mandatory even when automatic decomposition is disabled.
 The authenticated inventory now includes sanitized descriptions and extracts

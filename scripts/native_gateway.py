@@ -7,6 +7,7 @@ using the gateway, not an OS sandbox for arbitrary programs run by those clients
 from __future__ import annotations
 
 import json
+import re
 import secrets
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -15,6 +16,19 @@ from pathlib import Path
 from api_agent import (AgentError, BudgetError, HttpTransport, Pricing,
                        ProviderHTTPError, ProviderAdmissionError, UsageLedger, budgets_from_config,
                        normalize_usage, anthropic_context_beta)
+
+
+class ClientIncompatibleError(AgentError):
+    """The native client sent a request this gateway cannot meter.
+
+    This is evidence about one client/route, not about the provider: it is
+    recorded as a route-scoped incident and stops only the lane that sent it.
+    """
+
+
+def unmetered_endpoint(path, supported):
+    safe = re.sub(r"[^A-Za-z0-9/._-]", "_", str(path))[:120]
+    return f"native gateway does not meter POST {safe}; supported: {', '.join(supported)}"
 
 
 def claude_child_environment(environment, token, endpoint):
@@ -103,9 +117,12 @@ class NativeGateway:
     origin = "native-gateway"
 
     def __init__(self, root: Path, config: dict, ticket: str, sprint: str,
-                 run_id: str, transport=None):
+                 run_id: str, transport=None, route_scope=None):
         from provider_health import ProviderHealth
         self.health = ProviderHealth(root)
+        # Route identity that owns client-incompatibility incidents. Without it
+        # the incident is recorded under the gateway origin, which holds no route.
+        self.route_scope = route_scope or self.origin
         self.config = config
         self.ledger = UsageLedger(root)
         self.limits = budgets_from_config(config)
@@ -190,7 +207,7 @@ class NativeGateway:
         if payload.get("service_tier", "auto") != "auto" or any(
             tool.get("type", "custom") != "custom" for tool in payload.get("tools", [])
         ):
-            raise AgentError("native gateway supports custom client tools and standard token pricing only")
+            raise ClientIncompatibleError("native gateway supports custom client tools and standard token pricing only")
         count_payload = {k: v for k, v in payload.items()
                          if k in {"model", "messages", "system", "tools", "tool_choice", "thinking"}}
         counted = self.model_request("anthropic", "/messages/count_tokens", count_payload, count_only=True)
@@ -281,10 +298,23 @@ class NativeGateway:
                     status = 200
                     content_type = "text/event-stream" if streaming else "application/json"
                 except (AgentError, ValueError, TypeError, KeyError) as exc:
-                    if isinstance(exc, AgentError) and str(exc).startswith(("native Codex gateway supports", "native Codex requires", "native gateway supports")):
-                        gateway.health.failure(gateway.context["provider"], "incompatible")
                     rate_limited = isinstance(exc, ProviderHTTPError) and exc.status in {429, 529}
-                    gateway.stop("provider_rate_limited" if rate_limited else "provider_authentication" if isinstance(exc, ProviderHTTPError) and exc.status in {401,403} else str(exc), error=exc)
+                    if isinstance(exc, ClientIncompatibleError):
+                        # Scope to this client route; provider-wide admission,
+                        # API roles, and running sibling lanes are unaffected.
+                        try:
+                            gateway.health.failure(gateway.context["provider"], "incompatible",
+                                scope=gateway.route_scope, client=gateway.origin, detail=str(exc))
+                        except Exception:
+                            pass  # Unreadable health evidence already fails admission closed.
+                        reason = "client_incompatible: " + str(exc)
+                    elif rate_limited:
+                        reason = "provider_rate_limited"
+                    elif isinstance(exc, ProviderHTTPError) and exc.status in {401, 403}:
+                        reason = "provider_authentication"
+                    else:
+                        reason = str(exc)
+                    gateway.stop(reason, error=exc)
                     # A local budget refusal is not an upstream rate limit.
                     status, content_type = (exc.status if isinstance(exc, ProviderHTTPError) else 402 if isinstance(exc, BudgetError) else 502), "application/json"
                     body = json.dumps({"type": "error", "error": {

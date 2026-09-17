@@ -168,6 +168,29 @@ def bind_native_working_directory(command, route, working_directory):
     return cleaned
 
 
+HOLD_STATES = {"rate_limited", "authentication", "incompatible", "transport"}
+SCOPED_INCIDENTS = "scoped_incidents"
+
+
+def scoped_incident(client, detail):
+    return dict(
+        state="incompatible",
+        client=str(client)[:64],
+        reason=str(detail)[:300],
+        failures=1,
+        at=time.time(),
+        incident=uuid.uuid4().hex,
+    )
+
+
+def clear_preserving_scoped(state):
+    """Replace provider-level evidence without erasing route-scoped incidents."""
+    incidents = state.get(SCOPED_INCIDENTS)
+    state.clear()
+    if incidents:
+        state[SCOPED_INCIDENTS] = incidents
+
+
 class ProviderHealth:
     def __init__(self, root):
         from runtime_state import shared_repository_root
@@ -210,9 +233,20 @@ class ProviderHealth:
                 temporary.unlink(missing_ok=True)
 
     def status(self, provider, route=None):
+        """Return provider admission, narrowed to one route when it is named.
+
+        Provider-level incidents, including legacy unscoped ``incompatible``
+        records whose origin cannot be proven, hold every route. A route-scoped
+        client incompatibility holds only callers naming that route identity;
+        provider-wide callers (running gateways, API transports) ignore it.
+        """
         with self.locked(provider) as state:
             result = dict(state)
         result.setdefault("state", "unverified")
+        incidents = result.get(SCOPED_INCIDENTS) or {}
+        scoped = incidents.get(route) if route is not None else None
+        if result["state"] not in HOLD_STATES and isinstance(scoped, dict):
+            return {**scoped, "state": "incompatible", "scope": "route", "route": route}
         if result["state"] == "healthy" and (
             result.get("valid_until", 0) < time.time()
             or route is not None
@@ -222,14 +256,23 @@ class ProviderHealth:
         result.pop("probe_token", None)
         return result
 
-    def failure(self, provider, reason, retry_after=30):
-        if reason not in {
-            "rate_limited",
-            "authentication",
-            "incompatible",
-            "transport",
-        }:
+    def failure(self, provider, reason, retry_after=30, scope=None, client="", detail=""):
+        if reason not in HOLD_STATES:
             raise HealthError("invalid provider incident")
+        if scope is not None:
+            # Only a client's request shape is route-scoped. Authentication,
+            # rate-limit, and transport evidence always describes the provider.
+            if reason != "incompatible" or not isinstance(scope, str) or not scope:
+                raise HealthError("only client incompatibility can be route-scoped")
+            with self.locked(provider) as state:
+                incidents = state.setdefault(SCOPED_INCIDENTS, {})
+                existing = incidents.get(scope)
+                if isinstance(existing, dict):
+                    existing["failures"] = int(existing.get("failures", 1)) + 1
+                    existing["last_at"] = time.time()
+                else:
+                    incidents[scope] = scoped_incident(client, detail)
+            return
         with self.locked(provider) as state:
             # A later transient failure must not erase an authentication hold.
             if state.get("state") in {"authentication", "incompatible"}:
@@ -241,7 +284,7 @@ class ProviderHealth:
                 min(3600, float(retry_after or 30)),
                 min(900, 30 * 2 ** min(failures - 1, 5)),
             )
-            state.clear()
+            clear_preserving_scoped(state)
             state.update(
                 state=reason,
                 failures=failures,
@@ -266,21 +309,30 @@ class ProviderHealth:
                 probe_token=token,
                 probe_until=time.time() + 60,
                 probe_count=1 if repair else state.get("probe_count", 0) + 1,
+                probe_repair=bool(repair),
             )
             return token
 
-    def complete_probe(self, provider, token, outcome, route="", retry_after=30):
-        if not token or outcome not in {
-            "healthy",
-            "authentication",
-            "rate_limited",
-            "incompatible",
-            "transport",
-        }:
+    def complete_probe(
+        self, provider, token, outcome, route="", retry_after=30, scoped=False
+    ):
+        if not token or outcome not in {"healthy", *HOLD_STATES}:
             return False
         with self.locked(provider) as state:
             if state.get("probe_token") != token:
                 return False
+            if scoped:
+                # A failed installed-client check says nothing about the
+                # provider or other routes: keep provider state, hold the route.
+                if outcome != "incompatible" or not route:
+                    return False
+                for key in ("probe_token", "probe_until", "probe_repair"):
+                    state.pop(key, None)
+                state.setdefault(SCOPED_INCIDENTS, {})[route] = scoped_incident(
+                    "installed-client-check",
+                    "installed client failed the bounded compatibility probe",
+                )
+                return True
             if outcome == "healthy":
                 routes = (
                     set(state.get("routes", []))
@@ -288,7 +340,12 @@ class ProviderHealth:
                     else set()
                 )
                 routes.add(route)
-                state.clear()
+                incidents = state.get(SCOPED_INCIDENTS) or {}
+                if state.get("probe_repair") and route in incidents:
+                    # Only an explicit after-repair probe of this exact route
+                    # clears its client incompatibility.
+                    del incidents[route]
+                clear_preserving_scoped(state)
                 state.update(
                     state="healthy",
                     routes=sorted(routes),
@@ -296,7 +353,7 @@ class ProviderHealth:
                 )
             else:
                 count = state.get("probe_count", 1)
-                state.clear()
+                clear_preserving_scoped(state)
                 state.update(
                     state=outcome,
                     at=time.time(),
@@ -445,13 +502,18 @@ def probe(root, config, role="sprint-worker", repair=False, transport=None):
     if not route.get("model"):
         raise HealthError("configured route has no explicit model")
     existing = health.status(provider, identity)
-    if existing["state"] == "healthy" and not repair:
+    if not repair and (
+        existing["state"] == "healthy" or existing.get("scope") == "route"
+    ):
+        # A route-scoped client incompatibility needs actual repair and an
+        # explicit after-repair probe, exactly like a provider-wide one.
         return existing
     token = health.claim_probe(provider, repair=repair)
     if token is None:
         return health.status(provider, identity)
     transport = transport or HttpTransport(timeout=15)
     retry_after = 30
+    client_failed = False
     try:
         load_orchestration_env(Path(config))
         if route["execution"] == "desktop":
@@ -460,6 +522,7 @@ def probe(root, config, role="sprint-worker", repair=False, transport=None):
             try:
                 check(provider, route["model"])
             except Exception as exc:
+                client_failed = True
                 raise HealthError("installed client is incompatible") from exc
         if provider == "anthropic":
             reply = transport.request(
@@ -502,7 +565,14 @@ def probe(root, config, role="sprint-worker", repair=False, transport=None):
         outcome = "authentication" if "API_KEY is required" in str(exc) else "transport"
     except Exception:
         outcome = "transport"
-    health.complete_probe(provider, token, outcome, identity, retry_after)
+    health.complete_probe(
+        provider,
+        token,
+        outcome,
+        identity,
+        retry_after,
+        scoped=client_failed and outcome == "incompatible",
+    )
     return health.status(provider, identity)
 
 
@@ -528,11 +598,9 @@ class ProviderTransport:
             and kwargs.get("idempotency_key") == self.retry_owner
             and state.get("incident") == self.retry_incident
         )
-        if (
-            state["state"]
-            in {"rate_limited", "authentication", "incompatible", "transport"}
-            and not own_retry
-        ):
+        # Provider-wide on purpose: a route-scoped client incompatibility from a
+        # native gateway never holds API roles.
+        if state["state"] in HOLD_STATES and not own_retry:
             raise ProviderAdmissionError("provider admission held: " + state["state"])
         try:
             return self.transport.request(provider, path, payload, **kwargs)
