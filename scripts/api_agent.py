@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import copy
 import datetime as dt
 import fcntl
 import importlib.util
@@ -99,12 +100,35 @@ ROLE_TOOL_CEILINGS = {
     "sprint-worker": TOOL_NAMES,
 }
 POST_IMPLEMENTATION_REVIEWER_ROLES = {"code-reviewer", "security-reviewer"}
+REVIEWER_ROLES = {"design-reviewer", "code-reviewer", "security-reviewer"}
+# (configuration key, default envelope). Defaults are also the ceiling a
+# design transfer may move into implementation.
 PHASE_BUDGETS = {
     "design": ("max_usd_per_design_phase", Decimal("5")),
     "implementation": ("max_usd_per_implementation_phase", Decimal("12")),
     "code_review": ("max_usd_per_code_review_phase", Decimal("5")),
     "security_review": ("max_usd_per_security_review_phase", Decimal("5")),
 }
+# Repository configuration may raise design and review envelopes up to the
+# compiled per-run ceiling, so one run still cannot outspend max_usd_per_run.
+# Implementation stays at its default.
+PHASE_HARD_CAPS = {
+    "design": Decimal("10"),
+    "implementation": Decimal("12"),
+    "code_review": Decimal("10"),
+    "security_review": Decimal("10"),
+}
+FINAL_VERDICT_INSTRUCTION = (
+    "ORKA FINAL VERDICT TURN: the review budget or tool-round limit does not allow "
+    "another tool round, and tools are disabled for this response. Do not call "
+    "tools. Return your final structured review JSON now, based only on the "
+    "evidence gathered so far. If that evidence cannot verify a required area, do "
+    "not PASS it: record what remains unverified as a finding."
+)
+SKIPPED_TOOL_OUTPUT = (
+    "ERROR: tool call not executed: max_tool_rounds reached. Return the final "
+    "structured review JSON from the evidence already gathered."
+)
 
 
 def spending_phase(role: str | None) -> str:
@@ -134,6 +158,10 @@ DEFAULT_BUDGETS = {
     "max_model_runs_per_ticket": 12,
     "max_reviewer_runs_per_ticket": 6,
     "max_output_tokens_per_turn": 4096,
+    # Reviewer turns are bounded separately so each reservation reflects a
+    # realistic review response rather than the implementer allowance.
+    "max_output_tokens_per_review_turn": 8192,
+    "final_verdict_output_tokens": 4096,
     "max_tool_rounds": 8,
     "max_tool_output_chars": 12000,
     "tool_timeout_seconds": 300,
@@ -153,7 +181,9 @@ NON_OVERRIDABLE_MAXIMA = {
     "max_model_runs_per_ticket": 12,
     "max_reviewer_runs_per_ticket": 6,
 }
-NON_OVERRIDABLE_MAXIMA.update({key: maximum for key, maximum in PHASE_BUDGETS.values()})
+NON_OVERRIDABLE_MAXIMA.update(
+    {key: PHASE_HARD_CAPS[phase] for phase, (key, _) in PHASE_BUDGETS.items()}
+)
 CREDENTIAL_ENV_KEYS = {
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_BASE_URL",
@@ -492,6 +522,8 @@ def budgets_from_config(config: dict[str, Any]) -> dict[str, Any]:
             result[key] = decimal_value(raw[key], f"llm.budgets.{key}")
     for key in (
         "max_output_tokens_per_turn",
+        "max_output_tokens_per_review_turn",
+        "final_verdict_output_tokens",
         "max_tool_rounds",
         "max_tool_output_chars",
         "tool_timeout_seconds",
@@ -521,12 +553,27 @@ def budgets_from_config(config: dict[str, Any]) -> dict[str, Any]:
     for key, _ in PHASE_BUDGETS.values():
         if result[key] <= 0:
             raise AgentError(f"llm.budgets.{key} must be greater than zero")
-    # Repository configuration may tighten incident breakers, never relax them.
-    # Ticket-specific host grants are applied separately at admission; editing
-    # the worktree cannot raise these defaults or shared/per-run ceilings.
+    # Repository configuration may tighten every incident breaker. It may raise
+    # only the design, code-review, and security-review phase envelopes above
+    # their $5 defaults, and only up to PHASE_HARD_CAPS ($10, the compiled
+    # max_usd_per_run). Implementation, per-run, ticket, sprint, pause, and
+    # run-count ceilings can never exceed their compiled values; anything above
+    # a hard cap is clamped (budget_cap_violations reports it). Ticket-specific
+    # host grants are applied separately at admission; editing the worktree
+    # cannot raise shared or per-run ceilings.
     for key, maximum in NON_OVERRIDABLE_MAXIMA.items():
         configured = result[key]
         result[key] = maximum if not configured else min(configured, maximum)
+    # Output bounds are derived, never widened: the review turn stays within
+    # the general turn cap and the forced verdict turn within the review turn.
+    result["max_output_tokens_per_review_turn"] = min(
+        result["max_output_tokens_per_review_turn"],
+        result["max_output_tokens_per_turn"],
+    )
+    result["final_verdict_output_tokens"] = min(
+        result["final_verdict_output_tokens"],
+        result["max_output_tokens_per_review_turn"],
+    )
     hard = result["max_usd_per_ticket"]
     if "pause_usd_per_ticket" not in raw:
         result["pause_usd_per_ticket"] = min(Decimal("20"), hard * Decimal("0.75"))
@@ -543,6 +590,45 @@ def budgets_from_config(config: dict[str, Any]) -> dict[str, Any]:
     if pause and hard and pause >= hard:
         raise AgentError("pause_usd_per_ticket must be lower than max_usd_per_ticket")
     return result
+
+
+def budget_cap_violations(config: dict[str, Any]) -> list[dict[str, str]]:
+    """List configured `llm.budgets` values that Orka silently reduces.
+
+    Each item is `{"key", "configured", "effective", "cap"}` with string values,
+    ordered like `NON_OVERRIDABLE_MAXIMA`; `effective` equals the hard `cap`.
+    Derived output-token bounds are documented minimums, not hard caps, and
+    are not reported. This is advisory and never raises for values
+    `budgets_from_config` would reject; enforcement remains in
+    `budgets_from_config` and ledger admission.
+    """
+    llm = config.get("llm") if isinstance(config, dict) else None
+    raw = llm.get("budgets") if isinstance(llm, dict) else None
+    if not isinstance(raw, dict):
+        return []
+    violations: list[dict[str, str]] = []
+
+    def configured(key: str, parse: Any) -> Any:
+        if key not in raw:
+            return None
+        try:
+            return parse(raw[key], f"llm.budgets.{key}")
+        except AgentError:
+            return None
+
+    for key, cap in NON_OVERRIDABLE_MAXIMA.items():
+        parse = int_value if isinstance(cap, int) else decimal_value
+        value = configured(key, parse)
+        if value is not None and value > cap:
+            violations.append(
+                {
+                    "key": key,
+                    "configured": str(value),
+                    "effective": str(cap),
+                    "cap": str(cap),
+                }
+            )
+    return violations
 
 
 def normalize_ticket_scope(value: str | None) -> str | None:
@@ -755,8 +841,8 @@ class UsageLedger:
     @staticmethod
     def phase_limits(events, ticket, limits):
         result = {
-            phase: min(decimal_value(limits.get(key, maximum), key), maximum)
-            for phase, (key, maximum) in PHASE_BUDGETS.items()
+            phase: min(decimal_value(limits.get(key, default), key), PHASE_HARD_CAPS[phase])
+            for phase, (key, default) in PHASE_BUDGETS.items()
         }
         transfer = next(
             (
@@ -769,11 +855,13 @@ class UsageLedger:
         )
         if transfer:
             # Reconfiguration may tighten envelopes; never manufacture capacity.
+            # Only the default design envelope can move: a raised design phase
+            # must not lift implementation above its pre-raise reach.
             amount = min(
                 decimal_value(transfer["amount_usd"], "transfer"),
                 max(
                     Decimal("0"),
-                    result["design"]
+                    min(result["design"], PHASE_BUDGETS["design"][1])
                     - decimal_value(transfer["design_spent_usd"], "spent"),
                 ),
             )
@@ -797,7 +885,10 @@ class UsageLedger:
             totals = self.phase_totals(events, ticket)["design"]
             if totals["reserved_usd"]:
                 return False  # Uncertain provider work keeps its full reservation.
-            maximum = self.phase_limits(events, ticket, limits)["design"]
+            maximum = min(
+                self.phase_limits(events, ticket, limits)["design"],
+                PHASE_BUDGETS["design"][1],
+            )
             amount = max(Decimal("0"), maximum - totals["spent_usd"])
             if amount <= 0:
                 return False
@@ -812,6 +903,69 @@ class UsageLedger:
                 )
             )
             return True
+
+    def admission_headroom(
+        self,
+        *,
+        limits: dict[str, Any],
+        role: str | None,
+        run_id: str,
+        ticket: str | None,
+        sprint: str | None,
+    ) -> dict[str, Any]:
+        """Advisory remaining capacity under the configured dollar ceilings.
+
+        Host-issued budget grants are deliberately not queried: this runs no
+        privileged helper and can only understate capacity. reserve() stays
+        authoritative.
+        """
+        events = self.snapshot()
+        _, open_items = self._totals(events)
+
+        def used(field: str, value: str) -> Decimal:
+            spent = sum(
+                (
+                    decimal_value(event.get("cost_usd", 0), "ledger cost")
+                    for event in events
+                    if event.get("kind") == "usage"
+                    and self._matches(event, field, value)
+                ),
+                Decimal("0"),
+            )
+            reserved = sum(
+                (
+                    decimal_value(event.get("projected_cost_usd", 0), "reservation")
+                    for event in open_items.values()
+                    if self._matches(event, field, value)
+                ),
+                Decimal("0"),
+            )
+            return spent + reserved
+
+        phase = spending_phase(role)
+        run_limit = limits["max_usd_per_run"]
+        remaining = [run_limit - used("run_id", run_id)]
+        for field, value, key in (
+            ("ticket", ticket, "max_usd_per_ticket"),
+            ("ticket", ticket, "pause_usd_per_ticket"),
+            ("sprint", sprint, "max_usd_per_sprint"),
+        ):
+            if value and limits[key] > 0:
+                remaining.append(limits[key] - used(field, value))
+        phase_limit = phase_used = None
+        if ticket:
+            phase_limit = self.phase_limits(events, ticket, limits)[phase]
+            totals = self.phase_totals(events, ticket)[phase]
+            phase_used = totals["spent_usd"] + totals["reserved_usd"]
+            remaining.append(phase_limit - phase_used)
+        return {
+            "phase": phase,
+            "phase_key": PHASE_BUDGETS[phase][0],
+            "phase_limit": phase_limit,
+            "phase_used": phase_used,
+            "run_limit": run_limit,
+            "remaining": max(Decimal("0"), min(remaining)),
+        }
 
     def reserve(
         self,
@@ -2312,6 +2466,33 @@ class ApiAgent:
         )
         return response
 
+    def _tool_result(
+        self, call: dict[str, Any], output: str, is_error: bool
+    ) -> dict[str, Any]:
+        call_id = str(call.get("id") or call.get("call_id") or "")
+        if self.provider == "anthropic":
+            return {
+                "type": "tool_result",
+                "tool_use_id": call_id,
+                "content": output,
+                "is_error": is_error,
+            }
+        if self.provider == "bedrock":
+            return {
+                "toolResult": {
+                    "toolUseId": call_id,
+                    "content": [{"text": output}],
+                    "status": "error" if is_error else "success",
+                }
+            }
+        if self.provider in {"azure_adm", "bedrock_mantle"}:
+            return {"role": "tool", "tool_call_id": call_id, "content": output}
+        return {
+            "type": "function_call_output",
+            "call_id": str(call.get("call_id") or call_id),
+            "output": output,
+        }
+
     def _execute_calls(self, calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
         results = []
         allowed = {
@@ -2324,7 +2505,6 @@ class ApiAgent:
         }
         for call in calls:
             name = str(call.get("name") or "")
-            call_id = str(call.get("id") or call.get("call_id") or "")
             if self.provider in {"anthropic", "bedrock"}:
                 arguments = call.get("input") or {}
             else:
@@ -2342,38 +2522,191 @@ class ApiAgent:
             except (AgentError, OSError, ValueError) as exc:
                 is_error = True
                 output = f"ERROR: {exc}"
-            if self.provider == "anthropic":
-                results.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": call_id,
-                        "content": output,
-                        "is_error": is_error,
-                    }
-                )
-            elif self.provider == "bedrock":
-                results.append(
-                    {
-                        "toolResult": {
-                            "toolUseId": call_id,
-                            "content": [{"text": output}],
-                            "status": "error" if is_error else "success",
-                        }
-                    }
-                )
-            elif self.provider in {"azure_adm", "bedrock_mantle"}:
-                results.append(
-                    {"role": "tool", "tool_call_id": call_id, "content": output}
-                )
-            else:
-                results.append(
-                    {
-                        "type": "function_call_output",
-                        "call_id": str(call.get("call_id") or call_id),
-                        "output": output,
-                    }
-                )
+            results.append(self._tool_result(call, output, is_error))
         return results
+
+    def _continuation(
+        self,
+        body: dict[str, Any],
+        response: dict[str, Any],
+        results: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        if self.provider == "anthropic":
+            messages = list(body.get("messages") or [])
+            messages.append(
+                {"role": "assistant", "content": response.get("content") or []}
+            )
+            messages.append({"role": "user", "content": results})
+            body = dict(body)
+            body["messages"] = roll_conversation_cache_breakpoint(messages)
+            return body
+        if self.provider == "bedrock":
+            message = (response.get("output") or {}).get("message") or {}
+            messages = list(body.get("messages") or [])
+            messages.append(message)
+            messages.append({"role": "user", "content": results})
+            body = {
+                key: body[key]
+                for key in (
+                    "modelId",
+                    "inferenceConfig",
+                    "system",
+                    "toolConfig",
+                    "additionalModelRequestFields",
+                )
+                if key in body
+            }
+            body["messages"] = (
+                roll_bedrock_cache_breakpoint(messages)
+                if context_pipeline.bedrock_model_family(self.model) == "anthropic"
+                else messages
+            )
+            return body
+        if self.provider in {"azure_adm", "bedrock_mantle"}:
+            choices = response.get("choices") or []
+            assistant = dict((choices[0].get("message") or {}) if choices else {})
+            messages = list(body.get("messages") or [])
+            messages.append(
+                {
+                    key: assistant[key]
+                    for key in ("role", "content", "tool_calls")
+                    if key in assistant
+                }
+            )
+            messages.extend(results)
+            body = {
+                key: body[key]
+                for key in (
+                    "model",
+                    "max_completion_tokens",
+                    "max_tokens",
+                    "tools",
+                    "tool_choice",
+                    "parallel_tool_calls",
+                )
+                if key in body
+            }
+            body["messages"] = messages
+            return body
+        keep = {
+            key: body[key]
+            for key in (
+                "model",
+                "max_output_tokens",
+                "tools",
+                "tool_choice",
+                "parallel_tool_calls",
+                "reasoning",
+                "text",
+            )
+            if key in body
+        }
+        keep["previous_response_id"] = response["id"]
+        keep["input"] = results
+        return keep
+
+    def _add_user_text(
+        self, body: dict[str, Any], text: str, *, prepend: bool
+    ) -> None:
+        """Place text in the latest user turn using the provider's block shape."""
+        key = "input" if self.provider == "openai" else "messages"
+        items = body.get(key)
+        if isinstance(items, str):
+            items = [{"role": "user", "content": items}]
+        items = [dict(item) if isinstance(item, dict) else item for item in items or []]
+        block = (
+            {"type": "text", "text": text}
+            if self.provider in {"anthropic", "azure_adm", "bedrock_mantle"}
+            else {"text": text}
+            if self.provider == "bedrock"
+            else {"type": "input_text", "text": text}
+        )
+        target = (
+            items[-1]
+            if items
+            and isinstance(items[-1], dict)
+            and items[-1].get("role") == "user"
+            else None
+        )
+        if target is None:
+            content: Any = (
+                text if self.provider in {"azure_adm", "bedrock_mantle"} else [block]
+            )
+            items.append({"role": "user", "content": content})
+        else:
+            content = target.get("content")
+            if isinstance(content, list):
+                content = [block, *content] if prepend else [*content, block]
+            elif self.provider in {"azure_adm", "bedrock_mantle"}:
+                parts = [text, str(content or "")] if prepend else [str(content or ""), text]
+                content = "\n\n".join(part for part in parts if part)
+            else:
+                existing = (
+                    [{"type": "text", "text": content}]
+                    if self.provider == "anthropic"
+                    else [{"type": "input_text", "text": content}]
+                    if self.provider == "openai"
+                    else [{"text": content}]
+                ) if content else []
+                content = [block, *existing] if prepend else [*existing, block]
+            target["content"] = content
+        body[key] = items
+
+    def _final_verdict_body(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Build the single tool-free verdict request from a continuation body."""
+        final = copy.deepcopy(body)
+        cap = self.budgets["final_verdict_output_tokens"]
+        if self.provider == "bedrock":
+            config = dict(final.get("inferenceConfig") or {})
+            config["maxTokens"] = min(int(config.get("maxTokens") or cap), cap)
+            final["inferenceConfig"] = config
+            # Converse has no "none" tool choice and rejects a transcript with
+            # toolUse blocks unless toolConfig is present. The instruction asks
+            # for no tools, and a returned tool call fails closed below.
+        else:
+            cap_key = {
+                "anthropic": "max_tokens",
+                "azure_adm": "max_completion_tokens",
+                "bedrock_mantle": "max_tokens",
+            }.get(self.provider, "max_output_tokens")
+            final[cap_key] = min(int(final.get(cap_key) or cap), cap)
+            # Tool definitions stay because the transcript references them;
+            # tool_choice none forbids another call.
+            final["tool_choice"] = (
+                {"type": "none"} if self.provider == "anthropic" else "none"
+            )
+        self._add_user_text(final, FINAL_VERDICT_INSTRUCTION, prepend=False)
+        return final
+
+    def _budget_brief(self, output_cap: int) -> str:
+        headroom = self.ledger.admission_headroom(
+            limits=self.budgets,
+            role=self.role,
+            run_id=self.run_id,
+            ticket=self.ticket,
+            sprint=self.sprint,
+        )
+        per_turn = self.pricing.worst_case(0, output_cap)
+        if headroom["phase_limit"] is None:
+            scope = (
+                f"no ticket phase envelope applies; run ceiling "
+                f"${headroom['run_limit']:.2f}"
+            )
+        else:
+            scope = (
+                f"{headroom['phase']} phase ceiling ${headroom['phase_limit']:.2f}; "
+                f"already spent or reserved ${headroom['phase_used']:.2f}"
+            )
+        return (
+            f"ORKA BUDGET NOTE: {scope}; remaining ${headroom['remaining']:.2f} "
+            "across the configured phase, run, ticket, and sprint ceilings. Each model turn "
+            f"reserves its counted input plus up to ${per_turn:.4f} of output "
+            f"({output_cap} tokens), and at most {self.budgets['max_tool_rounds']} "
+            "tool rounds are allowed. Budget your tool rounds: gather decisive "
+            "evidence first. When the next turn would not fit or the tool-round "
+            "limit is reached, Orka forces one final verdict turn without tools in "
+            "which you must return your final structured review JSON."
+        )
 
     def run(self, request: dict[str, Any]) -> dict[str, Any]:
         self._active_review_head = ""
@@ -2436,15 +2769,21 @@ class ApiAgent:
         )
         if requested_cap <= 0:
             raise AgentError(f"request requires a positive {cap_key}")
+        # Reviewers submit (and therefore reserve) a realistic review bound
+        # rather than the general turn allowance. Continuations copy this cap.
+        output_cap = min(
+            requested_cap,
+            self.budgets[
+                "max_output_tokens_per_review_turn"
+                if self.role in REVIEWER_ROLES
+                else "max_output_tokens_per_turn"
+            ],
+        )
         if self.provider == "bedrock":
-            request.setdefault("inferenceConfig", {})[cap_key] = min(
-                requested_cap, self.budgets["max_output_tokens_per_turn"]
-            )
+            request.setdefault("inferenceConfig", {})[cap_key] = output_cap
             request["toolConfig"] = {"tools": self.tools, "toolChoice": {"auto": {}}}
         else:
-            request[cap_key] = min(
-                requested_cap, self.budgets["max_output_tokens_per_turn"]
-            )
+            request[cap_key] = output_cap
             request["tools"] = self.tools
         if self.provider == "anthropic":
             request["tool_choice"] = {"type": "auto", "disable_parallel_tool_use": True}
@@ -2452,12 +2791,14 @@ class ApiAgent:
         elif self.provider != "bedrock":
             request["tool_choice"] = "auto"
             request["parallel_tool_calls"] = False
-        reviewer_roles = {"design-reviewer", "code-reviewer", "security-reviewer"}
-        if self.role in reviewer_roles:
+        if self.role in REVIEWER_ROLES:
             if not self.review_authorization or not self.review_pr:
                 raise AgentError(
                     "reviewer run requires --review-pr and a ledger-issued --review-authorization"
                 )
+            # Read the ledger before consuming the permit so a failure here
+            # cannot strand a started permit outside the cancellable states.
+            self._add_user_text(request, self._budget_brief(output_cap), prepend=True)
             try:
                 head = subprocess.run(
                     ["git", "rev-parse", "HEAD"],
@@ -2501,35 +2842,57 @@ class ApiAgent:
         self._save(status="ready", request=request)
         body = request
         transcript: list[dict[str, Any]] = []
+        final_turn: str | None = None
         while True:
             try:
                 response = self._submit(body)
             except BudgetError as exc:
+                # A reviewer whose next tool continuation no longer fits gets
+                # exactly one smaller, tool-free verdict request. It is admitted
+                # like any other request; if even that does not fit, the run is
+                # blocked as before.
+                if (
+                    final_turn is None
+                    and self.role in REVIEWER_ROLES
+                    and body is not request
+                ):
+                    final_turn = "budget"
+                    self._save(final_turn=final_turn, final_turn_reason=str(exc))
+                    body = self._final_verdict_body(body)
+                    continue
                 self._save(status="budget_blocked", error=str(exc))
                 raise
             calls = tool_calls(self.provider, response)
             text = response_text(self.provider, response)
-            transcript.append(
-                {
-                    "response_id": response.get("id"),
-                    "stop_reason": (
-                        ((response.get("choices") or [{}])[0].get("finish_reason"))
-                        if self.provider in {"azure_adm", "bedrock_mantle"}
-                        else response.get("stopReason")
-                        if self.provider == "bedrock"
-                        else response.get("stop_reason") or response.get("status")
-                    ),
-                    "text": text,
-                    "tool_calls": [
-                        {
-                            "name": call.get("name"),
-                            "id": call.get("id") or call.get("call_id"),
-                        }
-                        for call in calls
-                    ],
-                }
-            )
+            entry: dict[str, Any] = {
+                "response_id": response.get("id"),
+                "stop_reason": (
+                    ((response.get("choices") or [{}])[0].get("finish_reason"))
+                    if self.provider in {"azure_adm", "bedrock_mantle"}
+                    else response.get("stopReason")
+                    if self.provider == "bedrock"
+                    else response.get("stop_reason") or response.get("status")
+                ),
+                "text": text,
+                "tool_calls": [
+                    {
+                        "name": call.get("name"),
+                        "id": call.get("id") or call.get("call_id"),
+                    }
+                    for call in calls
+                ],
+            }
+            if final_turn:
+                entry["final_turn"] = final_turn
+            transcript.append(entry)
             self._save(transcript=transcript)
+            if calls and final_turn:
+                error = (
+                    f"final verdict turn ({final_turn}) returned tool calls "
+                    "instead of a verdict"
+                )
+                self._save(status="budget_blocked", error=error)
+                raise BudgetError(error)
             if not calls:
                 status = "completed"
                 if self.provider == "anthropic" and response.get("stop_reason") not in {
@@ -2571,7 +2934,7 @@ class ApiAgent:
                         raise AgentError(
                             f"reviewer returned invalid structured output: {exc}"
                         ) from exc
-                if status == "completed" and self.role in reviewer_roles:
+                if status == "completed" and self.role in REVIEWER_ROLES:
                     completed_result: Any
                     try:
                         completed_result = json.loads(review_text(self.provider, text))
@@ -2629,85 +2992,34 @@ class ApiAgent:
                 }
                 if review is not None:
                     result["review"] = review
+                if final_turn:
+                    result["final_turn"] = final_turn
                 return result
             rounds = int(self.state["tool_rounds"])
             if rounds >= self.budgets["max_tool_rounds"]:
                 error = f"max_tool_rounds ({self.budgets['max_tool_rounds']}) reached"
-                self._save(status="budget_blocked", error=error)
-                raise BudgetError(error)
+                if self.role not in REVIEWER_ROLES:
+                    self._save(status="budget_blocked", error=error)
+                    raise BudgetError(error)
+                # Pending calls are answered without executing them, so the
+                # tool-round ceiling holds while the transcript stays valid.
+                final_turn = "max_tool_rounds"
+                # Between turns with nothing pending, like a tool round, so a
+                # later known failure still releases the review permit.
+                self._save(
+                    status="tool_running", final_turn=final_turn, final_turn_reason=error
+                )
+                skipped = [
+                    self._tool_result(call, SKIPPED_TOOL_OUTPUT, True)
+                    for call in calls
+                ]
+                body = self._final_verdict_body(
+                    self._continuation(body, response, skipped)
+                )
+                continue
             results = self._execute_calls(calls)
             self._save(status="tool_running", tool_rounds=rounds + 1)
-            if self.provider == "anthropic":
-                messages = list(body.get("messages") or [])
-                messages.append(
-                    {"role": "assistant", "content": response.get("content") or []}
-                )
-                messages.append({"role": "user", "content": results})
-                body = dict(body)
-                body["messages"] = roll_conversation_cache_breakpoint(messages)
-            elif self.provider == "bedrock":
-                message = (response.get("output") or {}).get("message") or {}
-                messages = list(body.get("messages") or [])
-                messages.append(message)
-                messages.append({"role": "user", "content": results})
-                body = {
-                    key: body[key]
-                    for key in (
-                        "modelId",
-                        "inferenceConfig",
-                        "system",
-                        "toolConfig",
-                        "additionalModelRequestFields",
-                    )
-                    if key in body
-                }
-                body["messages"] = (
-                    roll_bedrock_cache_breakpoint(messages)
-                    if context_pipeline.bedrock_model_family(self.model) == "anthropic"
-                    else messages
-                )
-            elif self.provider in {"azure_adm", "bedrock_mantle"}:
-                choices = response.get("choices") or []
-                assistant = dict((choices[0].get("message") or {}) if choices else {})
-                messages = list(body.get("messages") or [])
-                messages.append(
-                    {
-                        key: assistant[key]
-                        for key in ("role", "content", "tool_calls")
-                        if key in assistant
-                    }
-                )
-                messages.extend(results)
-                body = {
-                    key: body[key]
-                    for key in (
-                        "model",
-                        "max_completion_tokens",
-                        "max_tokens",
-                        "tools",
-                        "tool_choice",
-                        "parallel_tool_calls",
-                    )
-                    if key in body
-                }
-                body["messages"] = messages
-            else:
-                keep = {
-                    key: body[key]
-                    for key in (
-                        "model",
-                        "max_output_tokens",
-                        "tools",
-                        "tool_choice",
-                        "parallel_tool_calls",
-                        "reasoning",
-                        "text",
-                    )
-                    if key in body
-                }
-                keep["previous_response_id"] = response["id"]
-                keep["input"] = results
-                body = keep
+            body = self._continuation(body, response, results)
 
 
 def read_request(path: str) -> dict[str, Any]:
@@ -2872,6 +3184,11 @@ def build_report(root: Path, args: argparse.Namespace) -> dict[str, Any]:
         outcomes[status] = outcomes.get(status, 0) + 1
 
     _, open_items = ledger._totals(events)
+    # Reservations carry the same role/model/provider/ticket/sprint fields as
+    # usage, so they follow the report's filters and window.
+    open_reservations = [
+        event for event in open_items.values() if in_window(event) and matches(event)
+    ]
     return {
         "window": {
             "since": since.isoformat() if since else None,
@@ -2883,7 +3200,8 @@ def build_report(root: Path, args: argparse.Namespace) -> dict[str, Any]:
         "groups_hidden_by_top": hidden,
         "totals": aggregate(usage_events),
         "run_outcomes": outcomes,
-        "open_reservations": list(open_items.values()),
+        "open_reservations": open_reservations,
+        "open_reservations_ledger_wide": len(open_items),
         "ledger": str(ledger.path),
     }
 
@@ -2946,10 +3264,19 @@ def format_report(report: dict[str, Any]) -> str:
             f"{name} {count}" for name, count in sorted(report["run_outcomes"].items())
         )
         lines.append(f"run outcomes: {outcomes}")
-    if report["open_reservations"]:
+    matching = len(report["open_reservations"])
+    ledger_wide = report.get("open_reservations_ledger_wide", matching)
+    if matching:
+        elsewhere = (
+            f"; {ledger_wide} ledger-wide" if ledger_wide != matching else ""
+        )
         lines.append(
-            f"open reservations: {len(report['open_reservations'])} "
-            "(reconcile before trusting spend totals)"
+            f"open reservations: {matching} "
+            f"(reconcile before trusting spend totals{elsewhere})"
+        )
+    elif ledger_wide:
+        lines.append(
+            f"open reservations: 0 match these filters ({ledger_wide} ledger-wide)"
         )
     waits = report["totals"].get("rate_limit_wait_seconds") or 0
     if waits:

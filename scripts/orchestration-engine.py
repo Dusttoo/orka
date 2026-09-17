@@ -663,12 +663,34 @@ def require_config(args: argparse.Namespace) -> dict[str, Any]:
     return cfg
 
 
+def budget_cap_warnings(cfg: dict[str, Any]) -> list[str]:
+    """Explain configured LLM budgets that Orka clamps to a lower hard cap."""
+    llm = cfg.get("llm")
+    if not isinstance(llm, dict) or not isinstance(llm.get("budgets"), dict):
+        return []
+    scripts = str(Path(__file__).resolve().parent)
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    try:
+        # Lazy: only configurations with LLM budgets load the API runner.
+        import api_agent
+    except Exception as exc:  # advisory only; never block validation
+        return [f"WARNING could not check llm.budgets hard caps: {exc}"]
+    return [
+        f"WARNING llm.budgets.{item['key']}={item['configured']} exceeds the hard cap "
+        f"{item['cap']}; Orka enforces {item['effective']}"
+        for item in api_agent.budget_cap_violations(cfg)
+    ]
+
+
 def cmd_validate(args: argparse.Namespace) -> None:
     cfg = load_config(args)
     try:
         validate_config(cfg)
     except EngineError as exc:
         fail(str(exc))
+    for warning in budget_cap_warnings(cfg):
+        print(warning, file=sys.stderr)
     print(f"OK schema_version={schema_version(cfg)}")
 
 

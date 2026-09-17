@@ -39,6 +39,18 @@ cp "$FIX/legacy-v1.yaml" "$TMP/invalid-trust-profile.yaml"
 printf '\nworker_trust_profile: omnipotent-worker\n' >> "$TMP/invalid-trust-profile.yaml"
 run_fail "invalid worker trust profile" "$ENGINE" --config "$TMP/invalid-trust-profile.yaml" validate-config
 
+cp "$FIX/legacy-v1.yaml" "$TMP/budget-above-caps.yaml"
+printf '\nllm:\n  budgets:\n    max_usd_per_run: 200\n    max_usd_per_ticket: 400\n    max_usd_per_sprint: 4000\n    max_usd_per_code_review_phase: 8\n' >> "$TMP/budget-above-caps.yaml"
+BUDGET_OUT="$("$ENGINE" --config "$TMP/budget-above-caps.yaml" validate-config 2>"$TMP/budget-warnings.txt")"
+eq "budget values above hard caps stay non-fatal" "0" "$?"
+eq "budget cap warnings keep the validation result on stdout" "OK schema_version=1" "$BUDGET_OUT"
+BUDGET_WARNINGS="$(cat "$TMP/budget-warnings.txt")"
+eq "each budget value above its hard cap is reported" "WARNING llm.budgets.max_usd_per_run=200 exceeds the hard cap 10.00; Orka enforces 10.00
+WARNING llm.budgets.max_usd_per_ticket=400 exceeds the hard cap 30.00; Orka enforces 30.00
+WARNING llm.budgets.max_usd_per_sprint=4000 exceeds the hard cap 300.00; Orka enforces 300.00" "$BUDGET_WARNINGS"
+eq "budgets within hard caps produce no warnings" "" \
+  "$("$ENGINE" --config "$FIX/legacy-v1.yaml" validate-config 2>&1 >/dev/null)"
+
 eq "branch role resolves Gecktopia candidate template" "release/2026.08.05" \
   "$("$ENGINE" --config "$FIX/gecktopia-adr-008.yaml" branch-name candidate --var candidate_id=2026.08.05)"
 eq "branch role resolves custom simple topic template" "work/ABC-1-thing" \
