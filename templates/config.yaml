@@ -19,6 +19,14 @@
 # The legacy shell parser supports two shapes only: flat `key: value` scalars, and
 # simple block lists / list-of-maps under a top-level key (see self_check).
 # Do not introduce deeper nesting under a shell-read key.
+#
+# Lists may be block lists (`key:` then `  - item`) or flow lists. Flow lists may
+# use Prettier's formatting: `key: [a, b]`, `key:` with `[a, b]` on the next more
+# indented line, or `[` ... `]` wrapped across lines indented deeper than the key,
+# with trailing commas and comments. Quote items containing `,` `[` `]` or ` #`.
+# Still unsupported (validate-config refuses them with a hint): non-empty flow
+# maps `{a: 1}`, nested flow lists, block scalars `|` / `>`, multi-line quoted or
+# plain values, and text after a closing `]` (quote such a string instead).
 
 # --- Schema version ------------------------------------------------------- both
 # schema_version: 1 is the legacy ticket pipeline. Existing repositories keep

@@ -282,6 +282,62 @@ check "role overrides inherit and replace individual global route fields" 'data 
 "$PIPELINE" route --config "$TMP/routes.yaml" --role security-reviewer > "$TMP/security-route.json"
 check "desktop role override disables an inherited API fallback" 'data["execution"] == "desktop" and data["fallback"] == "none" and data["model"] == "claude-global"' "$TMP/security-route.json"
 
+# Prettier rewraps long flow lists onto the next line or across lines; the route
+# reader must resolve the same allowed_tools as the one-line form (never [] and
+# never a refusal) and agree with the shared engine parser.
+cat > "$TMP/routes-prettier.yaml" <<'YAML'
+worker_trust_profile: isolated-worker
+llm:
+  execution: api
+  provider: anthropic
+  model: claude-global
+  effort: high
+  fallback: desktop
+  budgets:
+    max_output_tokens_per_turn: 32768
+  roles:
+    code-reviewer:
+      provider: openai
+      model: gpt-review
+      effort: low
+      allowed_tools:
+        [read_file, search, git_diff]
+    security-reviewer:
+      execution: desktop
+    implementer:
+      model: gpt-implement
+      allowed_tools: [
+          read_file, # comment inside the list
+          "search",
+          git_diff,
+        ]
+YAML
+"$PIPELINE" route --config "$TMP/routes-prettier.yaml" --role orchestration-code-reviewer > "$TMP/review-route-prettier.json"
+if cmp -s "$TMP/review-route.json" "$TMP/review-route-prettier.json"; then ok "Prettier next-line allowed_tools resolves identically to the one-line form"; else fail_case "Prettier next-line allowed_tools resolves identically to the one-line form"; fi
+"$PIPELINE" route --config "$TMP/routes-prettier.yaml" --role implementer > "$TMP/implement-route-prettier.json"
+check "multi-line allowed_tools with comments and a trailing comma resolves every tool" 'data["allowed_tools"] == ["read_file","search","git_diff"] and data["model"] == "gpt-implement"' "$TMP/implement-route-prettier.json"
+cat > "$TMP/routes-unterminated.yaml" <<'YAML'
+llm:
+  execution: api
+  provider: openai
+  model: test-model
+  roles:
+    implementer:
+      allowed_tools: [read_file,
+        search
+    code-reviewer:
+      effort: low
+YAML
+run_fail "an unterminated allowed_tools list fails the route closed" "$PIPELINE" route --config "$TMP/routes-unterminated.yaml" --role implementer
+cat > "$TMP/fields-prettier.yaml" <<'YAML'
+ticket:
+  kind: jira
+  jira_fields:
+    [key, summary, description, status, priority, components, subtasks, issuelinks]
+YAML
+"$PIPELINE" jira-fields --config "$TMP/fields-prettier.yaml" > "$TMP/fields-prettier.json"
+if cmp -s "$TMP/fields.json" "$TMP/fields-prettier.json"; then ok "Prettier next-line jira_fields resolves identically to the block list"; else fail_case "Prettier next-line jira_fields resolves identically to the block list"; fi
+
 "$PIPELINE" payload --config "$TMP/routes.yaml" --role code-reviewer \
   --role-file "$TMP/role.md" --rules-file "$TMP/AGENTS.md" --repo-map "$TMP/map.txt" \
   --ticket "$TMP/ticket.json" --diff "$TMP/change.diff" --mode code-review \

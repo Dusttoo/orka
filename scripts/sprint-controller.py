@@ -201,26 +201,21 @@ def config_bool_any_depth(path: Path, key: str, default: bool) -> bool:
 
 
 def config_list(path: Path, key: str, default: list[str]) -> list[str]:
+    """Read a top-level list through the shared engine parser.
+
+    Block lists, one-line flow lists, and Prettier-wrapped flow lists therefore
+    resolve identically here and in jira_decomposition, which reads the same
+    keys from the parsed configuration.
+    """
     if not path.exists():
         return default
-    lines = path.read_text(encoding="utf-8").splitlines()
-    start = re.compile(rf"^{re.escape(key)}:\s*(?:#.*)?$")
-    item = re.compile(r"^\s+-\s+(.*?)\s*(?:#.*)?$")
-    in_block = False
-    values: list[str] = []
-    for line in lines:
-        if start.match(line):
-            in_block = True
-            continue
-        if not in_block:
-            continue
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        match = item.match(line)
-        if match:
-            values.append(unquote(match.group(1)))
-            continue
-        break
+    try:
+        value = load_yaml(path).get(key)
+    except AgentError as exc:
+        raise SprintError(str(exc)) from exc
+    if not isinstance(value, list):
+        return default
+    values = [str(item) for item in value if item is not None and str(item) != ""]
     return values or default
 
 

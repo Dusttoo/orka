@@ -9,6 +9,7 @@ selection, and sanitization before untrusted ticket data reaches an LLM.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import re
 import subprocess
@@ -478,6 +479,47 @@ def _strip_yaml_comment(line: str) -> str:
     return line
 
 
+_CONFIG_ENGINE: Any = None
+
+
+def _config_engine() -> Any:
+    """Load the shared dependency-free config parser from orchestration-engine.py."""
+    global _CONFIG_ENGINE
+    if _CONFIG_ENGINE is None:
+        engine = Path(__file__).with_name("orchestration-engine.py")
+        spec = importlib.util.spec_from_file_location("orka_context_config_parser", engine)
+        if spec is None or spec.loader is None:
+            raise ContextError("could not load orchestration configuration parser")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _CONFIG_ENGINE = module
+    return _CONFIG_ENGINE
+
+
+def _config_lines(path: Path) -> list[str]:
+    """Comment-free logical config lines with multi-line flow lists folded.
+
+    Folding lets these indentation readers see a Prettier-wrapped list such as
+    `allowed_tools:` followed by an indented `[read_file, search]` exactly as the
+    one-line `allowed_tools: [read_file, search]`, matching the engine parser.
+    """
+    engine = _config_engine()
+    try:
+        lines = engine.config_text_lines(path.read_text(encoding="utf-8"))
+    except engine.EngineError as exc:
+        raise ContextError(f"invalid config syntax in {path}: {exc}") from exc
+    return [text for _lineno, text in lines]
+
+
+def _flow_list(value: str, label: str) -> list[str]:
+    engine = _config_engine()
+    try:
+        items = engine.parse_flow_sequence(value)
+    except engine.EngineError as exc:
+        raise ContextError(f"{label} is not a valid YAML flow list: {exc}") from exc
+    return ["" if item is None else str(item) for item in items]
+
+
 def _flat_config_scalar(lines: list[str], key: str) -> str | None:
     pattern = re.compile(rf"^{re.escape(key)}\s*:\s*(.*?)\s*$")
     for raw in lines:
@@ -495,8 +537,7 @@ def max_output_tokens_from_config(path: Path) -> int:
         return DEFAULT_PAYLOAD_MAX_TOKENS
     llm_indent: int | None = None
     budgets_indent: int | None = None
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        clean = _strip_yaml_comment(raw).rstrip()
+    for clean in _config_lines(path):
         if not clean.strip():
             continue
         indent = len(clean) - len(clean.lstrip(" "))
@@ -540,7 +581,7 @@ def _route_value(field: str, value: str) -> Any:
         return []
     if not (value.startswith("[") and value.endswith("]")):
         raise ContextError("llm role allowed_tools must be an inline YAML list")
-    tools = [_unquote(item).strip() for item in value[1:-1].split(",") if item.strip()]
+    tools = [item.strip() for item in _flow_list(value, "llm role allowed_tools")]
     for tool in tools:
         if not re.fullmatch(r"[a-z][a-z0-9_]*", tool):
             raise ContextError(f"invalid LLM tool name: {tool!r}")
@@ -587,7 +628,7 @@ def llm_route_from_config(path: Path, requested_role: str) -> dict[str, Any]:
     role = _canonical_role(requested_role)
     if not path.is_file():
         return _validate_route({}, role)
-    lines = path.read_text(encoding="utf-8").splitlines()
+    lines = _config_lines(path)
     global_route: dict[str, Any] = {
         "execution": _flat_config_scalar(lines, "llm_execution") or "desktop",
         "provider": _flat_config_scalar(lines, "llm_provider") or "anthropic",
@@ -602,8 +643,7 @@ def llm_route_from_config(path: Path, requested_role: str) -> dict[str, Any]:
     current_role: str | None = None
     current_role_indent: int | None = None
     ignored_indent: int | None = None
-    for raw in lines:
-        clean = _strip_yaml_comment(raw).rstrip()
+    for clean in lines:
         if not clean.strip():
             continue
         indent = len(clean) - len(clean.lstrip(" "))
@@ -681,12 +721,11 @@ def jira_fields_from_config(path: Path) -> list[str]:
     """Read ticket.jira_fields without requiring a YAML runtime dependency."""
     if not path.is_file():
         return list(DEFAULT_JIRA_FIELDS)
-    lines = path.read_text(encoding="utf-8").splitlines()
+    lines = _config_lines(path)
     ticket_indent: int | None = None
     field_indent: int | None = None
     values: list[str] = []
-    for raw in lines:
-        clean = raw.split("#", 1)[0].rstrip()
+    for clean in lines:
         if not clean.strip():
             continue
         indent = len(clean) - len(clean.lstrip(" "))
@@ -706,7 +745,7 @@ def jira_fields_from_config(path: Path) -> list[str]:
             if inline:
                 if not (inline.startswith("[") and inline.endswith("]")):
                     raise ContextError("ticket.jira_fields must be a YAML list")
-                values = [_unquote(item) for item in inline[1:-1].split(",") if item.strip()]
+                values = _flow_list(inline, "ticket.jira_fields")
                 break
             continue
         if indent <= field_indent:

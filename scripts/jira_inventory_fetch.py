@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -600,20 +601,27 @@ def ticket_project_from_config(path: Path) -> str:
 
 
 def list_config(path: Path, key: str, default: list[str]) -> list[str]:
+    """Read a top-level list through the shared engine parser.
+
+    Block lists, one-line flow lists, and Prettier-wrapped flow lists resolve
+    identically; a malformed list fails closed instead of silently defaulting.
+    """
     if not path.is_file():
         return list(default)
-    lines = path.read_text(encoding="utf-8").splitlines()
-    values: list[str] = []
-    active = False
-    for raw in lines:
-        if raw.startswith(f"{key}:"):
-            active = True
-            continue
-        if active and raw and not raw[0].isspace():
-            break
-        match = re.fullmatch(r"\s+-\s+([^#]+?)(?:\s+#.*)?", raw)
-        if active and match:
-            values.append(match.group(1).strip().strip("\"'"))
+    engine_path = Path(__file__).with_name("orchestration-engine.py")
+    spec = importlib.util.spec_from_file_location("orka_inventory_config_parser", engine_path)
+    if spec is None or spec.loader is None:
+        raise ValueError("could not load orchestration configuration parser")
+    engine = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(engine)
+    try:
+        parsed = engine.load_simple_yaml(path)
+    except engine.EngineError as exc:
+        raise ValueError(f"invalid config syntax in {path}: {exc}") from exc
+    value = parsed.get(key) if isinstance(parsed, dict) else None
+    if not isinstance(value, list):
+        return list(default)
+    values = [str(item).strip() for item in value if item is not None and str(item).strip()]
     return values or list(default)
 
 
