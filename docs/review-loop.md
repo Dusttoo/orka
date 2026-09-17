@@ -107,7 +107,9 @@ the commit addresses an open finding.
 Every configured `gates:` entry the ledger owns (`code-review`,
 `security-review`) is required for each generation, whether or not a permit was
 issued for it. A missing or empty `gates:` key fails closed to both, matching
-`templates/config.yaml`. Issued permits, rebinds, and a pending repair can only
+`templates/config.yaml`. `code-review` is always required, even when a
+`gates:` list omits it; only `security-review` is optional. Issued permits,
+rebinds, and a pending repair can only
 add to that set, and `complete-repair-review` recomputes it, so a ledger that
 stored a shorter set is corrected on read.
 

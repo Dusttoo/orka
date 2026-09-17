@@ -699,6 +699,16 @@ eq "a code-only gate configuration requires only code review" "code-review" \
 eq "a code-only gate configuration clears after code review" "gates-clear" \
   "$(record_pass configured-code-only code | field next_action)"
 
+write_config $'gates:\n  - security-review\n'
+led open code-gate-omitted >/dev/null
+eq "a gate list that omits code review still requires it" "code-review,security-review" \
+  "$(led status code-gate-omitted | field required_gates)"
+
+write_config $'gates:\n  - visual-qa\n'
+led open non-ledger-gates-only >/dev/null
+eq "a gate list with only non-ledger gates still requires code review" "code-review" \
+  "$(led status non-ledger-gates-only | field required_gates)"
+
 write_config "$BOTH_GATES"
 led open security-decision-missing >/dev/null
 missing_decision="$(record_pass security-decision-missing code)"

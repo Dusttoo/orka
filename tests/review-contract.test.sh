@@ -119,6 +119,8 @@ for file in skills/gate-pr/SKILL.md commands/gate.md; do
   require_text "$file" "configured \`gates:\`" \
     "configured gates are required regardless of issued permits"
 done
+require_text skills/orchestrate-ticket/SKILL.md "record-security-gate" \
+  "the Codex ticket pipeline binds its security-gate decision"
 require_text docs/review-loop.md "correct-repair-head" \
   "abbreviated legacy repair heads have a documented recovery"
 

@@ -143,7 +143,9 @@ def configured_review_gates() -> set[str]:
 
     A missing or empty key fails closed to the template's gate set rather than
     to whichever permits happened to be issued. Gates the ledger does not own
-    (for example visual QA) are left to their own stages.
+    (for example visual QA) are left to their own stages. Code review is the
+    mandatory independent verdict, so a list that omits it (a typo, or only
+    non-ledger gates) cannot remove it; only security review is optional.
     """
     try:
         cfg = canonical_config_path(project_root())
@@ -152,7 +154,9 @@ def configured_review_gates() -> set[str]:
         raise LedgerError(str(exc)) from exc
     except OSError as exc:
         raise LedgerError(f"cannot read configured review gates: {exc}") from exc
-    return set(configured or DEFAULT_REVIEW_GATES) & set(ROLE_GATES.values())
+    return (set(configured or DEFAULT_REVIEW_GATES) & set(ROLE_GATES.values())) | {
+        "code-review"
+    }
 
 
 def resolve_commit(value: str) -> str:
@@ -1409,7 +1413,7 @@ def cmd_record(args: argparse.Namespace) -> None:
 def _repair_head_matches(stored: str, head: str) -> bool:
     """Match a full review head against a repair attempt's stored head.
 
-    Before 1.6.3, record-repair stored the report head verbatim, so a ledger may
+    Before 1.7.0, record-repair stored the report head verbatim, so a ledger may
     hold an abbreviation. Accept its full expansion only when the abbreviation
     is a prefix of that head and git resolves it unambiguously to the same commit.
     """
