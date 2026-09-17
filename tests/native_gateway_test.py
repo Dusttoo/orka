@@ -557,5 +557,326 @@ urllib.request.urlopen(request, timeout=3).read()
                 model="test", role="code-reviewer", logical_review_id="round-1")
 
 
+
+class GatewayReservationReconciliationTests(unittest.TestCase):
+    """Evidence-bound release of gateway reservations that have no API run state."""
+
+    TIMEOUT = "provider submission outcome is unknown: The read operation timed out"
+    EVIDENCE = "Anthropic Console logs searched 2026-09-12 22:30-22:50 UTC; no request found."
+
+    def setUp(self):
+        import api_agent
+        import uuid
+        self.api_agent = api_agent
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        subprocess.run(["git", "-C", str(self.root), "-c", "user.name=Test", "-c",
+                        "user.email=test@example.com", "commit", "--allow-empty", "-qm", "initial"],
+                       check=True)
+        (self.root / ".orchestration").mkdir()
+        (self.root / ".orchestration" / "config.yaml").write_text(
+            "sprint_checkpoint_dir: .orchestration/.sprint-state\n")
+        self.controller = api_agent.load_sprint_controller()
+        self.state_dir = self.root / ".orchestration" / ".sprint-state"
+        self.checkpoint = self.controller.state_path(self.state_dir, "65")
+        self.config = {"llm": {"pricing": {"test": dict(input_per_mtok=1, cache_write_per_mtok=1,
+            cache_read_per_mtok=1, output_per_mtok=1)}}}
+        self.invocation = uuid.uuid4().hex
+        self.reservation = self.gateway_timeout("BL-1760", self.invocation)
+        self.tickets = {}
+        self.launch("BL-1760", self.invocation)
+
+    def gateway_timeout(self, ticket, invocation):
+        transport = Transport()
+        transport.fail = True
+        gateway = NativeGateway(self.root, self.config, ticket, "65", invocation, transport)
+        with self.assertRaises(ProviderAmbiguous):
+            gateway.request("/v1/messages", {"model": "test", "messages": [], "max_tokens": 100})
+        return next(item["reservation_id"] for item in gateway.ledger.summary()["open_reservations"]
+                    if item["run_id"] == invocation)
+
+    def dead_pid(self):
+        process = subprocess.Popen([sys.executable, "-c", "pass"])
+        process.wait()
+        return process.pid
+
+    def launch(self, ticket, invocation, *, pid=None, start_identity="linux:boot:1",
+               containment="test-supervisor", tombstone=True, **terminal):
+        tombstone_path = self.state_dir / f"execution-{invocation}.terminal.json"
+        identity = dict(kind="execution_unit", invocation_id=invocation, containment=containment,
+                        unit_name="", tombstone_path=str(tombstone_path),
+                        pid=pid or self.dead_pid(), start_identity=start_identity)
+        lane = self.tickets.setdefault(ticket, dict(
+            key=ticket, state="pending", raw_status="In Progress", reason="requeued", attempts=0,
+            history=[], dependencies=[], branch="", pr="", run_ref="", summary="test",
+            attempt_token="", worker_identity=""))
+        lane["attempts"] += 1
+        lane["history"].extend([
+            {"at": "2026-09-12T22:34:49+00:00", "event": "worker-launched", "worker_identity": identity},
+            {"at": "2026-09-12T22:38:37+00:00", "event": "supervisor-stopped",
+             "state": "recoverable", "reason": self.TIMEOUT},
+            {"at": "2026-09-12T22:41:30+00:00", "event": "requeued", "reason": "verified stopped"},
+        ])
+        self.controller.save(self.checkpoint, dict(schema_version=2, sprint={"id": "65"},
+                                                   dependency_status={}, tickets=self.tickets))
+        if tombstone:
+            record = dict(invocation_id=invocation, phase="terminal", spawned=True, returncode=143,
+                          stop_reason=self.TIMEOUT, startup_retryable=False,
+                          finished_at=self.controller.now(),
+                          cooperative_cleanup=dict(worker_pgid=identity["pid"], gateway_closed=True))
+            record.update(terminal)
+            self.controller.write_json(tombstone_path, record)
+        return identity
+
+    def manifest(self, entries=None, evidence=None, **overrides):
+        plan = self.api_agent.reservation_migration_plan(self.root)
+        chosen = entries if entries is not None else plan["entries"]
+        for entry in chosen:
+            entry["evidence"] = self.EVIDENCE if evidence is None else evidence
+            entry.update(overrides)
+        plan["entries"] = chosen
+        path = self.root / ".orchestration" / "reservation-migration.json"
+        path.write_text(json.dumps(plan), encoding="utf-8")
+        return path
+
+    def reconcile(self, path, apply=False):
+        args = argparse.Namespace(manifest=str(path), apply=apply)
+        return self.api_agent.reconcile_reservation_manifest(args, self.root)
+
+    def open_ids(self):
+        return {item["reservation_id"] for item in UsageLedger(self.root).summary()["open_reservations"]}
+
+    def audit_path(self, invocation=None):
+        return (self.root / ".orchestration" / ".llm-usage" / "gateway-reconciliations"
+                / f"{invocation or self.invocation}.json")
+
+    def test_gateway_reservations_carry_an_origin_marker(self):
+        reservation = next(event for event in UsageLedger(self.root).snapshot()
+                           if event.get("reservation_id") == self.reservation)
+        self.assertEqual(reservation["origin"], "native-gateway")
+        self.assertEqual(reservation["run_id"], self.invocation)
+
+    def test_gateway_timeout_reservation_is_released_with_audit_evidence(self):
+        plan = self.api_agent.reservation_migration_plan(self.root)
+        self.assertEqual([(e["run_id"], e["reservation_id"], e["source"]) for e in plan["entries"]],
+                         [(self.invocation, self.reservation, "native-gateway")])
+        self.assertEqual(plan["excluded"], [])
+        with self.assertRaisesRegex(AgentError, "run state not found"):
+            self.api_agent.reconcile_run(argparse.Namespace(
+                run_id=self.invocation, outcome="not-found", evidence=self.EVIDENCE), self.root)
+
+        path = self.manifest()
+        validated = self.reconcile(path)
+        self.assertEqual(validated["validated_runs"], [self.invocation])
+        self.assertEqual(validated["applied_runs"], [])
+        self.assertIn(self.reservation, self.open_ids())
+        self.assertFalse(self.audit_path().exists())
+
+        applied = self.reconcile(path, apply=True)
+        self.assertEqual(applied["applied_runs"], [self.invocation])
+        self.assertNotIn(self.reservation, self.open_ids())
+        self.assertFalse((self.root / ".orchestration" / ".llm-runs" / f"{self.invocation}.json").exists())
+        audit = json.loads(self.audit_path().read_text(encoding="utf-8"))
+        self.assertEqual(audit["run_id"], self.invocation)
+        self.assertEqual(audit["source"], "native-gateway")
+        self.assertEqual((audit["ticket"], audit["sprint"]), ("BL-1760", "65"))
+        record = audit["reservations"][self.reservation]
+        self.assertEqual(record["outcome"], "not-found")
+        self.assertEqual(record["evidence"], self.EVIDENCE)
+        self.assertEqual(record["execution"]["unit_status"], "absent")
+        self.assertEqual(record["execution"]["stop_reason"], self.TIMEOUT)
+        self.assertEqual(Path(record["execution"]["tombstone"]),
+                         self.state_dir / f"execution-{self.invocation}.terminal.json")
+        self.assertRegex(record["execution"]["tombstone_sha256"], "^[0-9a-f]{64}$")
+        releases = [e for e in UsageLedger(self.root).snapshot()
+                    if e.get("kind") == "release" and e.get("reservation_id") == self.reservation]
+        self.assertEqual(len(releases), 1)
+        self.assertIn(self.EVIDENCE, releases[0]["reason"])
+
+    def test_reapply_is_idempotent_and_evidence_is_immutable(self):
+        path = self.manifest()
+        self.reconcile(path, apply=True)
+        first = self.audit_path().read_text(encoding="utf-8")
+        (self.state_dir / f"execution-{self.invocation}.terminal.json").unlink()
+        repeated = self.reconcile(path, apply=True)
+        self.assertEqual(repeated["applied_runs"], [self.invocation])
+        self.assertEqual(self.audit_path().read_text(encoding="utf-8"), first)
+        releases = [e for e in UsageLedger(self.root).snapshot()
+                    if e.get("kind") == "release" and e.get("reservation_id") == self.reservation]
+        self.assertEqual(len(releases), 1)
+        changed = json.loads(path.read_text(encoding="utf-8"))
+        changed["entries"][0]["evidence"] = "a different story"
+        path.write_text(json.dumps(changed), encoding="utf-8")
+        with self.assertRaisesRegex(AgentError, "not bound to open reservation"):
+            self.reconcile(path, apply=True)
+
+    def test_legacy_gateway_reservation_without_origin_marker_is_accepted(self):
+        legacy_invocation = "5ee5e53594254d6293847c2e5229d057"
+        ledger = UsageLedger(self.root)
+        legacy = "resv_7bf57feb5ea848168b534faf88e138f0"
+        ledger.append({"kind": "reservation", "logical_review_id": None,
+                       "timestamp": "2026-09-12T22:36:32.265414+00:00", "reservation_id": legacy,
+                       "run_id": legacy_invocation, "role": "implementer", "phase": "implementation",
+                       "ticket": "BL-1726", "sprint": "65", "provider": "anthropic",
+                       "model": "claude-sonnet-5", "projected_cost_usd": "0.7174775"})
+        self.launch("BL-1726", legacy_invocation)
+        plan = self.api_agent.reservation_migration_plan(self.root)
+        self.assertIn((legacy_invocation, legacy, "native-gateway"),
+                      [(e["run_id"], e["reservation_id"], e["source"]) for e in plan["entries"]])
+        self.reconcile(self.manifest(), apply=True)
+        self.assertEqual(self.open_ids(), set())
+
+    def test_live_execution_unit_is_refused(self):
+        identity = self.controller.process_identity(str(os.getpid()))
+        self.tickets.clear()
+        self.launch("BL-1760", self.invocation, pid=identity["pid"],
+                    start_identity=identity["start_identity"])
+        plan = self.api_agent.reservation_migration_plan(self.root)
+        self.assertEqual(plan["entries"], [])
+        self.assertEqual([item["reservation_id"] for item in plan["excluded"]], [self.reservation])
+        self.assertIn("live", plan["excluded"][0]["reason"])
+        entry = dict(run_id=self.invocation, reservation_id=self.reservation, outcome="not-found")
+        with self.assertRaisesRegex(AgentError, "live"):
+            self.reconcile(self.manifest([entry]), apply=True)
+        self.assertIn(self.reservation, self.open_ids())
+        self.assertFalse(self.audit_path().exists())
+
+    def test_live_cooperative_worker_group_is_refused(self):
+        self.tickets.clear()
+        self.launch("BL-1760", self.invocation, containment="cooperative-session",
+                    cooperative_cleanup=dict(worker_pgid=os.getpgid(0), gateway_closed=True))
+        entry = dict(run_id=self.invocation, reservation_id=self.reservation, outcome="not-found")
+        with self.assertRaisesRegex(AgentError, "worker process group"):
+            self.reconcile(self.manifest([entry]), apply=True)
+        self.assertIn(self.reservation, self.open_ids())
+
+    def test_unknown_execution_unit_is_refused(self):
+        self.tickets.clear()
+        self.launch("BL-1760", self.invocation, containment="unrecognized")
+        entry = dict(run_id=self.invocation, reservation_id=self.reservation, outcome="not-found")
+        with self.assertRaisesRegex(AgentError, "containment"):
+            self.reconcile(self.manifest([entry]), apply=True)
+        self.assertIn(self.reservation, self.open_ids())
+
+    def test_missing_or_nonterminal_tombstone_is_refused(self):
+        entry = dict(run_id=self.invocation, reservation_id=self.reservation, outcome="not-found")
+        (self.state_dir / f"execution-{self.invocation}.terminal.json").unlink()
+        with self.assertRaisesRegex(AgentError, "terminal record"):
+            self.reconcile(self.manifest([dict(entry)]), apply=True)
+        self.tickets.clear()
+        self.launch("BL-1760", self.invocation, phase="launched")
+        with self.assertRaisesRegex(AgentError, "terminal record"):
+            self.reconcile(self.manifest([dict(entry)]), apply=True)
+        self.tickets.clear()
+        self.launch("BL-1760", self.invocation, finished_at="2026-01-01T00:00:00+00:00")
+        with self.assertRaisesRegex(AgentError, "before"):
+            self.reconcile(self.manifest([dict(entry)]), apply=True)
+        self.assertIn(self.reservation, self.open_ids())
+
+    def test_mismatched_run_is_refused(self):
+        import uuid
+        other = uuid.uuid4().hex
+        other_reservation = self.gateway_timeout("BL-1724", other)
+        self.launch("BL-1724", other)
+        cases = [
+            dict(run_id=other, reservation_id=self.reservation),
+            dict(run_id=self.invocation, reservation_id=other_reservation),
+        ]
+        for case in cases:
+            with self.subTest(case=case):
+                with self.assertRaisesRegex(AgentError, "not bound to open reservation"):
+                    self.reconcile(self.manifest([dict(case, outcome="not-found")]), apply=True)
+        # A launch record under a different ticket cannot vouch for this reservation.
+        self.tickets.clear()
+        self.launch("BL-1724", self.invocation)
+        with self.assertRaisesRegex(AgentError, "no controller launch record"):
+            self.reconcile(self.manifest([dict(run_id=self.invocation,
+                reservation_id=self.reservation, outcome="not-found")]), apply=True)
+        self.assertEqual(self.open_ids(), {self.reservation, other_reservation})
+
+    def test_manifest_shape_refusals_are_preserved(self):
+        entry = dict(run_id=self.invocation, reservation_id=self.reservation, outcome="not-found")
+        with self.assertRaisesRegex(AgentError, "requires a valid run"):
+            self.reconcile(self.manifest([dict(entry)], outcome="completed"), apply=True)
+        with self.assertRaisesRegex(AgentError, "requires a valid run"):
+            self.reconcile(self.manifest([dict(entry)], evidence="   "), apply=True)
+        with self.assertRaisesRegex(AgentError, "duplicate reservation"):
+            self.reconcile(self.manifest([dict(entry), dict(entry)]), apply=True)
+        outside = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, outside)
+        inside = self.manifest([dict(entry)])
+        (outside / "manifest.json").write_text(inside.read_text(encoding="utf-8"))
+        with self.assertRaisesRegex(AgentError, "inside the repository"):
+            self.reconcile(outside / "manifest.json", apply=True)
+        self.assertIn(self.reservation, self.open_ids())
+
+    def test_non_gateway_or_ambiguous_origins_are_refused(self):
+        ledger = UsageLedger(self.root)
+        import uuid
+        api_like = uuid.uuid4().hex
+        api_reservation = ledger.reserve(projected=Decimal(".01"), limits=dict(self.api_agent.DEFAULT_BUDGETS),
+            run_id=api_like, ticket="BL-1762", sprint="65", provider="anthropic", model="test",
+            role="implementer", origin="api-run")
+        self.launch("BL-1762", api_like)
+        with self.assertRaisesRegex(AgentError, "run state not found"):
+            self.reconcile(self.manifest([dict(run_id=api_like, reservation_id=api_reservation,
+                                               outcome="not-found")]), apply=True)
+        state_path = self.root / ".orchestration" / ".llm-runs" / f"{self.invocation}.json"
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(json.dumps({"run_id": self.invocation, "status": "needs_reconcile",
+                                          "pending_reservation": self.reservation}))
+        with self.assertRaisesRegex(AgentError, "ambiguous"):
+            self.reconcile(self.manifest([dict(run_id=self.invocation, reservation_id=self.reservation,
+                                               outcome="not-found")]), apply=True)
+        excluded = {item["reservation_id"]: item["reason"]
+                    for item in self.api_agent.reservation_migration_plan(self.root)["excluded"]}
+        self.assertIn("ambiguous", excluded[self.reservation])
+        self.assertIn("run state not found", excluded[api_reservation])
+        self.assertEqual(self.open_ids(), {self.reservation, api_reservation})
+
+    def test_cli_plans_and_applies_gateway_manifest(self):
+        script = Path(__file__).resolve().parents[1] / "scripts" / "api_agent.py"
+        planned = subprocess.run([sys.executable, str(script), "reservation-migration-plan",
+                                  "--repo", str(self.root)], capture_output=True, text=True, check=True)
+        plan = json.loads(planned.stdout)
+        self.assertEqual([entry["source"] for entry in plan["entries"]], ["native-gateway"])
+        plan["entries"][0]["evidence"] = self.EVIDENCE
+        path = self.root / ".orchestration" / "reservation-migration.json"
+        path.write_text(json.dumps(plan), encoding="utf-8")
+        command = [sys.executable, str(script), "reconcile-reservations", "--repo", str(self.root),
+                   "--manifest", str(path), "--apply"]
+        applied = subprocess.run(command, capture_output=True, text=True)
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.assertEqual(json.loads(applied.stdout)["applied_runs"], [self.invocation])
+        self.assertEqual(self.open_ids(), set())
+        self.assertTrue(self.audit_path().is_file())
+
+    def test_restart_ticket_reservation_check_passes_after_reconciliation(self):
+        cfg = dict(shared_root=self.root, state_dir=self.state_dir, max_lane_relaunches=2,
+                   concurrency_max=1, max_usd_without_progress=5, auto_decompose_large_tickets=False,
+                   pause_usd_per_ticket=20, warn_usd_per_ticket=10, max_model_runs_per_ticket=12,
+                   max_reviewer_runs_per_ticket=6, ready={"ready"}, done={"done"}, blocked={"blocked"})
+        grant = dict(grant_id="grant-1", reason="Bounded continuation after reconciliation",
+                     expires_at=9999999999, allowances=dict(
+                         attempts=6, model_runs=30, review_runs=14, design_rounds=8, code_rounds=7,
+                         security_rounds=7, repair_cycles=8, ticket_usd="70", design_usd="20",
+                         implementation_usd="30", code_review_usd="10", security_review_usd="10",
+                         progress_baseline_usd="0"))
+        args = argparse.Namespace(sprint="65", ticket="BL-1760", operator_capability="")
+        with patch.object(self.controller, "authorized_restart_grant", return_value=grant):
+            self.assertGreater(self.controller.usage_snapshots(cfg)["BL-1760"]["reserved_usd"], 0)
+            with self.assertRaisesRegex(self.controller.SprintError, "outstanding provider reservations"):
+                self.controller.restart_ticket(args, cfg)
+            self.reconcile(self.manifest(), apply=True)
+            self.assertEqual(self.controller.usage_snapshots(cfg)["BL-1760"]["reserved_usd"], 0)
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                self.controller.restart_ticket(args, cfg)
+        self.assertEqual(json.loads(output.getvalue())["grant_id"], "grant-1")
+        ticket = self.controller.load(self.checkpoint)["tickets"]["BL-1760"]
+        self.assertEqual(ticket["restart_grant_id"], "grant-1")
+
+
 if __name__ == "__main__":
     unittest.main()

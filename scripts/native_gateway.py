@@ -100,6 +100,8 @@ def stream_events(response):
 
 
 class NativeGateway:
+    origin = "native-gateway"
+
     def __init__(self, root: Path, config: dict, ticket: str, sprint: str,
                  run_id: str, transport=None):
         from provider_health import ProviderHealth
@@ -210,7 +212,7 @@ class NativeGateway:
             body["thinking"] = {**thinking, "budget_tokens": min(budget, maximum - 1)}
         reservation = self.ledger.reserve(
             projected=pricing.worst_case(count, maximum), limits=self.limits,
-            model=model, **self.context)
+            model=model, origin=self.origin, **self.context)
         try:
             response = self.model_request("anthropic", "/messages",
                 body,

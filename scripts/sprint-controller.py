@@ -3171,6 +3171,7 @@ def prepare_batch(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
                     provider=provider,
                     model=str(jobs[key]["model"]),
                     role="sprint-worker",
+                    origin="provider-batch",
                 )
                 reservations.append((reservation_id, run_id))
                 if provider == "anthropic":
@@ -4337,6 +4338,167 @@ def execution_unit_status(identity: dict[str, Any]) -> str:
     if current.get("start_identity") != identity.get("start_identity"):
         return "absent" if tombstone else "unknown"
     return "live"
+
+
+STOPPED_INVOCATION_IDENTITY_FIELDS = (
+    "kind",
+    "containment",
+    "unit_name",
+    "tombstone_path",
+    "pid",
+    "start_identity",
+    "cgroup",
+)
+
+
+def stopped_invocation_evidence(
+    shared_root: Path,
+    *,
+    ticket: str,
+    sprint: str,
+    invocation_id: str,
+    reserved_at: str,
+) -> dict[str, Any]:
+    """Prove a controller-launched invocation is terminal and no longer running.
+
+    Native gateways run inside the supervisor and write ledger reservations under
+    the invocation id without an API run marker. Only the controller checkpoint,
+    its terminal record, and a live identity check can show that no gateway
+    remains to settle such a reservation.
+    """
+    if not re.fullmatch(r"[a-f0-9]{32}", invocation_id):
+        raise SprintError("reservation run id is not a controller invocation id")
+    if not sprint:
+        raise SprintError("gateway reservation has no sprint binding")
+    key = normalize_key(ticket)
+    shared_root = Path(shared_root).resolve()
+    try:
+        config = canonical_config_path(shared_root)
+    except RuntimeStateError as exc:
+        raise SprintError(str(exc)) from exc
+    configured = Path(
+        config_scalar(config, "sprint_checkpoint_dir", ".orchestration/.sprint-state")
+    )
+    if configured.is_absolute():
+        raise SprintError("sprint checkpoint directory must be repository-relative")
+    state_dir = (shared_root / configured).resolve()
+    if state_dir != shared_root and shared_root not in state_dir.parents:
+        raise SprintError("sprint checkpoint directory escapes the repository")
+    checkpoint = state_path(state_dir, str(sprint))
+    lane = load(checkpoint).get("tickets", {}).get(key)
+    if not isinstance(lane, dict):
+        raise SprintError(f"no controller launch record binds {invocation_id} to {key}")
+    evidence = lane.get("launch_evidence")
+    candidates = [
+        evidence.get("identity") if isinstance(evidence, dict) else None,
+        lane.get("worker_identity"),
+        *(item.get("worker_identity") for item in lane.get("history", [])),
+    ]
+    identities = [
+        item
+        for item in candidates
+        if isinstance(item, dict) and item.get("invocation_id") == invocation_id
+    ]
+    if not identities:
+        raise SprintError(
+            f"no controller launch record binds invocation {invocation_id} to {key}"
+        )
+    identity = identities[0]
+    if any(
+        other.get(field) != identity.get(field)
+        for other in identities[1:]
+        for field in STOPPED_INVOCATION_IDENTITY_FIELDS
+    ):
+        raise SprintError(
+            f"controller launch records for invocation {invocation_id} are ambiguous"
+        )
+    tombstone_path = state_dir / f"execution-{invocation_id}.terminal.json"
+    if (
+        identity.get("kind") != "execution_unit"
+        or Path(str(identity.get("tombstone_path") or "")).resolve()
+        != tombstone_path.resolve()
+    ):
+        raise SprintError(
+            f"controller identity for invocation {invocation_id} is not a supervised execution unit"
+        )
+    try:
+        raw = tombstone_path.read_bytes()
+        tombstone = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SprintError(
+            f"controller execution terminal record for {invocation_id} is missing or unreadable"
+        ) from exc
+    if (
+        not isinstance(tombstone, dict)
+        or tombstone.get("phase") != "terminal"
+        or tombstone.get("invocation_id") != invocation_id
+        or tombstone.get("spawned") is not True
+    ):
+        raise SprintError(
+            f"controller execution terminal record for {invocation_id} does not show an exited unit"
+        )
+    try:
+        finished = datetime.fromisoformat(str(tombstone.get("finished_at")))
+        reserved = datetime.fromisoformat(str(reserved_at))
+    except ValueError as exc:
+        raise SprintError(
+            f"terminal record or reservation for {invocation_id} lacks a valid timestamp"
+        ) from exc
+    if finished.tzinfo is None or reserved.tzinfo is None or finished < reserved:
+        raise SprintError(
+            f"execution unit {invocation_id} finished before the reservation was recorded"
+        )
+    containment = identity.get("containment")
+    if containment not in {
+        "cgroup-v2-systemd-scope",
+        "cooperative-session",
+        "test-supervisor",
+    }:
+        raise SprintError(
+            f"execution unit {invocation_id} has unsupported containment {containment!r}"
+        )
+    status = execution_unit_status(identity)
+    if status != "absent":
+        raise SprintError(
+            f"execution unit for invocation {invocation_id} is {status}; "
+            "its gateway may still settle the reservation"
+        )
+    if containment == "cooperative-session":
+        cleanup = tombstone.get("cooperative_cleanup") or {}
+        pgid = cleanup.get("worker_pgid")
+        if (
+            cleanup.get("gateway_closed") is not True
+            or not isinstance(pgid, int)
+            or isinstance(pgid, bool)
+            or pgid <= 1
+        ):
+            raise SprintError(
+                f"cooperative execution unit {invocation_id} lacks a gateway cleanup receipt"
+            )
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            pass
+        except OSError as exc:
+            raise SprintError(
+                f"worker process group for {invocation_id} cannot be verified: {exc}"
+            ) from exc
+        else:
+            raise SprintError(
+                f"worker process group for invocation {invocation_id} is still alive"
+            )
+    return {
+        "checkpoint": str(checkpoint),
+        "ticket": key,
+        "sprint": str(sprint),
+        "containment": containment,
+        "unit_status": status,
+        "tombstone": str(tombstone_path),
+        "tombstone_sha256": hashlib.sha256(raw).hexdigest(),
+        "stop_reason": str(tombstone.get("stop_reason") or ""),
+        "returncode": tombstone.get("returncode"),
+        "finished_at": str(tombstone.get("finished_at")),
+    }
 
 
 def launch_local(args: argparse.Namespace, cfg: dict[str, Any]) -> None:

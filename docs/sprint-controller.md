@@ -618,7 +618,9 @@ sudo /usr/local/libexec/orchestration-recovery-authority issue-restart \
 
 The checkpoint must already contain the ticket. Restart refuses running,
 completed, or decomposed tickets, unknown execution identities, and outstanding
-provider reservations. Reconcile those first. An existing PR routes to repair;
+provider reservations. Reconcile those first; reservations left by a native
+gateway timeout use the evidence manifest described in
+[API agent runner](api-agent.md#gateway-reservations). An existing PR routes to repair;
 its branch, execution fence, findings, failed reviews, and historical counters
 remain intact. A preserved scoping/product decision remains an operator decision.
 The grant does not authorize a merge, change Jira readiness, satisfy dependencies,

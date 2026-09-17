@@ -272,6 +272,47 @@ The manifest is repository-bound, limited to 100 unique reservations, and each
 entry must match both the run marker and the open ledger reservation. Application
 is idempotent and copies the exact evidence into the run's durable audit record.
 
+Each plan entry names its `source`. Open reservations that neither path below can
+accept are listed under `excluded` with the refusal reason instead of as entries,
+so the plan and the reconciler always agree. The plan is a snapshot: application
+re-validates every entry.
+
+#### Gateway reservations
+
+Workers launched with `sprint-controller.py launch-local -- .../claude` or
+`.../codex exec` meter through the controller-owned loopback gateway. Its
+reservations use the controller invocation id as `run_id` and never have a
+`.llm-runs` marker, so `reconcile --run-id` cannot close them. New gateway
+reservations carry `origin: native-gateway` or `origin: codex-gateway`; API
+runner reservations carry `origin: api-run`. Reservations written before the
+marker existed are treated as gateway reservations only when they have no run
+marker, role `implementer`, no logical review id, and an `anthropic` or `openai`
+provider. Anything else without a run marker is refused as `run state not found`,
+and a gateway-origin reservation that also has a run marker is refused as ambiguous.
+
+The bulk manifest accepts a gateway entry as `source: native-gateway` only when
+all of the following hold at validation time:
+
+- The reservation is still open with that exact `run_id`, and its ticket and
+  sprint select a controller checkpoint in `sprint_checkpoint_dir` whose ticket
+  launch history records that invocation as a supervised execution unit.
+- `execution-<run_id>.terminal.json` exists in that directory, is `phase:
+  terminal`, belongs to the invocation, shows a spawned worker, and finished no
+  earlier than the reservation.
+- The controller's own liveness check reports the unit `absent`. Live and unknown
+  units are refused. A cooperative-session unit also needs a closed-gateway cleanup
+  receipt and a worker process group that no longer exists.
+- The outcome is `not-found` with nonempty evidence. A completed gateway request
+  has no settlement path yet and stays reserved.
+
+Before releasing, Orka writes
+`.orchestration/.llm-usage/gateway-reconciliations/<run_id>.json` with the
+evidence, the reservation's cost envelope, and the execution proof (checkpoint,
+terminal record path and SHA-256, containment, stop reason). The ledger release
+repeats the evidence. Re-applying the same manifest is a no-op, and different
+evidence for an already released reservation is refused. Once released,
+`sprint-controller.py restart-ticket` no longer sees the ticket's `reserved_usd`.
+
 ### Logical review retries
 
 API reviewers derive their logical review identity from the consumed permit's

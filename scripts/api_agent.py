@@ -822,6 +822,7 @@ class UsageLedger:
         model: str,
         role: str | None = None,
         logical_review_id: str | None = None,
+        origin: str | None = None,
     ) -> str:
         self.directory.mkdir(parents=True, exist_ok=True)
         with self.lock_path.open("a+", encoding="utf-8") as lock:
@@ -1113,6 +1114,8 @@ class UsageLedger:
                 "model": model,
                 "projected_cost_usd": str(projected),
             }
+            if origin:
+                event["origin"] = origin
             self._append_locked(event)
             return reservation_id
 
@@ -2140,6 +2143,7 @@ class ApiAgent:
                     provider=self.provider,
                     model=self.model,
                     role=self.role,
+                    origin="api-run",
                 )
         except AttemptCapabilityError as exc:
             raise AgentError(str(exc)) from exc
@@ -3087,29 +3091,210 @@ def reconcile_run(args: argparse.Namespace, root: Path) -> dict[str, Any]:
     }
 
 
+GATEWAY_RESERVATION_ORIGINS = {"native-gateway", "codex-gateway"}
+LEGACY_GATEWAY_PROVIDERS = {"anthropic", "openai"}
+SPRINT_CONTROLLER_MODULE = "orka_sprint_controller"
+
+
+def load_sprint_controller() -> Any:
+    """Load the controller's own launch and liveness checks without a copy.
+
+    The controller imports this module, so it is loaded lazily and bound to the
+    already-imported runner rather than a second instance with distinct errors.
+    """
+    loaded = sys.modules.get(SPRINT_CONTROLLER_MODULE)
+    if loaded is not None:
+        return loaded
+    sys.modules.setdefault("api_agent", sys.modules[__name__])
+    spec = importlib.util.spec_from_file_location(
+        SPRINT_CONTROLLER_MODULE, Path(__file__).resolve().with_name("sprint-controller.py")
+    )
+    if spec is None or spec.loader is None:
+        raise AgentError("sprint controller is unavailable for gateway reconciliation")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[SPRINT_CONTROLLER_MODULE] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(SPRINT_CONTROLLER_MODULE, None)
+        raise
+    return module
+
+
+def gateway_audit_path(root: Path, run_id: str) -> Path:
+    return (
+        runtime_path(root, ".orchestration/.llm-usage/gateway-reconciliations")
+        / f"{run_id}.json"
+    )
+
+
+def reservation_binding(
+    root: Path,
+    run_id: str,
+    reservation_id: str,
+    open_items: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Classify one open reservation by the only evidence that can release it.
+
+    The migration plan and the manifest reconciler share this function so the
+    plan never offers an entry the reconciler would refuse without saying why.
+    """
+    reservation = open_items.get(reservation_id)
+    state_path = runtime_path(root, ".orchestration/.llm-runs") / f"{run_id}.json"
+    if state_path.is_file():
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        if (
+            state.get("status") != "needs_reconcile"
+            or state.get("pending_reservation") != reservation_id
+            or (reservation or {}).get("run_id") != run_id
+        ):
+            raise AgentError(
+                f"run {run_id} is not bound to open reservation {reservation_id}"
+            )
+        if reservation.get("origin") not in {None, "api-run"}:
+            raise AgentError(
+                f"reservation {reservation_id} is ambiguous: "
+                f"{reservation['origin']} origin with an API run marker"
+            )
+        return {"source": "api-run", "state_path": state_path, "state": state}
+    if not reservation or reservation.get("run_id") != run_id:
+        raise AgentError(
+            f"run {run_id} is not bound to open reservation {reservation_id}"
+        )
+    origin = reservation.get("origin")
+    legacy_gateway_shape = (
+        origin is None
+        and reservation.get("role") == "implementer"
+        and not reservation.get("logical_review_id")
+        and reservation.get("provider") in LEGACY_GATEWAY_PROVIDERS
+    )
+    if origin not in GATEWAY_RESERVATION_ORIGINS and not legacy_gateway_shape:
+        raise AgentError(f"run state not found: {state_path}")
+    controller = load_sprint_controller()
+    try:
+        execution = controller.stopped_invocation_evidence(
+            root,
+            ticket=str(reservation.get("ticket") or ""),
+            sprint=str(reservation.get("sprint") or ""),
+            invocation_id=run_id,
+            reserved_at=str(reservation.get("timestamp") or ""),
+        )
+    except (controller.SprintError, RuntimeStateError) as exc:
+        raise AgentError(
+            f"gateway reservation {reservation_id} cannot be reconciled: {exc}"
+        ) from exc
+    return {
+        "source": "native-gateway",
+        "origin": origin or "legacy-gateway",
+        "reservation": reservation,
+        "execution": execution,
+    }
+
+
 def reservation_migration_plan(root: Path) -> dict[str, Any]:
     """Produce a bounded manifest template without releasing uncertain work."""
     ledger = UsageLedger(root)
-    open_items = sorted(
-        ledger.summary()["open_reservations"],
+    open_items = {
+        str(item.get("reservation_id") or ""): item
+        for item in ledger.summary()["open_reservations"]
+    }
+    entries: list[dict[str, Any]] = []
+    excluded: list[dict[str, Any]] = []
+    for item in sorted(
+        open_items.values(),
         key=lambda item: (
             str(item.get("run_id") or ""),
             str(item.get("reservation_id") or ""),
         ),
-    )
-    return {
-        "schema_version": 1,
-        "repository": str(root.resolve()),
-        "entries": [
+    ):
+        run_id = str(item.get("run_id") or "")
+        reservation_id = str(item.get("reservation_id") or "")
+        try:
+            if not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", run_id):
+                raise AgentError("reservation has no valid run id")
+            binding = reservation_binding(root, run_id, reservation_id, open_items)
+        except (AgentError, OSError, json.JSONDecodeError) as exc:
+            excluded.append(
+                {"run_id": run_id, "reservation_id": reservation_id, "reason": str(exc)}
+            )
+            continue
+        entries.append(
             {
-                "run_id": str(item.get("run_id") or ""),
-                "reservation_id": str(item.get("reservation_id") or ""),
+                "run_id": run_id,
+                "reservation_id": reservation_id,
+                "source": binding["source"],
                 "outcome": "not-found",
                 "evidence": "",
             }
-            for item in open_items
-        ],
+        )
+    return {
+        "schema_version": 1,
+        "repository": str(root.resolve()),
+        "entries": entries,
+        "excluded": excluded,
     }
+
+
+def gateway_reconciled(
+    root: Path,
+    run_id: str,
+    reservation_id: str,
+    evidence: str,
+    open_items: dict[str, dict[str, Any]],
+    events: list[dict[str, Any]],
+) -> bool:
+    if reservation_id in open_items:
+        return False
+    path = gateway_audit_path(root, run_id)
+    if not path.is_file():
+        return False
+    audit = json.loads(path.read_text(encoding="utf-8"))
+    record = (audit.get("reservations") or {}).get(reservation_id) or {}
+    return (
+        audit.get("run_id") == run_id
+        and record.get("outcome") == "not-found"
+        and record.get("evidence") == evidence
+        and any(
+            event.get("kind") == "release"
+            and event.get("reservation_id") == reservation_id
+            and event.get("run_id") == run_id
+            for event in events
+        )
+    )
+
+
+def record_gateway_reconciliation(
+    root: Path, run_id: str, reservation_id: str, evidence: str, binding: dict[str, Any]
+) -> None:
+    reservation = binding["reservation"]
+    path = gateway_audit_path(root, run_id)
+    audit = (
+        json.loads(path.read_text(encoding="utf-8"))
+        if path.is_file()
+        else {
+            "schema_version": 1,
+            "run_id": run_id,
+            "source": "native-gateway",
+            "ticket": reservation.get("ticket"),
+            "sprint": reservation.get("sprint"),
+            "reservations": {},
+        }
+    )
+    if audit.get("run_id") != run_id:
+        raise AgentError(f"gateway reconciliation audit for {run_id} is inconsistent")
+    audit["reservations"][reservation_id] = {
+        "outcome": "not-found",
+        "evidence": evidence,
+        "origin": binding["origin"],
+        "provider": reservation.get("provider"),
+        "model": reservation.get("model"),
+        "role": reservation.get("role"),
+        "reserved_at": reservation.get("timestamp"),
+        "projected_cost_usd": reservation.get("projected_cost_usd"),
+        "execution": binding["execution"],
+        "reconciled_at": utc_now(),
+    }
+    atomic_json(path, audit)
 
 
 def reconcile_reservation_manifest(
@@ -3135,6 +3320,7 @@ def reconcile_reservation_manifest(
             "reservation reconciliation manifest requires 1 through 100 entries"
         )
     ledger = UsageLedger(root)
+    events = ledger.snapshot()
     open_items = {
         str(item.get("reservation_id") or ""): item
         for item in ledger.summary()["open_reservations"]
@@ -3162,41 +3348,32 @@ def reconcile_reservation_manifest(
             raise AgentError(f"duplicate reservation in manifest: {reservation_id}")
         seen.add(reservation_id)
         state_path = runtime_path(root, ".orchestration/.llm-runs") / f"{run_id}.json"
-        if not state_path.is_file():
-            raise AgentError(f"run state not found: {state_path}")
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-        already_done = (
-            state.get("status") == "reconciled_not_found"
-            and state.get("pending_reservation") is None
-            and state.get("reconciliation_evidence") == evidence
-        )
-        if not already_done and (
-            state.get("status") != "needs_reconcile"
-            or state.get("pending_reservation") != reservation_id
-            or open_items.get(reservation_id, {}).get("run_id") != run_id
+        if state_path.is_file():
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            if (
+                state.get("status") == "reconciled_not_found"
+                and state.get("pending_reservation") is None
+                and state.get("reconciliation_evidence") == evidence
+            ):
+                validated.append((run_id, reservation_id, evidence, None, True))
+                continue
+        elif gateway_reconciled(
+            root, run_id, reservation_id, evidence, open_items, events
         ):
-            raise AgentError(
-                f"run {run_id} is not bound to open reservation {reservation_id}"
-            )
-        validated.append(
-            (run_id, reservation_id, evidence, state_path, state, already_done)
-        )
+            validated.append((run_id, reservation_id, evidence, None, True))
+            continue
+        binding = reservation_binding(root, run_id, reservation_id, open_items)
+        validated.append((run_id, reservation_id, evidence, binding, False))
     applied = []
     if args.apply:
-        for (
-            run_id,
-            reservation_id,
-            evidence,
-            state_path,
-            state,
-            already_done,
-        ) in validated:
-            if not already_done:
+        for run_id, reservation_id, evidence, binding, already_done in validated:
+            if not already_done and binding["source"] == "api-run":
                 ledger.release(
                     reservation_id,
                     run_id,
                     f"provider lookup found no request: {evidence}",
                 )
+                state = binding["state"]
                 state.update(
                     {
                         "status": "reconciled_not_found",
@@ -3206,7 +3383,18 @@ def reconcile_reservation_manifest(
                         "reconciled_at": utc_now(),
                     }
                 )
-                atomic_json(state_path, state)
+                atomic_json(binding["state_path"], state)
+            elif not already_done:
+                # Durable evidence precedes the release; replay after a crash
+                # revalidates the still-open reservation and releases it.
+                record_gateway_reconciliation(
+                    root, run_id, reservation_id, evidence, binding
+                )
+                ledger.release(
+                    reservation_id,
+                    run_id,
+                    f"provider lookup found no request: {evidence}",
+                )
             applied.append(run_id)
     return {
         "status": "completed",
