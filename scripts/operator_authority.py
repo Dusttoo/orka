@@ -98,6 +98,7 @@ def _call(
     except (OSError, subprocess.SubprocessError) as exc:
         raise AuthorityError(f"host operator authority failed: {exc}") from exc
     if result.returncode == 3 and command in {
+        "budget-policy",
         "budget-ceiling",
         "relaunch-ceiling",
         "restart-grant",
@@ -142,6 +143,63 @@ def activate_budget(repository: Path, ticket: str, token: str) -> Decimal:
     if not value.is_finite() or value <= 0:
         raise AuthorityError("host authority returned a non-positive budget ceiling")
     return value
+
+
+POLICY_DOLLAR_KEYS = frozenset(
+    {
+        "max_usd_per_run",
+        "max_usd_per_ticket",
+        "max_usd_per_sprint",
+        "pause_usd_per_ticket",
+        "max_usd_per_design_phase",
+        "max_usd_per_implementation_phase",
+        "max_usd_per_code_review_phase",
+        "max_usd_per_security_review_phase",
+        "max_usd_without_progress",
+    }
+)
+POLICY_COUNT_KEYS = frozenset({"max_model_runs_per_ticket", "max_reviewer_runs_per_ticket"})
+
+
+def budget_policy(repository: Path) -> dict[str, Any] | None:
+    """Return the root-owned standing budget policy for this repository.
+
+    The policy only raises compiled hard caps. Its values are re-validated here
+    so a malformed helper response can never widen a ceiling.
+    """
+    scope = json.dumps(
+        {"kind": "budget-policy", "repository": str(repository.resolve())},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    raw = _call("budget-policy", scope, no_authority_ok=True)
+    if raw is None:
+        return None
+    try:
+        value = json.loads(raw)
+        caps_raw = value["caps"]
+        if not isinstance(caps_raw, dict) or not caps_raw:
+            raise ValueError("empty caps")
+        caps: dict[str, Any] = {}
+        for key, item in caps_raw.items():
+            if key in POLICY_COUNT_KEYS:
+                if not isinstance(item, int) or isinstance(item, bool) or item <= 0:
+                    raise ValueError(key)
+                caps[key] = item
+            elif key in POLICY_DOLLAR_KEYS:
+                amount = Decimal(str(item))
+                if not amount.is_finite() or amount <= 0:
+                    raise ValueError(key)
+                caps[key] = amount
+            else:
+                raise ValueError(key)
+        return {
+            "policy_id": str(value.get("policy_id") or ""),
+            "reason": str(value.get("reason") or ""),
+            "caps": caps,
+        }
+    except (ValueError, KeyError, TypeError, InvalidOperation) as exc:
+        raise AuthorityError("host authority returned an invalid budget policy") from exc
 
 
 def relaunch_ceiling(repository: Path, ticket: str) -> int | None:

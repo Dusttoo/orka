@@ -40,6 +40,7 @@ from attempt_capability import (
 from operator_authority import (
     AuthorityError,
     budget_ceiling as authorized_budget_ceiling,
+    budget_policy as authorized_budget_policy,
     restart_grant as authorized_restart_grant,
 )
 from review_permit import (
@@ -184,6 +185,8 @@ NON_OVERRIDABLE_MAXIMA = {
 NON_OVERRIDABLE_MAXIMA.update(
     {key: PHASE_HARD_CAPS[phase] for phase, (key, _) in PHASE_BUDGETS.items()}
 )
+# The controller's no-progress breaker; a host budget policy may raise it.
+COMPILED_MAX_USD_WITHOUT_PROGRESS = Decimal("10")
 CREDENTIAL_ENV_KEYS = {
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_BASE_URL",
@@ -503,7 +506,70 @@ class Pricing:
         ) / MILLION
 
 
-def budgets_from_config(config: dict[str, Any]) -> dict[str, Any]:
+HOST_POLICY_CACHE_SECONDS = 60
+_HOST_POLICY_CACHE: dict[str, tuple[float, dict[str, Any], dict[str, Any]]] = {}
+
+
+def clear_host_budget_policy_cache() -> None:
+    _HOST_POLICY_CACHE.clear()
+
+
+def _host_budget_policy(root: Path | None) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Resolve the hard caps for a repository and describe where they came from.
+
+    A root-owned standing policy may raise compiled caps; it never lowers them,
+    and repository configuration still chooses values within them. Any failure
+    to read the policy falls back to the compiled caps, which can only reduce
+    spend, and the reason is reported instead of raised.
+    """
+    caps: dict[str, Any] = dict(NON_OVERRIDABLE_MAXIMA)
+    caps["max_usd_without_progress"] = COMPILED_MAX_USD_WITHOUT_PROGRESS
+    if root is None:
+        return caps, {"source": "compiled"}
+    try:
+        shared = shared_repository_root(Path(root)).resolve()
+    except (AgentError, OSError) as exc:
+        return caps, {"source": "compiled", "error": str(exc)}
+    cached = _HOST_POLICY_CACHE.get(str(shared))
+    if cached and cached[0] > time.monotonic():
+        return dict(cached[1]), dict(cached[2])
+    try:
+        policy = authorized_budget_policy(shared)
+    except AuthorityError as exc:
+        policy = None
+        status: dict[str, Any] = {"source": "compiled", "error": str(exc)}
+    else:
+        status = {"source": "compiled"}
+    if policy:
+        for key, value in policy["caps"].items():
+            if key in caps:
+                caps[key] = max(caps[key], value)
+        status = {
+            "source": "host-policy",
+            "policy_id": policy["policy_id"],
+            "reason": policy["reason"],
+            "caps": {key: str(value) for key, value in sorted(policy["caps"].items())},
+        }
+    _HOST_POLICY_CACHE[str(shared)] = (
+        time.monotonic() + HOST_POLICY_CACHE_SECONDS,
+        dict(caps),
+        dict(status),
+    )
+    return caps, status
+
+
+def host_budget_caps(root: Path | None) -> dict[str, Any]:
+    return _host_budget_policy(root)[0]
+
+
+def host_budget_policy_status(root: Path | None) -> dict[str, Any]:
+    return _host_budget_policy(root)[1]
+
+
+def budgets_from_config(
+    config: dict[str, Any], root: Path | None = None
+) -> dict[str, Any]:
+    caps = host_budget_caps(root)
     result = dict(DEFAULT_BUDGETS)
     llm = config.get("llm")
     raw = llm.get("budgets") if isinstance(llm, dict) else None
@@ -557,11 +623,13 @@ def budgets_from_config(config: dict[str, Any]) -> dict[str, Any]:
     # only the design, code-review, and security-review phase envelopes above
     # their $5 defaults, and only up to PHASE_HARD_CAPS ($10, the compiled
     # max_usd_per_run). Implementation, per-run, ticket, sprint, pause, and
-    # run-count ceilings can never exceed their compiled values; anything above
-    # a hard cap is clamped (budget_cap_violations reports it). Ticket-specific
-    # host grants are applied separately at admission; editing the worktree
-    # cannot raise shared or per-run ceilings.
-    for key, maximum in NON_OVERRIDABLE_MAXIMA.items():
+    # run-count ceilings can never exceed their hard caps; anything above one
+    # is clamped (budget_cap_violations reports it). Hard caps are compiled
+    # unless a root-owned host budget policy for this repository raises them;
+    # editing the worktree can never raise a hard cap. Ticket-specific host
+    # grants are applied separately at admission.
+    for key in NON_OVERRIDABLE_MAXIMA:
+        maximum = caps[key]
         configured = result[key]
         result[key] = maximum if not configured else min(configured, maximum)
     # Output bounds are derived, never widened: the review turn stays within
@@ -576,10 +644,18 @@ def budgets_from_config(config: dict[str, Any]) -> dict[str, Any]:
     )
     hard = result["max_usd_per_ticket"]
     if "pause_usd_per_ticket" not in raw:
-        result["pause_usd_per_ticket"] = min(Decimal("20"), hard * Decimal("0.75"))
+        # Derived thresholds scale only when the ticket ceiling itself was
+        # raised past its compiled cap; otherwise they match earlier releases.
+        pause_ceiling = (
+            caps["pause_usd_per_ticket"]
+            if hard > NON_OVERRIDABLE_MAXIMA["max_usd_per_ticket"]
+            else NON_OVERRIDABLE_MAXIMA["pause_usd_per_ticket"]
+        )
+        result["pause_usd_per_ticket"] = min(pause_ceiling, hard * Decimal("0.75"))
     if "warn_usd_per_ticket" not in raw:
+        pause = result["pause_usd_per_ticket"]
         result["warn_usd_per_ticket"] = min(
-            Decimal("10"), result["pause_usd_per_ticket"] * Decimal("0.666666")
+            max(Decimal("10"), pause / 2), pause * Decimal("0.666666")
         )
     if result["max_usd_per_run"] <= 0:
         raise AgentError("llm.budgets.max_usd_per_run must be greater than zero")
@@ -592,7 +668,9 @@ def budgets_from_config(config: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def budget_cap_violations(config: dict[str, Any]) -> list[dict[str, str]]:
+def budget_cap_violations(
+    config: dict[str, Any], root: Path | None = None
+) -> list[dict[str, str]]:
     """List configured `llm.budgets` values that Orka silently reduces.
 
     Each item is `{"key", "configured", "effective", "cap"}` with string values,
@@ -616,7 +694,9 @@ def budget_cap_violations(config: dict[str, Any]) -> list[dict[str, str]]:
         except AgentError:
             return None
 
-    for key, cap in NON_OVERRIDABLE_MAXIMA.items():
+    caps = host_budget_caps(root)
+    for key in NON_OVERRIDABLE_MAXIMA:
+        cap = caps[key]
         parse = int_value if isinstance(cap, int) else decimal_value
         value = configured(key, parse)
         if value is not None and value > cap:
@@ -839,9 +919,12 @@ class UsageLedger:
         return totals
 
     @staticmethod
-    def phase_limits(events, ticket, limits):
+    def phase_limits(events, ticket, limits, root=None):
+        # A hand-built limits map cannot bypass the hard cap: clamp again to the
+        # caps for this repository, which only a host budget policy can raise.
+        caps = host_budget_caps(root)
         result = {
-            phase: min(decimal_value(limits.get(key, default), key), PHASE_HARD_CAPS[phase])
+            phase: min(decimal_value(limits.get(key, default), key), caps[key])
             for phase, (key, default) in PHASE_BUDGETS.items()
         }
         transfer = next(
@@ -886,7 +969,7 @@ class UsageLedger:
             if totals["reserved_usd"]:
                 return False  # Uncertain provider work keeps its full reservation.
             maximum = min(
-                self.phase_limits(events, ticket, limits)["design"],
+                self.phase_limits(events, ticket, limits, self.root)["design"],
                 PHASE_BUDGETS["design"][1],
             )
             amount = max(Decimal("0"), maximum - totals["spent_usd"])
@@ -954,7 +1037,7 @@ class UsageLedger:
                 remaining.append(limits[key] - used(field, value))
         phase_limit = phase_used = None
         if ticket:
-            phase_limit = self.phase_limits(events, ticket, limits)[phase]
+            phase_limit = self.phase_limits(events, ticket, limits, self.root)[phase]
             totals = self.phase_totals(events, ticket)[phase]
             phase_used = totals["spent_usd"] + totals["reserved_usd"]
             remaining.append(phase_limit - phase_used)
@@ -1179,7 +1262,7 @@ class UsageLedger:
                 phase = spending_phase(role)
                 phase_key, default_limit = PHASE_BUDGETS[phase]
                 limit = max(
-                    self.phase_limits(events, ticket, limits)[phase],
+                    self.phase_limits(events, ticket, limits, self.root)[phase],
                     Decimal(allowances.get(phase + "_usd", "0")),
                 )
                 totals = self.phase_totals(events, ticket)[phase]
@@ -2111,7 +2194,7 @@ class ApiAgent:
         self.ticket = normalize_ticket_scope(ticket)
         self.sprint = normalize_sprint_scope(sprint)
         self.run_id = run_id
-        self.budgets = budgets_from_config(self.config)
+        self.budgets = budgets_from_config(self.config, self.root)
         from provider_health import ProviderTransport
 
         self.transport = ProviderTransport(

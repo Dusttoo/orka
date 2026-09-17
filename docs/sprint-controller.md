@@ -274,6 +274,42 @@ through the narrow sudo policy installed by
 scope-bound token. If that helper is absent or unsafe, override is disabled;
 there is deliberately no repository, home-directory, or same-UID secret.
 
+## Standing budget policy
+
+Ticket grants below are temporary and per ticket. When a repository routinely
+needs higher ceilings, root can set one standing policy for it instead. The
+policy raises hard caps; `.orchestration/config.yaml` still chooses the values.
+
+```text
+cat > /root/breedledger-budget-policy.json <<'JSON'
+{"max_usd_per_run":"50","max_usd_per_ticket":"400","max_usd_per_sprint":"4000",
+ "pause_usd_per_ticket":"300","max_usd_per_code_review_phase":"25",
+ "max_usd_per_security_review_phase":"25","max_usd_without_progress":"60",
+ "max_model_runs_per_ticket":30,"max_reviewer_runs_per_ticket":12}
+JSON
+sudo /usr/local/libexec/orchestration-recovery-authority set-budget-policy \
+  --repository /absolute/repo --policy /root/breedledger-budget-policy.json \
+  --reason "Breed Ledger sprints run 30 tickets"
+sudo /usr/local/libexec/orchestration-recovery-authority show-budget-policy \
+  --repository /absolute/repo
+sudo /usr/local/libexec/orchestration-recovery-authority clear-budget-policy \
+  --repository /absolute/repo
+```
+
+- **Values:** dollar caps are decimal strings from above 0 through 100000.
+  Run-count caps are integers from 1 through 1000. Unknown keys are refused.
+  Setting a policy replaces the previous one.
+- **Scope:** the policy is bound to the exact resolved repository path. Every
+  worktree of that repository shares it.
+- **Upgrade:** re-run `sudo scripts/install-operator-authority.sh <runtime-user>`
+  after upgrading Orka. The installer adds the read-only `budget-policy` command
+  to the runtime sudo rule and creates the private `policies` directory. Until
+  then `validate-config` warns that the policy is unavailable and the compiled
+  caps apply.
+- **Check:** `orchestration-engine.py validate-config` prints a `NOTE` naming the
+  active policy, and captain preflight reports `budget_policy` and the effective
+  `budget_limits`.
+
 ## Operator continuations
 
 Repository settings can tighten the built-in `$20` ticket pause but cannot

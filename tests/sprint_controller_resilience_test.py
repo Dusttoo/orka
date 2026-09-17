@@ -1615,5 +1615,74 @@ class ResilienceTests(unittest.TestCase):
         self.assertIn("PROJ-1", [item["key"] for item in plan["waiting"]])
 
 
+class HostBudgetPolicySettingsTests(unittest.TestCase):
+    """Controller breakers honor a root-owned policy, never the worktree alone."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.repo = Path(self.temp.name) / "repo"
+        (self.repo / ".orchestration").mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
+        config = (ROOT / "templates/config.yaml").read_text(encoding="utf-8")
+        for old, raised in (
+            ("warn_usd_per_ticket: 1.00", "warn_usd_per_ticket: 100"),
+            ("pause_usd_per_ticket: 1.50", "pause_usd_per_ticket: 250"),
+            ("max_model_runs_per_ticket: 12", "max_model_runs_per_ticket: 40"),
+            ("max_reviewer_runs_per_ticket: 6", "max_reviewer_runs_per_ticket: 20"),
+            ("max_usd_without_progress: 5.00", "max_usd_without_progress: 60"),
+        ):
+            self.assertIn(old, config)
+            config = config.replace(old, raised, 1)
+        (self.repo / ".orchestration/config.yaml").write_text(config, encoding="utf-8")
+        helper = ROOT / "host-tools/orchestration-recovery-authority.py"
+        self.helper = helper
+        env = {
+            "ORCHESTRATION_TEST_MODE": "1",
+            "ORCHESTRATION_TEST_AUTHORITY_HELPER": str(helper),
+            "ORCHESTRATION_AUTHORITY_TEST_MODE": "1",
+            "ORCHESTRATION_AUTHORITY_STATE_DIR": str(Path(self.temp.name) / "authority"),
+        }
+        patcher = patch.dict("os.environ", env)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        import api_agent
+
+        api_agent.clear_host_budget_policy_cache()
+        self.addCleanup(api_agent.clear_host_budget_policy_cache)
+        self.api_agent = api_agent
+
+    def settings(self):
+        with patch.object(controller, "project_root", return_value=self.repo):
+            return controller.settings(argparse.Namespace(config=None, state_dir=None))
+
+    def test_compiled_caps_bound_configured_breakers_without_a_policy(self):
+        cfg = self.settings()
+        self.assertEqual(cfg["pause_usd_per_ticket"], 20)
+        self.assertEqual(cfg["warn_usd_per_ticket"], 10)
+        self.assertEqual(cfg["max_model_runs_per_ticket"], 12)
+        self.assertEqual(cfg["max_reviewer_runs_per_ticket"], 6)
+        self.assertEqual(cfg["max_usd_without_progress"], 10)
+
+    def test_host_policy_raises_configured_breakers_to_its_caps(self):
+        policy = Path(self.temp.name) / "policy.json"
+        policy.write_text(json.dumps({
+            "pause_usd_per_ticket": "300", "max_model_runs_per_ticket": 30,
+            "max_reviewer_runs_per_ticket": 25, "max_usd_without_progress": "50",
+        }))
+        subprocess.run(
+            [str(self.helper), "set-budget-policy", "--repository", str(self.repo),
+             "--policy", str(policy), "--reason", "large sprints"],
+            check=True, capture_output=True, text=True,
+        )
+        self.api_agent.clear_host_budget_policy_cache()
+        cfg = self.settings()
+        self.assertEqual(cfg["pause_usd_per_ticket"], 250)
+        self.assertEqual(cfg["warn_usd_per_ticket"], 100)
+        self.assertEqual(cfg["max_model_runs_per_ticket"], 30)
+        self.assertEqual(cfg["max_reviewer_runs_per_ticket"], 20)
+        self.assertEqual(cfg["max_usd_without_progress"], 50)
+
+
 if __name__ == "__main__":
     unittest.main()

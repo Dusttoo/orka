@@ -39,6 +39,11 @@ cp "$FIX/legacy-v1.yaml" "$TMP/invalid-trust-profile.yaml"
 printf '\nworker_trust_profile: omnipotent-worker\n' >> "$TMP/invalid-trust-profile.yaml"
 run_fail "invalid worker trust profile" "$ENGINE" --config "$TMP/invalid-trust-profile.yaml" validate-config
 
+# Resolve hard caps through the authority helper in test mode, never this host's.
+export ORCHESTRATION_TEST_MODE=1
+export ORCHESTRATION_TEST_AUTHORITY_HELPER="$ROOT/host-tools/orchestration-recovery-authority.py"
+export ORCHESTRATION_AUTHORITY_TEST_MODE=1
+export ORCHESTRATION_AUTHORITY_STATE_DIR="$TMP/authority"
 cp "$FIX/legacy-v1.yaml" "$TMP/budget-above-caps.yaml"
 printf '\nllm:\n  budgets:\n    max_usd_per_run: 200\n    max_usd_per_ticket: 400\n    max_usd_per_sprint: 4000\n    max_usd_per_code_review_phase: 8\n' >> "$TMP/budget-above-caps.yaml"
 BUDGET_OUT="$("$ENGINE" --config "$TMP/budget-above-caps.yaml" validate-config 2>"$TMP/budget-warnings.txt")"
@@ -50,6 +55,20 @@ WARNING llm.budgets.max_usd_per_ticket=400 exceeds the hard cap 30.00; Orka enfo
 WARNING llm.budgets.max_usd_per_sprint=4000 exceeds the hard cap 300.00; Orka enforces 300.00" "$BUDGET_WARNINGS"
 eq "budgets within hard caps produce no warnings" "" \
   "$("$ENGINE" --config "$FIX/legacy-v1.yaml" validate-config 2>&1 >/dev/null)"
+
+mkdir -p "$TMP/policy-repo/.orchestration"
+cp "$TMP/budget-above-caps.yaml" "$TMP/policy-repo/.orchestration/config.yaml"
+printf '{"max_usd_per_run":"50","max_usd_per_ticket":"400","max_usd_per_sprint":"4000"}' > "$TMP/policy.json"
+POLICY_ID="$("$ROOT/host-tools/orchestration-recovery-authority.py" set-budget-policy \
+  --repository "$TMP/policy-repo" --policy "$TMP/policy.json" --reason "large sprints")"
+POLICY_WARNINGS="$("$ENGINE" --config "$TMP/policy-repo/.orchestration/config.yaml" validate-config 2>&1 >/dev/null)"
+eq "validate-config reports a host budget policy and warns only above its caps" "NOTE host budget policy $POLICY_ID raises hard caps: max_usd_per_run=50, max_usd_per_sprint=4000, max_usd_per_ticket=400
+WARNING llm.budgets.max_usd_per_run=200 exceeds the hard cap 50; Orka enforces 50" "$POLICY_WARNINGS"
+printf '#!/bin/sh\necho "sudo: a password is required" >&2\nexit 1\n' > "$TMP/denied-helper"
+chmod +x "$TMP/denied-helper"
+DENIED_WARNINGS="$(ORCHESTRATION_TEST_AUTHORITY_HELPER="$TMP/denied-helper" "$ENGINE" \
+  --config "$TMP/policy-repo/.orchestration/config.yaml" validate-config 2>&1 >/dev/null | head -1)"
+eq "validate-config explains an unreadable host budget policy" "WARNING host budget policy unavailable (host operator authority denied budget-policy: sudo: a password is required); compiled hard caps apply" "$DENIED_WARNINGS"
 
 eq "branch role resolves Gecktopia candidate template" "release/2026.08.05" \
   "$("$ENGINE" --config "$FIX/gecktopia-adr-008.yaml" branch-name candidate --var candidate_id=2026.08.05)"

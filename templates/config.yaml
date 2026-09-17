@@ -83,7 +83,9 @@ llm:
     # caps. Design and review phases may be raised to a $10 hard cap;
     # implementation cannot exceed $12. Run, ticket, sprint, and pause values
     # cannot exceed their compiled caps ($10/$30/$300/$20). Larger values are
-    # clamped, and validate-config prints a WARNING for each.
+    # clamped, and validate-config prints a WARNING for each. A root-owned host
+    # budget policy (docs/sprint-controller.md) can raise these hard caps for
+    # this repository; nothing in this file can.
     max_usd_per_design_phase: 5.00 # includes ticket scoping
     max_usd_per_implementation_phase: 12.00
     max_usd_per_code_review_phase: 5.00

@@ -296,6 +296,7 @@ spec = importlib.util.spec_from_file_location("captain_preflight", sys.argv[1])
 module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
 cli = json.load(open(sys.argv[3]))
 assert cli["budget_limits"]["max_usd_per_run"] == "10.00", cli["budget_limits"]
+assert cli["budget_policy"]["source"] in {"compiled", "host-policy"}, cli["budget_policy"]
 report = module.budget_report(Path(sys.argv[2]))
 assert report["budget_limits"]["max_usd_per_run"] == "10.00"
 assert {"key": "max_usd_per_run", "configured": "200", "effective": "10.00", "cap": "10.00"} in report["budget_cap_warnings"], report
