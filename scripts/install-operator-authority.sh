@@ -25,7 +25,7 @@ TARGET="/usr/local/libexec/orchestration-recovery-authority"
 STATE="/var/lib/orka-authority"
 SUDOERS="/etc/sudoers.d/orka-authority"
 
-for path in "$STATE" "$STATE/pending" "$STATE/active" "$STATE/consumed"; do
+for path in "$STATE" "$STATE/pending" "$STATE/active" "$STATE/consumed" "$STATE/policies"; do
   if [ -L "$path" ]; then
     echo "refusing symlinked authority path: $path" >&2
     exit 2
@@ -33,7 +33,7 @@ for path in "$STATE" "$STATE/pending" "$STATE/active" "$STATE/consumed"; do
 done
 
 install -d -o root -g root -m 0755 /usr/local/libexec
-install -d -o root -g root -m 0700 "$STATE" "$STATE/pending" "$STATE/active" "$STATE/consumed"
+install -d -o root -g root -m 0700 "$STATE" "$STATE/pending" "$STATE/active" "$STATE/consumed" "$STATE/policies"
 install -o root -g root -m 0755 "$SOURCE" "$TARGET"
 
 temporary="$(mktemp)"
@@ -45,6 +45,7 @@ trap 'rm -f "$temporary"' EXIT
   printf '%s review-repair-grant --scope *, ' "$TARGET"
   printf '%s activate-budget --scope *, ' "$TARGET"
   printf '%s budget-ceiling --scope *, ' "$TARGET"
+  printf '%s budget-policy --scope *, ' "$TARGET"
   printf '%s activate-relaunch --scope *, ' "$TARGET"
   printf '%s activate-restart --scope *, ' "$TARGET"
   printf '%s restart-grant --scope *, ' "$TARGET"

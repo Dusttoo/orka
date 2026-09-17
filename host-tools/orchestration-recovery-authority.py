@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Root-owned, file-backed authority for recovery, budget, and relaunch capabilities.
 
+It also holds standing per-repository budget policies that raise Orka's compiled
+hard caps. Only root sets or clears a policy; the runtime may only read one.
+
 Runtime commands are intended to be exposed through a narrow sudoers rule.
 Issuance and revocation commands require a real root invocation and are never
 included in that rule.
@@ -55,6 +58,8 @@ def canonical_scope(raw: str, expected_kind: str) -> str:
     value = json.loads(raw)
     if expected_kind == "review-repair":
         expected = {"kind", "repository", "pr"}
+    elif expected_kind == "budget-policy":
+        expected = {"kind", "repository"}
     else:
         expected = {"kind", "repository", "ticket"}
         if expected_kind == "recovery":
@@ -64,7 +69,10 @@ def canonical_scope(raw: str, expected_kind: str) -> str:
     if value.get("kind") != expected_kind:
         raise ValueError("authority scope kind mismatch")
     repository = str(value.get("repository") or "")
-    if expected_kind == "review-repair":
+    if expected_kind == "budget-policy":
+        if not repository.startswith("/"):
+            raise ValueError("budget policy scope is incomplete")
+    elif expected_kind == "review-repair":
         if not repository.startswith("/") or not re.fullmatch(
             r"[1-9][0-9]{0,19}", str(value.get("pr") or "")
         ):
@@ -119,6 +127,63 @@ def build_review_repair_scope(repository: str, pr: str) -> str:
     )
 
 
+def build_budget_policy_scope(repository: str) -> str:
+    root = Path(repository).resolve()
+    if not root.is_dir():
+        raise ValueError("repository does not exist")
+    value = {"kind": "budget-policy", "repository": str(root)}
+    return canonical_scope(
+        json.dumps(value, sort_keys=True, separators=(",", ":")), "budget-policy"
+    )
+
+
+# Standing policies may raise only Orka's compiled hard caps, never output-token
+# or tool bounds. Dollars are decimal strings so no float rounds a ceiling.
+POLICY_DOLLAR_KEYS = {
+    "max_usd_per_run",
+    "max_usd_per_ticket",
+    "max_usd_per_sprint",
+    "pause_usd_per_ticket",
+    "max_usd_per_design_phase",
+    "max_usd_per_implementation_phase",
+    "max_usd_per_code_review_phase",
+    "max_usd_per_security_review_phase",
+    "max_usd_without_progress",
+}
+POLICY_COUNT_KEYS = {"max_model_runs_per_ticket", "max_reviewer_runs_per_ticket"}
+POLICY_MAX_USD = Decimal("100000")
+POLICY_MAX_COUNT = 1000
+
+
+def budget_policy_caps(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or not value:
+        raise ValueError("budget policy must be a non-empty JSON object of caps")
+    unknown = set(value) - POLICY_DOLLAR_KEYS - POLICY_COUNT_KEYS
+    if unknown:
+        raise ValueError(f"budget policy has unsupported keys: {', '.join(sorted(unknown))}")
+    caps: dict[str, Any] = {}
+    for key, raw in value.items():
+        if key in POLICY_COUNT_KEYS:
+            if (
+                not isinstance(raw, int)
+                or isinstance(raw, bool)
+                or not 0 < raw <= POLICY_MAX_COUNT
+            ):
+                raise ValueError(f"{key} must be an integer from 1 through {POLICY_MAX_COUNT}")
+            caps[key] = raw
+            continue
+        if not isinstance(raw, str):
+            raise ValueError(f"{key} must be a decimal string")
+        try:
+            amount = Decimal(raw)
+        except InvalidOperation as exc:
+            raise ValueError(f"{key} must be a decimal string") from exc
+        if not amount.is_finite() or not 0 < amount <= POLICY_MAX_USD:
+            raise ValueError(f"{key} must be greater than 0 and at most {POLICY_MAX_USD}")
+        caps[key] = str(amount)
+    return caps
+
+
 def validate_directory(path: Path, *, private: bool = True) -> None:
     info = path.lstat()
     expected_uid = os.getuid() if test_mode() else 0
@@ -134,12 +199,18 @@ def ensure_layout(root: Path) -> None:
     if root.is_symlink():
         raise PermissionError("authority state root must not be a symlink")
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    for name in ("pending", "active", "consumed"):
+    for name in ("pending", "active", "consumed", "policies"):
         path = root / name
         if path.is_symlink():
             raise PermissionError(f"authority path must not be a symlink: {path}")
         path.mkdir(mode=0o700, exist_ok=True)
-    for path in (root, root / "pending", root / "active", root / "consumed"):
+    for path in (
+        root,
+        root / "pending",
+        root / "active",
+        root / "consumed",
+        root / "policies",
+    ):
         validate_directory(path, private=False)
         os.chmod(path, 0o700)
         validate_directory(path)
@@ -530,6 +601,87 @@ def relaunch_ceiling(args: argparse.Namespace) -> int:
     return 0
 
 
+def policy_path(root: Path, scope: str) -> Path:
+    return root / "policies" / f"{hashlib.sha256(scope.encode('utf-8')).hexdigest()}.json"
+
+
+def set_budget_policy(args: argparse.Namespace) -> int:
+    require_real_root()
+    scope = build_budget_policy_scope(args.repository)
+    reason = args.reason.strip()
+    if not reason or len(reason) > 2000:
+        raise ValueError("budget policy requires a bounded operator reason")
+    caps = budget_policy_caps(json.loads(Path(args.policy).read_text(encoding="utf-8")))
+    root = state_root()
+    ensure_layout(root)
+    record = {
+        "kind": "budget-policy",
+        "scope": scope,
+        "caps": caps,
+        "reason": reason,
+        "issued_at": time.time(),
+        "policy_id": secrets.token_hex(16),
+    }
+    with locked(root):
+        atomic_json(policy_path(root, scope), record)
+    print(record["policy_id"])
+    return 0
+
+
+def clear_budget_policy(args: argparse.Namespace) -> int:
+    require_real_root()
+    scope = build_budget_policy_scope(args.repository)
+    root = state_root()
+    ensure_layout(root)
+    with locked(root):
+        policy_path(root, scope).unlink(missing_ok=True)
+    return 0
+
+
+def read_budget_policy(scope: str) -> dict[str, Any] | None:
+    root = state_root()
+    # A state root that was never created, or an install that predates
+    # policies, holds no policy; any existing layout must still be private.
+    if not root.exists() and not root.is_symlink():
+        return None
+    require_layout(root)
+    if not (root / "policies").exists():
+        return None
+    validate_directory(root / "policies")
+    target = policy_path(root, scope)
+    with locked(root):
+        if not target.is_file():
+            return None
+        record = load_record(target)
+    if record.get("kind") != "budget-policy" or not hmac.compare_digest(
+        str(record.get("scope") or ""), scope
+    ):
+        return None
+    return {
+        "policy_id": str(record.get("policy_id") or ""),
+        "caps": budget_policy_caps(record.get("caps")),
+        "reason": str(record.get("reason") or ""),
+        "issued_at": record.get("issued_at"),
+    }
+
+
+def budget_policy(args: argparse.Namespace) -> int:
+    policy = read_budget_policy(canonical_scope(args.scope, "budget-policy"))
+    if policy is None:
+        return 3
+    print(json.dumps(policy, sort_keys=True, separators=(",", ":")))
+    return 0
+
+
+def show_budget_policy(args: argparse.Namespace) -> int:
+    require_real_root()
+    policy = read_budget_policy(build_budget_policy_scope(args.repository))
+    if policy is None:
+        return fail("no budget policy is set for this repository", 3)
+    print(json.dumps(policy, indent=2, sort_keys=True))
+    return 0
+
+
 def revoke_budget(args: argparse.Namespace) -> int:
     require_real_root()
     scope = build_scope("budget", args.repository, args.ticket, None)
@@ -565,9 +717,19 @@ def parser() -> argparse.ArgumentParser:
         "relaunch-ceiling",
         "activate-restart",
         "restart-grant",
+        "budget-policy",
     ):
         command = commands.add_parser(name)
         command.add_argument("--scope", required=True)
+    set_policy = commands.add_parser("set-budget-policy")
+    set_policy.add_argument("--repository", required=True)
+    set_policy.add_argument(
+        "--policy", required=True, help="JSON object of raised hard caps"
+    )
+    set_policy.add_argument("--reason", required=True)
+    for name in ("clear-budget-policy", "show-budget-policy"):
+        command = commands.add_parser(name)
+        command.add_argument("--repository", required=True)
     recovery = commands.add_parser("issue-recovery")
     recovery.add_argument("--repository", required=True)
     recovery.add_argument("--ticket", required=True)
@@ -613,6 +775,14 @@ def parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = parser().parse_args()
     try:
+        if args.command == "set-budget-policy":
+            return set_budget_policy(args)
+        if args.command == "clear-budget-policy":
+            return clear_budget_policy(args)
+        if args.command == "show-budget-policy":
+            return show_budget_policy(args)
+        if args.command == "budget-policy":
+            return budget_policy(args)
         if args.command == "issue-restart":
             return issue(args, "restart")
         if args.command == "activate-restart":

@@ -1059,10 +1059,28 @@ def budget_cap_warnings(cfg: dict[str, Any]) -> list[str]:
         import api_agent
     except Exception as exc:  # advisory only; never block validation
         return [f"WARNING could not check llm.budgets hard caps: {exc}"]
-    return [
+    config_file = cfg.get("_config_path")
+    root = (
+        Path(str(config_file)).resolve().parent.parent
+        if config_file
+        else project_root()
+    )
+    status = api_agent.host_budget_policy_status(root)
+    notes = []
+    if status.get("error"):
+        notes.append(
+            f"WARNING host budget policy unavailable ({status['error']}); "
+            "compiled hard caps apply"
+        )
+    elif status.get("source") == "host-policy":
+        caps = ", ".join(f"{key}={value}" for key, value in status["caps"].items())
+        notes.append(
+            f"NOTE host budget policy {status['policy_id']} raises hard caps: {caps}"
+        )
+    return notes + [
         f"WARNING llm.budgets.{item['key']}={item['configured']} exceeds the hard cap "
         f"{item['cap']}; Orka enforces {item['effective']}"
-        for item in api_agent.budget_cap_violations(cfg)
+        for item in api_agent.budget_cap_violations(cfg, root)
     ]
 
 

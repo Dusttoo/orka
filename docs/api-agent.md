@@ -140,6 +140,35 @@ Values above a hard cap are clamped; `orchestration-engine.py validate-config`
 prints a `WARNING` for each one. There is deliberately no same-user CLI approval
 bypass.
 
+### Host budget policy
+
+The compiled hard caps suit small repositories. A host that runs larger sprints
+can raise them for one repository with a standing, root-owned budget policy held
+by the same authority that issues ticket grants
+([Standing budget policy](sprint-controller.md#standing-budget-policy)):
+
+- The policy may raise `max_usd_per_run`, `max_usd_per_ticket`,
+  `max_usd_per_sprint`, `pause_usd_per_ticket`, the four phase envelopes,
+  `max_model_runs_per_ticket`, `max_reviewer_runs_per_ticket`, and the
+  controller's `max_usd_without_progress`. Output-token and tool bounds are not
+  policy values.
+- It only raises. Each hard cap becomes the larger of its compiled value and
+  the policy value.
+- Repository configuration still chooses values within the caps. A policy that
+  allows `max_usd_per_ticket: 400` takes effect only when `llm.budgets` asks for
+  it, and values the configuration omits keep their defaults. When the ticket
+  ceiling is raised, an omitted pause defaults to 75% of it (within the pause
+  cap), and an omitted warning to half the pause.
+- Only root can set or clear a policy. The runtime user's sudo rule can only
+  read it, and nothing in the repository or worktree can change it.
+- If the policy cannot be read (no authority installed, an older helper without
+  `budget-policy`, a sudo refusal, or a malformed response), the compiled caps
+  apply. That can only lower spend. `validate-config` prints why, and captain
+  preflight reports it under `budget_policy`.
+- Every limit derived from configuration, including the ledger's phase clamp,
+  resolves against the same repository's policy, so admission never uses a cap
+  higher than the policy allows.
+
 With `issue-budget`, a host operator may authorize one ticket to continue to an exact absolute
 ceiling with the separately installed root authority. This raises only that
 ticket's cost pause and hard ticket-cost ceiling; model-run and

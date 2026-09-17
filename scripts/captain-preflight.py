@@ -94,19 +94,20 @@ def jira_readiness(
     return {**result, "state": "ready", "live_check": "passed"}
 
 
-def budget_report(config: Path) -> dict[str, Any]:
-    """Effective (capped) budget limits, plus cap warnings when available."""
+def budget_report(config: Path, repo: Path | None = None) -> dict[str, Any]:
+    """Effective (capped) budget limits, cap warnings, and the hard-cap source."""
     import api_agent
 
     try:
         loaded = api_agent.load_yaml(config)
-        limits = api_agent.budgets_from_config(loaded)
+        limits = api_agent.budgets_from_config(loaded, repo)
     except (api_agent.AgentError, ValueError) as exc:
         return {"budget_limits": None, "budget_error": str(exc)}
     report: dict[str, Any] = {"budget_limits": _json_safe(dict(sorted(limits.items())))}
     violations = getattr(api_agent, "budget_cap_violations", None)
     if callable(violations):
-        report["budget_cap_warnings"] = _json_safe(violations(loaded))
+        report["budget_cap_warnings"] = _json_safe(violations(loaded, repo))
+    report["budget_policy"] = _json_safe(api_agent.host_budget_policy_status(repo))
     return report
 
 
@@ -167,7 +168,7 @@ def main() -> int:
             status = {"state": "incompatible", "reason": str(exc)}
         routes.append({"role": role, "provider": route["provider"], "model": route["model"], **status})
     jira = jira_readiness(repo, config, skip_live=args.skip_jira_auth_check)
-    budgets = budget_report(config)
+    budgets = budget_report(config, repo)
     execution_ready = (
         all(item["state"] == "healthy" for item in routes)
         and jira["state"] == "ready"

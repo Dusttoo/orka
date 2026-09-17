@@ -125,7 +125,7 @@ class NativeGateway:
         self.route_scope = route_scope or self.origin
         self.config = config
         self.ledger = UsageLedger(root)
-        self.limits = budgets_from_config(config)
+        self.limits = budgets_from_config(config, root)
         self.context = dict(ticket=ticket, sprint=sprint, run_id=run_id,
                             provider="anthropic", role="implementer")
         self.transport = (

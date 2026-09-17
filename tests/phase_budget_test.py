@@ -1,15 +1,22 @@
 """Phase envelopes share the existing atomic admission and settlement ledger."""
 import concurrent.futures
 import fcntl
+import json
+import os
+import subprocess
 import threading
 from decimal import Decimal
 from pathlib import Path
 import sys
 import tempfile
 import unittest
+import unittest.mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+import api_agent
 from api_agent import AgentError, BudgetError, UsageLedger, budgets_from_config
+
+AUTHORITY = Path(__file__).resolve().parents[1] / "host-tools/orchestration-recovery-authority.py"
 
 
 class PhaseBudgetTests(unittest.TestCase):
@@ -198,6 +205,122 @@ class PhaseBudgetTests(unittest.TestCase):
         ], "T-1")
         self.assertEqual(totals["code_review"]["spent_usd"], Decimal(".5"))
         self.assertEqual(totals["implementation"]["spent_usd"], 0)
+
+
+class HostBudgetPolicyTests(unittest.TestCase):
+    """A root-owned repository policy raises hard caps; the worktree cannot."""
+
+    RAISED = {"llm": {"budgets": {
+        "max_usd_per_run": 200, "max_usd_per_ticket": 400, "max_usd_per_sprint": 4000,
+        "pause_usd_per_ticket": 250, "max_usd_per_code_review_phase": 20,
+        "max_model_runs_per_ticket": 40}}}
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name) / "repo"
+        self.root.mkdir()
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        self.state = Path(self.temp.name) / "authority"
+        self.env = {
+            "ORCHESTRATION_TEST_MODE": "1",
+            "ORCHESTRATION_TEST_AUTHORITY_HELPER": str(AUTHORITY),
+            "ORCHESTRATION_AUTHORITY_TEST_MODE": "1",
+            "ORCHESTRATION_AUTHORITY_STATE_DIR": str(self.state),
+        }
+        patcher = unittest.mock.patch.dict(os.environ, self.env)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        api_agent.clear_host_budget_policy_cache()
+        self.addCleanup(api_agent.clear_host_budget_policy_cache)
+
+    def set_policy(self, caps):
+        policy = Path(self.temp.name) / "policy.json"
+        policy.write_text(json.dumps(caps))
+        subprocess.run(
+            [str(AUTHORITY), "set-budget-policy", "--repository", str(self.root),
+             "--policy", str(policy), "--reason", "large sprints"],
+            check=True, capture_output=True, text=True,
+        )
+        api_agent.clear_host_budget_policy_cache()
+
+    def test_without_a_policy_compiled_caps_apply(self):
+        limits = budgets_from_config(self.RAISED, root=self.root)
+        self.assertEqual(limits["max_usd_per_run"], Decimal("10.00"))
+        self.assertEqual(limits["max_usd_per_ticket"], Decimal("30.00"))
+        self.assertEqual(limits["max_usd_per_sprint"], Decimal("300.00"))
+        self.assertEqual(api_agent.host_budget_policy_status(self.root)["source"], "compiled")
+
+    def test_policy_raises_caps_up_to_its_values_for_configured_budgets(self):
+        self.set_policy({"max_usd_per_run": "50", "max_usd_per_ticket": "400",
+                         "max_usd_per_sprint": "4000", "pause_usd_per_ticket": "300",
+                         "max_usd_per_code_review_phase": "25",
+                         "max_model_runs_per_ticket": 40})
+        limits = budgets_from_config(self.RAISED, root=self.root)
+        self.assertEqual(limits["max_usd_per_run"], Decimal("50"))
+        self.assertEqual(limits["max_usd_per_ticket"], Decimal("400"))
+        self.assertEqual(limits["max_usd_per_sprint"], Decimal("4000"))
+        self.assertEqual(limits["pause_usd_per_ticket"], Decimal("250"))
+        self.assertEqual(limits["max_usd_per_code_review_phase"], Decimal("20"))
+        self.assertEqual(limits["max_model_runs_per_ticket"], 40)
+        status = api_agent.host_budget_policy_status(self.root)
+        self.assertEqual(status["source"], "host-policy")
+        self.assertEqual(status["reason"], "large sprints")
+        # Without the root the same configuration keeps compiled caps.
+        self.assertEqual(budgets_from_config(self.RAISED)["max_usd_per_run"], Decimal("10.00"))
+
+    def test_policy_does_not_change_defaults_the_repository_did_not_raise(self):
+        self.set_policy({"max_usd_per_ticket": "400", "pause_usd_per_ticket": "300"})
+        self.assertEqual(budgets_from_config({}, root=self.root), budgets_from_config({}))
+        raised_ticket = budgets_from_config(
+            {"llm": {"budgets": {"max_usd_per_ticket": 400}}}, root=self.root)
+        # A raised ticket ceiling scales its derived pause and warning thresholds.
+        self.assertEqual(raised_ticket["pause_usd_per_ticket"], Decimal("300"))
+        self.assertEqual(raised_ticket["warn_usd_per_ticket"], Decimal("150"))
+
+    def test_policy_can_only_raise_compiled_caps(self):
+        self.set_policy({"max_usd_per_run": "5", "max_model_runs_per_ticket": 3})
+        limits = budgets_from_config(self.RAISED, root=self.root)
+        self.assertEqual(limits["max_usd_per_run"], Decimal("10.00"))
+        self.assertEqual(limits["max_model_runs_per_ticket"], 12)
+
+    def test_unreadable_policy_falls_back_to_compiled_caps_and_reports_why(self):
+        broken = Path(self.temp.name) / "broken-helper"
+        broken.write_text("#!/bin/sh\necho unsupported command >&2\nexit 2\n")
+        broken.chmod(0o755)
+        with unittest.mock.patch.dict(os.environ, {"ORCHESTRATION_TEST_AUTHORITY_HELPER": str(broken)}):
+            api_agent.clear_host_budget_policy_cache()
+            limits = budgets_from_config(self.RAISED, root=self.root)
+            status = api_agent.host_budget_policy_status(self.root)
+        self.assertEqual(limits["max_usd_per_run"], Decimal("10.00"))
+        self.assertEqual(status["source"], "compiled")
+        self.assertIn("unsupported command", status["error"])
+
+    def test_cap_violations_use_the_policy_caps(self):
+        self.set_policy({"max_usd_per_run": "50"})
+        violations = api_agent.budget_cap_violations(self.RAISED, root=self.root)
+        run = next(item for item in violations if item["key"] == "max_usd_per_run")
+        self.assertEqual((run["configured"], run["cap"], run["effective"]), ("200", "50", "50"))
+        self.assertFalse(any(item["key"] == "max_usd_per_run"
+                             for item in api_agent.budget_cap_violations(
+                                 {"llm": {"budgets": {"max_usd_per_run": 50}}}, root=self.root)))
+
+    def test_admission_enforces_policy_raised_run_and_phase_ceilings(self):
+        self.set_policy({"max_usd_per_run": "50", "max_usd_per_ticket": "400",
+                         "pause_usd_per_ticket": "300", "max_usd_per_code_review_phase": "25"})
+        limits = budgets_from_config(self.RAISED, root=self.root)
+        ledger = UsageLedger(self.root)
+        phase = ledger.phase_limits([], "T-1", limits, self.root)
+        self.assertEqual(phase["code_review"], Decimal("20"))
+        forged = dict(limits, max_usd_per_code_review_phase=Decimal("90"))
+        self.assertEqual(ledger.phase_limits([], "T-1", forged, self.root)["code_review"],
+                         Decimal("25"))
+        reservation = ledger.reserve(projected=Decimal("19"), limits=limits, run_id="review",
+            ticket="T-1", sprint="1", provider="anthropic", model="test", role="code-reviewer")
+        self.assertTrue(reservation)
+        with self.assertRaisesRegex(BudgetError, "max_usd_per_code_review_phase"):
+            ledger.reserve(projected=Decimal("2"), limits=limits, run_id="review",
+                ticket="T-1", sprint="1", provider="anthropic", model="test", role="code-reviewer")
 
 
 if __name__ == "__main__":

@@ -42,6 +42,7 @@ from api_agent import (
     Pricing,
     UsageLedger,
     budgets_from_config,
+    host_budget_caps,
     load_yaml,
     TRANSIENT_PAUSE_REASONS,
     load_orchestration_env,
@@ -286,24 +287,28 @@ def settings(args: argparse.Namespace) -> dict[str, Any]:
         raise SprintError(
             "worker idle seconds must be 60..7200 and lifetime must be idle..43200"
         )
+    # Hard caps are compiled unless a root-owned host budget policy for this
+    # repository raises them; the configuration still chooses within them.
+    caps = host_budget_caps(shared_root)
+    pause_cap = float(caps["pause_usd_per_ticket"])
     try:
         warning_budget = min(
             float(config_scalar_any_depth(config, "warn_usd_per_ticket", "10")) or 10,
-            10,
+            max(10.0, pause_cap / 2),
         )
         pause_budget = min(
             float(config_scalar_any_depth(config, "pause_usd_per_ticket", "20")) or 20,
-            20,
+            pause_cap,
         )
         max_model_runs = min(
             int(config_scalar_any_depth(config, "max_model_runs_per_ticket", "12"))
             or 12,
-            12,
+            caps["max_model_runs_per_ticket"],
         )
         max_reviewer_runs = min(
             int(config_scalar_any_depth(config, "max_reviewer_runs_per_ticket", "6"))
             or 6,
-            6,
+            caps["max_reviewer_runs_per_ticket"],
         )
         max_auto_slices = min(
             int(config_scalar_any_depth(config, "max_auto_slices", "6")) or 6,
@@ -315,7 +320,7 @@ def settings(args: argparse.Namespace) -> dict[str, Any]:
         max_usd_without_progress = min(
             float(config_scalar_any_depth(config, "max_usd_without_progress", "5"))
             or 5,
-            10,
+            float(caps["max_usd_without_progress"]),
         )
     except ValueError as exc:
         raise SprintError("ticket budgets and run limits must be numbers") from exc
@@ -1297,7 +1302,7 @@ def usage_snapshots(cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
                         str(event.get("logical_review_id") or event["run_id"])
                     )
     phase_limits = budgets_from_config(
-        load_yaml(cfg["config"]) if cfg.get("config") else {}
+        load_yaml(cfg["config"]) if cfg.get("config") else {}, cfg["shared_root"]
     )
     for ticket, item in result.items():
         restart = authorized_restart_grant(cfg["shared_root"], ticket)
@@ -1305,7 +1310,9 @@ def usage_snapshots(cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
         item["phase_budgets"] = {}
         for phase, totals in UsageLedger.phase_totals(events, ticket).items():
             limit = max(
-                UsageLedger.phase_limits(events, ticket, phase_limits)[phase],
+                UsageLedger.phase_limits(
+                    events, ticket, phase_limits, cfg["shared_root"]
+                )[phase],
                 Decimal(allowances.get(phase + "_usd", "0")),
             )
             total = totals["spent_usd"] + totals["reserved_usd"]
@@ -2257,7 +2264,9 @@ def record_progress(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
                 )
             fingerprint = str(result["phase_permit"])
             UsageLedger(cfg["shared_root"]).transfer_design_budget(
-                key, budgets_from_config(load_yaml(cfg["config"])), fingerprint
+                key,
+                budgets_from_config(load_yaml(cfg["config"]), cfg["shared_root"]),
+                fingerprint,
             )
             verified = True
         if args.milestone == "review_finding_closed":
@@ -3131,7 +3140,7 @@ def prepare_batch(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         requests = []
         marker_jobs = []
         config = load_yaml(cfg["config"])
-        limits = budgets_from_config(config)
+        limits = budgets_from_config(config, cfg["shared_root"])
         usage = UsageLedger(cfg["shared_root"])
         reservations: list[tuple[str, str]] = []
         prepared = []
