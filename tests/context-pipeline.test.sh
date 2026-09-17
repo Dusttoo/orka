@@ -132,6 +132,125 @@ json.dump(value, open(sys.argv[2], "w"))
 PY
 run_fail "PASS with a blocking finding is rejected" "$PIPELINE" validate-review --gate code-review --input "$TMP/contradictory-review.json"
 
+# --- CI-verified checks --------------------------------------------------------
+# A check the repository forbids running locally (for example a DB integration
+# suite) may be satisfied by CI on the exact reviewed commit, with evidence.
+HEAD_SHA="$(printf 'a%.0s' $(seq 40))"
+OTHER_SHA="$(printf 'b%.0s' $(seq 40))"
+cat > "$TMP/ci-verified-review.json" <<JSON
+{"schema_version":1,"gate":"security-review","verdict":"PASS","checks":[{"name":"security surface","status":"pass"},{"name":"CI integration suite","status":"ci_verified","evidence":{"ci_check":"integration-tests","head_sha":"$HEAD_SHA"}}],"findings":[]}
+JSON
+"$PIPELINE" validate-review --gate security-review --input "$TMP/ci-verified-review.json" > "$TMP/ci-verified-validated.json"
+check "PASS with a CI-verified check and evidence validates without a blocking finding" 'data["verdict"] == "PASS" and data["checks"][1]["status"] == "ci_verified" and data["checks"][1]["evidence"]["ci_check"] == "integration-tests"' "$TMP/ci-verified-validated.json"
+python3 - "$TMP/ci-verified-review.json" "$TMP/ci-verified-no-evidence.json" "$TMP/ci-verified-empty-evidence.json" "$TMP/ci-verified-short-sha.json" "$TMP/pass-with-evidence.json" <<'PY'
+import copy, json, sys
+base = json.load(open(sys.argv[1]))
+no_evidence = copy.deepcopy(base); del no_evidence["checks"][1]["evidence"]
+json.dump(no_evidence, open(sys.argv[2], "w"))
+empty = copy.deepcopy(base); empty["checks"][1]["evidence"] = {"ci_check": " ", "head_sha": ""}
+json.dump(empty, open(sys.argv[3], "w"))
+short = copy.deepcopy(base); short["checks"][1]["evidence"]["head_sha"] = "aaaaaaa"
+json.dump(short, open(sys.argv[4], "w"))
+extra = copy.deepcopy(base); extra["checks"][0]["evidence"] = base["checks"][1]["evidence"]
+json.dump(extra, open(sys.argv[5], "w"))
+PY
+run_fail "ci_verified without evidence is rejected" "$PIPELINE" validate-review --gate security-review --input "$TMP/ci-verified-no-evidence.json"
+run_fail "ci_verified with empty evidence is rejected" "$PIPELINE" validate-review --gate security-review --input "$TMP/ci-verified-empty-evidence.json"
+run_fail "ci_verified evidence requires a full commit SHA" "$PIPELINE" validate-review --gate security-review --input "$TMP/ci-verified-short-sha.json"
+run_fail "evidence is refused on checks that are not ci_verified" "$PIPELINE" validate-review --gate security-review --input "$TMP/pass-with-evidence.json"
+cat > "$TMP/not-run-review.json" <<'JSON'
+{"schema_version":1,"gate":"security-review","verdict":"PASS","checks":[{"name":"CI integration suite","status":"not_run"}],"findings":[]}
+JSON
+run_fail "not_run still requires a blocking finding" "$PIPELINE" validate-review --gate security-review --input "$TMP/not-run-review.json"
+"$PIPELINE" review-schema --gate security-review > "$TMP/review-schema.json"
+check "review schema offers ci_verified only with required evidence" 'any(b["properties"]["status"]["enum"] == ["ci_verified"] and "evidence" in b["required"] and b["properties"]["evidence"]["required"] == ["ci_check","head_sha"] for b in data["properties"]["checks"]["items"]["anyOf"]) and all("ci_verified" not in b["properties"]["status"]["enum"] for b in data["properties"]["checks"]["items"]["anyOf"] if "evidence" not in b["properties"])' "$TMP/review-schema.json"
+
+cat > "$TMP/check-runs.json" <<JSON
+{"total_count":3,"check_runs":[
+ {"id":1,"name":"integration-tests","head_sha":"$HEAD_SHA","status":"completed","conclusion":"success","html_url":"https://github.com/o/r/runs/1","output":{"text":"very long raw log"},"app":{"id":7}},
+ {"id":2,"name":"lint","head_sha":"$HEAD_SHA","status":"completed","conclusion":"failure","html_url":"https://github.com/o/r/runs/2"},
+ {"id":3,"name":"e2e","head_sha":"$HEAD_SHA","status":"in_progress","conclusion":null,"html_url":"https://github.com/o/r/runs/3"}
+]}
+JSON
+"$PIPELINE" validate-review --gate security-review --input "$TMP/ci-verified-review.json" \
+  --ci-evidence "$TMP/check-runs.json" --head "$HEAD_SHA" > "$TMP/ci-cross-checked.json"
+check "CI evidence confirms a ci_verified check that passed at the reviewed head" 'data["checks"][1]["status"] == "ci_verified"' "$TMP/ci-cross-checked.json"
+run_fail "ci_verified citing a different head than the reviewed head is rejected" "$PIPELINE" validate-review \
+  --gate security-review --input "$TMP/ci-verified-review.json" --head "$OTHER_SHA"
+python3 - "$TMP/ci-verified-review.json" "$TMP/ci-verified-failed-run.json" "$TMP/ci-verified-missing-run.json" <<'PY'
+import copy, json, sys
+base = json.load(open(sys.argv[1]))
+failed = copy.deepcopy(base); failed["checks"][1]["evidence"]["ci_check"] = "lint"
+json.dump(failed, open(sys.argv[2], "w"))
+missing = copy.deepcopy(base); missing["checks"][1]["evidence"]["ci_check"] = "never-ran"
+json.dump(missing, open(sys.argv[3], "w"))
+PY
+run_fail "CI evidence contradicting a ci_verified check fails closed" "$PIPELINE" validate-review \
+  --gate security-review --input "$TMP/ci-verified-failed-run.json" --ci-evidence "$TMP/check-runs.json" --head "$HEAD_SHA"
+run_fail "ci_verified citing a run absent from supplied CI evidence fails closed" "$PIPELINE" validate-review \
+  --gate security-review --input "$TMP/ci-verified-missing-run.json" --ci-evidence "$TMP/check-runs.json" --head "$HEAD_SHA"
+
+"$PIPELINE" payload --provider openai --role-file "$TMP/role.md" --rules-file "$TMP/AGENTS.md" \
+  --repo-map "$TMP/map.txt" --ticket "$TMP/ticket.json" --diff "$TMP/change.diff" \
+  --mode security-review --execution gate --model test-model \
+  --ci-evidence "$TMP/check-runs.json" --review-head "$HEAD_SHA" > "$TMP/ci-payload.json"
+check "review payload embeds normalized exact-head CI evidence" '"<ci_evidence>" in data["input"][1]["content"][0]["text"] and "integration-tests" in data["input"][1]["content"][0]["text"] and "https://github.com/o/r/runs/1" in data["input"][1]["content"][0]["text"] and "very long raw log" not in str(data) and "ci_verified" in data["input"][1]["content"][0]["text"]' "$TMP/ci-payload.json"
+python3 - "$TMP/ci-payload.json" "$TMP/ci-summary.json" <<'PY'
+import json, re, sys
+text = json.load(open(sys.argv[1]))["input"][1]["content"][0]["text"]
+json.dump(json.loads(re.search(r"<ci_evidence>\n(.*?)\n</ci_evidence>", text, re.S).group(1)), open(sys.argv[2], "w"))
+PY
+check "embedded CI evidence keeps only name, status, conclusion, head sha, and url" 'set(data) == {"head_sha","check_runs","total_count","truncated"} and all(set(run) == {"name","status","conclusion","head_sha","url"} for run in data["check_runs"]) and data["truncated"] is False' "$TMP/ci-summary.json"
+run_fail "payload refuses CI evidence for a different head than the reviewed head" "$PIPELINE" payload \
+  --provider openai --role-file "$TMP/role.md" --rules-file "$TMP/AGENTS.md" --repo-map "$TMP/map.txt" \
+  --ticket "$TMP/ticket.json" --diff "$TMP/change.diff" --mode security-review --model test-model \
+  --ci-evidence "$TMP/check-runs.json" --review-head "$OTHER_SHA"
+run_fail "payload refuses CI evidence without an explicit reviewed head" "$PIPELINE" payload \
+  --provider openai --role-file "$TMP/role.md" --rules-file "$TMP/AGENTS.md" --repo-map "$TMP/map.txt" \
+  --ticket "$TMP/ticket.json" --diff "$TMP/change.diff" --mode security-review --model test-model \
+  --ci-evidence "$TMP/check-runs.json"
+python3 - "$TMP/check-runs.json" "$TMP/check-runs-mixed.json" "$TMP/check-runs-many.json" "$OTHER_SHA" <<'PY'
+import copy, json, sys
+base = json.load(open(sys.argv[1]))
+mixed = copy.deepcopy(base); mixed["check_runs"][2]["head_sha"] = sys.argv[4]
+json.dump(mixed, open(sys.argv[2], "w"))
+many = copy.deepcopy(base)
+many["check_runs"] = [dict(base["check_runs"][0], id=i, name=f"job-{i:03d}") for i in range(200)]
+many["total_count"] = 200
+json.dump(many, open(sys.argv[3], "w"))
+PY
+run_fail "payload refuses CI evidence containing any run for another commit" "$PIPELINE" payload \
+  --provider openai --role-file "$TMP/role.md" --rules-file "$TMP/AGENTS.md" --repo-map "$TMP/map.txt" \
+  --ticket "$TMP/ticket.json" --diff "$TMP/change.diff" --mode security-review --model test-model \
+  --ci-evidence "$TMP/check-runs-mixed.json" --review-head "$HEAD_SHA"
+"$PIPELINE" payload --provider anthropic --role-file "$TMP/role.md" --rules-file "$TMP/AGENTS.md" \
+  --repo-map "$TMP/map.txt" --ticket "$TMP/ticket.json" --diff "$TMP/change.diff" \
+  --mode code-review --model test-model \
+  --ci-evidence "$TMP/check-runs-many.json" --review-head "$HEAD_SHA" > "$TMP/ci-payload-many.json"
+check "embedded CI evidence is size-bounded and marks truncation" '"\"truncated\": true" in data["messages"][0]["content"] and data["messages"][0]["content"].count("\"name\": \"job-") <= 64 and len(data["messages"][0]["content"]) < 40000' "$TMP/ci-payload-many.json"
+
+mkdir -p "$TMP/fake-bin"
+cat > "$TMP/fake-bin/gh" <<SH
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$TMP/gh-calls.txt"
+cat "$TMP/check-runs.json"
+SH
+chmod +x "$TMP/fake-bin/gh"
+PATH="$TMP/fake-bin:$PATH" "$PIPELINE" payload --provider openai --role-file "$TMP/role.md" \
+  --rules-file "$TMP/AGENTS.md" --repo-map "$TMP/map.txt" --ticket "$TMP/ticket.json" \
+  --diff "$TMP/change.diff" --mode security-review --model test-model \
+  --fetch-ci-evidence --review-head "$HEAD_SHA" > "$TMP/ci-fetched-payload.json"
+check "explicit CI fetch embeds gh check runs for the reviewed head" '"<ci_evidence>" in data["input"][1]["content"][0]["text"] and "integration-tests" in data["input"][1]["content"][0]["text"]' "$TMP/ci-fetched-payload.json"
+if grep -Fq "repos/{owner}/{repo}/commits/$HEAD_SHA/check-runs" "$TMP/gh-calls.txt" 2>/dev/null; then
+  ok "explicit CI fetch queries check runs for the exact reviewed commit"
+else
+  fail_case "explicit CI fetch queries check runs for the exact reviewed commit"
+fi
+"$PIPELINE" payload --provider openai --role-file "$TMP/role.md" --rules-file "$TMP/AGENTS.md" \
+  --repo-map "$TMP/map.txt" --ticket "$TMP/ticket.json" --diff "$TMP/change.diff" \
+  --mode security-review --model test-model > "$TMP/no-ci-payload.json"
+check "review payloads omit CI evidence unless explicitly requested" '"<ci_evidence>" not in str(data)' "$TMP/no-ci-payload.json"
+
 "$PIPELINE" route --config "$TMP/missing.yaml" --role implementer > "$TMP/default-route.json"
 check "missing routing config preserves desktop execution" 'data["execution"] == "desktop" and data["fallback"] == "none"' "$TMP/default-route.json"
 

@@ -47,6 +47,10 @@ Before each `code-reviewer` or `security-reviewer` pass, resolve its route with
 <role>`. Desktop routes use fresh native agents. API routes build their request
 with `context_pipeline.py payload --config ... --role <role>` and use the
 `api_agent.py run --request -` adapter with the ticket and a stable run id.
+Give API reviewers exact-head CI results with `payload --ci-evidence <gh api
+"repos/{owner}/{repo}/commits/<full-exact-head>/check-runs" output>
+--review-head <full-exact-head>` (or `--fetch-ci-evidence --review-head ...`)
+so a CI-only check can be `ci_verified` instead of `not_run`.
 First issue a phase permit from the durable ledger with `review-ledger.py
 permit-review <pr> --role <role> --head <full-exact-head>`;
 pass it to `run --review-pr <pr> --review-authorization <token>`. The ledger

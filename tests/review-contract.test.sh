@@ -61,6 +61,14 @@ for file in agents/orchestration-code-reviewer.md agents/orchestration-security-
   require_text "$file" '"findings":[]' "clean reviews avoid narrative output"
 done
 
+for file in agents/orchestration-code-reviewer.md agents/orchestration-security-reviewer.md docs/reviewer-output.md; do
+  require_text "$file" 'ci_verified' "reviewers can cite exact-commit CI for checks they may not run"
+  require_text "$file" '"evidence":{"ci_check":' "CI-verified checks carry a structured evidence reference"
+  require_text "$file" 'otherwise `not_run`' "unverifiable checks stay not_run with a blocking finding"
+done
+require_text commands/gate.md "commits/<full-exact-head>/check-runs" "gate documents exact-head CI evidence capture"
+require_text commands/gate.md "--ci-evidence" "gate feeds exact-head CI evidence to API reviewers"
+
 require_text scripts/context_pipeline.py '"type": "json_schema"' "API providers receive a reviewer schema"
 require_text scripts/context_pipeline.py 'validate_review_output' "review output is validated mechanically"
 require_text docs/reviewer-output.md "Explanations are generated only for actual findings" \

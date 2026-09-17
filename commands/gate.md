@@ -56,6 +56,14 @@ git worktree remove <review-path>   # after the round is recorded
 Linked worktrees resolve the same shared review ledger and canonical config, so
 the ledger state is identical from either checkout.
 
+For API reviewers, capture exact-head CI results before building the payload:
+`gh api --paginate "repos/{owner}/{repo}/commits/<full-exact-head>/check-runs?per_page=100"
+> .orchestration/.review-results/ci-evidence.json`, then add `--ci-evidence
+<that file> --review-head <full-exact-head>` to `context_pipeline.py payload`
+(or `--fetch-ci-evidence --review-head <full-exact-head>` to let it call `gh`).
+The builder refuses evidence for any other commit. Reviewers may then mark a
+CI-only check `ci_verified` with evidence instead of `not_run`.
+
 0. **Open the ledger and build the round brief.** The failure ledger lives on
    disk, not in this conversation -- it survives compaction, normalizes component
    keys so a repeated defect actually accumulates strikes, and decides when the
