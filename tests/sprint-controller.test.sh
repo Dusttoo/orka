@@ -29,6 +29,29 @@ json_check() {
     fail_case "$label"
   fi
 }
+wait_unit_absent() {
+  # Poll the controller's own liveness predicate for a ticket's execution unit.
+  local sprint="$1" ticket="$2"
+  python3 - "$CONTROLLER_MODULE" "$sprint" "$ticket" "${UNIT_ABSENT_TIMEOUT:-30}" <<'PY'
+import importlib.util,os,sys,time
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1]).parent))
+os.environ["ORCHESTRATION_TEST_MODE"] = "1"
+spec = importlib.util.spec_from_file_location("sprint_controller", sys.argv[1])
+module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+sprint, ticket, timeout = sys.argv[2], sys.argv[3], float(sys.argv[4])
+cfg = module.settings(module.parser().parse_args(["summary", "--sprint", sprint]))
+deadline = time.monotonic() + timeout
+while True:
+    lane = module.load(module.state_path(cfg["state_dir"], sprint))["tickets"][ticket]
+    status = module.execution_unit_status(lane["worker_identity"])
+    if status == "absent":
+        break
+    if time.monotonic() > deadline:
+        raise SystemExit(f"{ticket} execution unit is still {status} after {timeout:g}s")
+    time.sleep(0.05)
+PY
+}
 jira_receipt() {
   local inventory="$1" artifact="$1.fetch.json" transport="$1.transport.json"
   python3 - "$inventory" "$transport" <<'PY'
@@ -251,7 +274,10 @@ run_fail "launch evidence is bound to its exact ticket and attempt" "$CONTROLLER
 run_ok "controller attach capability establishes launched worker identity" "$CONTROLLER" attach --sprint 42 --ticket PROJ-2 --launch-evidence "$LAUNCH2"
 run_fail "live attached worker blocks requeue despite dead provisional identity" "$CONTROLLER" requeue --sprint 42 --ticket PROJ-2 --reason 'worker no longer exists' --attempt-token "$TOKEN2"
 kill "$PID2" 2>/dev/null || true
-wait "$PID2" 2>/dev/null || true
+# PID2 is the supervisor's child, not this shell's, so `wait` cannot block on it.
+# The supervisor still has to observe the exit, write its terminal record, and
+# exit itself; requeue before that correctly sees a live or unknown unit.
+wait_unit_absent 42 PROJ-2 && ok "killed worker's execution unit becomes absent within the bound" || fail_case "killed worker's execution unit becomes absent within the bound"
 run_ok "confirmed process absence permits automatic requeue" "$CONTROLLER" requeue --sprint 42 --ticket PROJ-2 --reason 'worker exited' --attempt-token "$TOKEN2"
 python3 - "$CONTROLLER_MODULE" "$TMP/repo" <<'PY' && ok "unknown unit inspection, descendant liveness, and identity reuse fail closed" || fail_case "unknown unit inspection, descendant liveness, and identity reuse fail closed"
 import importlib.util,sys

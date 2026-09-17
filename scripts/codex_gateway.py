@@ -73,6 +73,8 @@ def client_tools_only(tools):
 
 
 class CodexGateway(NativeGateway):
+    origin = "codex-gateway"
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.context["provider"] = "openai"
@@ -113,7 +115,7 @@ class CodexGateway(NativeGateway):
         if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
             raise AgentError("provider omitted a valid input token count")
         reservation = self.ledger.reserve(projected=pricing.worst_case(count, maximum),
-            limits=self.limits, model=model, **self.context)
+            limits=self.limits, model=model, origin=self.origin, **self.context)
         try:
             response = self.model_request("openai", "responses", body, idempotency_key=reservation)
         except ProviderAdmissionError:

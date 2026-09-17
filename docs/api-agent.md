@@ -257,9 +257,11 @@ scripts/api_agent.py reservation-migration-plan --repo . \
 ```
 
 Fill every entry's `evidence` with the provider lookup and timestamp that proves
-the request was not found. Orka accepts only `not-found` outcomes in this bulk
-path; completed requests still require individual token and response-id
-reconciliation. Validate the entire manifest before mutation, then apply it:
+the request was not found. API run entries (`source: api-run`) accept only
+`not-found` in this bulk path; a completed API run request still requires
+individual token and response-id reconciliation with `reconcile --run-id`.
+Gateway entries have stricter rules, described below. Validate the entire
+manifest before mutation, then apply it:
 
 ```text
 scripts/api_agent.py reconcile-reservations --repo . \
@@ -271,6 +273,111 @@ scripts/api_agent.py reconcile-reservations --repo . \
 The manifest is repository-bound, limited to 100 unique reservations, and each
 entry must match both the run marker and the open ledger reservation. Application
 is idempotent and copies the exact evidence into the run's durable audit record.
+
+Each plan entry names its `source`. Open reservations that neither path below can
+accept are listed under `excluded` with the refusal reason instead of as entries,
+so the plan and the reconciler always agree. The plan is a snapshot: application
+re-validates every entry.
+
+#### Gateway reservations
+
+Workers launched with `sprint-controller.py launch-local -- .../claude` or
+`.../codex exec` meter through the controller-owned loopback gateway. Its
+reservations use the controller invocation id as `run_id` and never have a
+`.llm-runs` marker, so `reconcile --run-id` cannot close them. New gateway
+reservations carry `origin: native-gateway` or `origin: codex-gateway`; API
+runner reservations carry `origin: api-run`. Reservations written before the
+marker existed are treated as gateway reservations only when they have no run
+marker, role `implementer`, no logical review id, and an `anthropic` or `openai`
+provider. Anything else without a run marker is refused as `run state not found`,
+and a gateway-origin reservation that also has a run marker is refused as ambiguous.
+
+The bulk manifest accepts a gateway entry as `source: native-gateway` only when
+all of the following hold at validation time:
+
+- The reservation is still open with that exact `run_id`, and its ticket and
+  sprint select a controller checkpoint in `sprint_checkpoint_dir` whose ticket
+  launch history records that invocation as a supervised execution unit.
+- `execution-<run_id>.terminal.json` exists in that directory, is `phase:
+  terminal`, belongs to the invocation, shows a spawned worker, and finished no
+  earlier than the reservation.
+- The controller's own liveness check reports the unit `absent`. Live and unknown
+  units are refused. A cooperative-session unit also needs a closed-gateway cleanup
+  receipt and a worker process group that no longer exists.
+- The operator chose the outcome, `not-found` or `completed`, and wrote evidence
+  for this reservation (see below).
+
+The plan leaves `outcome` and `evidence` empty for gateway entries, so an
+unedited plan is refused. Each gateway entry also lists a `request` block
+(ticket, sprint, provider, model, `reserved_at`, projected cost, and the unit's
+stop reason) and `evidence_must_name`, the values the evidence has to mention.
+Look up every request in the provider console yourself. Do not paste one search
+result onto every entry.
+
+Gateway evidence is refused when it:
+
+- contains template or placeholder text, such as `<...>`, `{{`, `...`, `TODO`,
+  `TBD`, `FIXME`, `placeholder`, `n/a`, or `same as above`;
+- is shorter than 24 characters, or has fewer than three words besides ids and
+  timestamps;
+- does not name this reservation. It must contain either the reservation id
+  (`resv_...`) or the reservation's UTC request minute: the date `YYYY-MM-DD` and
+  `HH:MM` anywhere in the text. The request minute is `reserved_at` converted to
+  UTC. The run id is not enough, because one invocation can hold several
+  reservations.
+
+The same sentence can cover several reservations only if it names each one. For
+example, `Anthropic Console searched 2026-09-12: no request at 22:36 or 22:49 UTC`
+covers reservations made at 22:36 and 22:49 UTC. A search described as
+`22:30-22:50` names neither minute and is refused. This is how a reservation that
+nobody looked up is kept from being released by a copied line. If a request came
+in near a minute boundary, name the reservation id instead.
+
+A `not-found` entry must not carry usage fields. A `completed` entry settles a
+request the provider did finish. It needs the provider's `response_id` and
+nonnegative integer `input_tokens`, `cache_write_tokens`, `cache_read_tokens`,
+and `output_tokens`, using the ledger's normalized meaning:
+
+- `input_tokens` is uncached input.
+- `cache_write_tokens` and `cache_read_tokens` are cache creation and cache read
+  input.
+- `output_tokens` includes any reasoning. `reasoning_tokens` is optional.
+
+For example:
+
+```json
+{"run_id": "5ee5e53594254d6293847c2e5229d057",
+ "reservation_id": "resv_7bf57feb5ea848168b534faf88e138f0",
+ "outcome": "completed",
+ "evidence": "Anthropic Console 2026-09-12 22:36 UTC shows msg_01Abc completed",
+ "response_id": "msg_01Abc", "input_tokens": 1830, "cache_write_tokens": 0,
+ "cache_read_tokens": 41200, "output_tokens": 912}
+```
+
+Orka prices that usage with the current `llm.pricing` entry for the reservation's
+model from the canonical `.orchestration/config.yaml`. It refuses a zero total, a
+response id that appears on two entries, and a response id that already settled
+another reservation. If the priced cost exceeds the reservation's projected worst
+case, the entry is refused and the reservation stays open, still counting its
+projection. That usually means a typo or the wrong request, so nothing is lost or
+settled. If the provider's record really does cost more, for example because
+prices changed, rerun with `--accept-cost-above-reservation RESERVATION_ID` for
+that reservation. The flag must name a reservation in the manifest. The actual
+cost is then settled, and the audit record sets `cost_above_reservation: true`.
+
+Before changing the ledger, Orka writes
+`.orchestration/.llm-usage/gateway-reconciliations/<run_id>.json` with the
+outcome, the evidence, the reservation's cost envelope, the execution proof
+(checkpoint, terminal record path and SHA-256, containment, stop reason) and, for
+`completed`, the response id, usage, cost, and `cost_above_reservation`. A
+`not-found` entry is then released and the release repeats the evidence. A
+`completed` entry is settled through the ledger's normal settle path as a
+`usage` event with the response id, token counts, and cost. Re-applying the same
+manifest is a no-op. Different evidence or usage for an already reconciled
+reservation is refused. Once reconciled, `sprint-controller.py restart-ticket` no
+longer sees the ticket's `reserved_usd`. Until then, its refusal lists each
+blocking reservation id with its run id, projected cost, reservation time, and
+origin.
 
 ### Logical review retries
 
