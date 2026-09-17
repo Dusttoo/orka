@@ -2925,7 +2925,9 @@ class ApiAgent:
                     text = review_text(self.provider, text)
                     try:
                         review = context_pipeline.validate_review_output(
-                            json.loads(text), review_gate
+                            json.loads(text),
+                            review_gate,
+                            reviewed_head=getattr(self, "_active_review_head", "") or None,
                         )
                     except (json.JSONDecodeError, context_pipeline.ContextError) as exc:
                         self._save(

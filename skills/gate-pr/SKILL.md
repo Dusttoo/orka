@@ -146,7 +146,8 @@ worktrees resolve the same shared review ledger and canonical config.
    ledger, blocking and advisory findings
    alike: `review-ledger.py record <pr> --gate code-review --result
    .orchestration/.review-results/code-review.json --head <exact-sha>
-   --phase-permit <token>`. The validated JSON carries
+   --phase-permit <token>` (plus `--ci-evidence <exact-head file>` when it has a
+   `ci_verified` check). The validated JSON carries
    disposition, severity, regression, and explanation. Both concurrent results
    retain the same generation and scope mode regardless of which is recorded
    first. A partial generation cannot return `gates-clear`; every issued gate

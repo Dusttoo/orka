@@ -68,6 +68,12 @@ present, `completed`, and `success` at that head. The Python API exposes the
 same cross-check as keyword-only `reviewed_head=` and `ci_evidence=` arguments
 to `validate_review_output`.
 
+The ledger enforces this. `review-ledger.py record` refuses a result with any
+`ci_verified` check unless it is given `--ci-evidence <file>` captured for the
+exact `--head`, and then runs the full cross-check. `complete-review` and API
+reviewer completion reject a `ci_verified` check citing any head other than
+the one being reviewed.
+
 The schema itself is available through `scripts/context_pipeline.py
 review-schema --gate code-review` (or `security-review`). Result files are
 runtime state and should remain gitignored.

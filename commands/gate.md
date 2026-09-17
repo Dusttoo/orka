@@ -133,6 +133,9 @@ CI-only check `ci_verified` with evidence instead of `not_run`.
      --phase-permit <token>
    ```
 
+   A result with any `ci_verified` check also needs `--ci-evidence <file>`
+   captured for that exact head, or `record` refuses it.
+
    `complete-review` is for desktop reviewers only. An API run through
    `api_agent.py run --review-authorization <token>` completes its own permit
    on success, so go straight to `record` with the same token. A repeated

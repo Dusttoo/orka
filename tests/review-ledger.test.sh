@@ -233,6 +233,38 @@ else
   bad "concurrent gate permits remain completable and recordable in either order"
 fi
 CONCURRENT_LEDGER="$(led open concurrent-permits | field ledger)"
+
+# --- ci_verified checks are bound to exact-head CI evidence at record ---------
+led open ci-verified >/dev/null
+CI_HEAD="$(git -C "$TMP" rev-parse HEAD)"
+CI_OTHER="$(printf 'b%.0s' $(seq 40))"
+CI_PERMIT="$(led permit-review ci-verified --role security-reviewer --head "$CI_HEAD" | field review_phase_permit)"
+ci_review() {
+  printf '{"schema_version":1,"gate":"security-review","verdict":"PASS","checks":[{"name":"CI integration suite","status":"ci_verified","evidence":{"ci_check":"%s","head_sha":"%s"}}],"findings":[]}\n' "$1" "$2" > "$3"
+}
+ci_runs() {
+  printf '{"total_count":1,"check_runs":[{"name":"integration-tests","head_sha":"%s","status":"completed","conclusion":"%s","html_url":"https://github.com/o/r/runs/1"}]}\n' "$CI_HEAD" "$1" > "$2"
+}
+ci_review integration-tests "$CI_OTHER" "$TMP/ci-wrong-head.json"
+if led complete-review ci-verified --role security-reviewer --phase-permit "$CI_PERMIT" --result "$TMP/ci-wrong-head.json" >/dev/null 2>&1; then
+  bad "complete-review rejects ci_verified evidence citing another head"
+else ok "complete-review rejects ci_verified evidence citing another head"; fi
+ci_review integration-tests "$CI_HEAD" "$TMP/ci-review.json"
+led complete-review ci-verified --role security-reviewer --phase-permit "$CI_PERMIT" --result "$TMP/ci-review.json" >/dev/null
+if led record ci-verified --gate security-review --result "$TMP/ci-review.json" --head "$CI_HEAD" --phase-permit "$CI_PERMIT" >/dev/null 2>&1; then
+  bad "record refuses ci_verified checks without --ci-evidence"
+else ok "record refuses ci_verified checks without --ci-evidence"; fi
+ci_runs failure "$TMP/ci-runs-failed.json"
+if led record ci-verified --gate security-review --result "$TMP/ci-review.json" --head "$CI_HEAD" --phase-permit "$CI_PERMIT" --ci-evidence "$TMP/ci-runs-failed.json" >/dev/null 2>&1; then
+  bad "record refuses ci_verified when CI evidence shows the check failed"
+else ok "record refuses ci_verified when CI evidence shows the check failed"; fi
+ci_review never-ran "$CI_HEAD" "$TMP/ci-review-absent.json"
+ci_runs success "$TMP/ci-runs-passed.json"
+if led record ci-verified --gate security-review --result "$TMP/ci-review-absent.json" --head "$CI_HEAD" --phase-permit "$CI_PERMIT" --ci-evidence "$TMP/ci-runs-passed.json" >/dev/null 2>&1; then
+  bad "record refuses ci_verified when the cited check is absent from CI evidence"
+else ok "record refuses ci_verified when the cited check is absent from CI evidence"; fi
+eq "record accepts ci_verified with passing exact-head CI evidence" "PASS" \
+  "$(led record ci-verified --gate security-review --result "$TMP/ci-review.json" --head "$CI_HEAD" --phase-permit "$CI_PERMIT" --ci-evidence "$TMP/ci-runs-passed.json" | field effective_verdict)"
 eq "concurrent gates share one logical review round" "1" \
   "$(python3 -c 'import json,sys; print(len({r["round"] for r in json.load(open(sys.argv[1]))["rounds"]}))' "$CONCURRENT_LEDGER")"
 

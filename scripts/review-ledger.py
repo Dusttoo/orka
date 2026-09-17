@@ -1218,7 +1218,24 @@ def cmd_record(args: argparse.Namespace) -> None:
             )
         try:
             structured = json.loads(Path(args.result).read_text(encoding="utf-8"))
-            context_pipeline.validate_review_output(structured, args.gate)
+            validated = context_pipeline.validate_review_output(structured, args.gate)
+            # A ci_verified check replaces the blocking finding a not_run check
+            # would force, so record is the chokepoint that binds it to CI
+            # results captured for the exact head.
+            if any(
+                check["status"] == context_pipeline.CI_VERIFIED_STATUS
+                for check in validated["checks"]
+            ):
+                if not args.ci_evidence or not args.head:
+                    raise LedgerError(
+                        "ci_verified checks require --ci-evidence captured for the exact head"
+                    )
+                context_pipeline.validate_review_output(
+                    structured,
+                    args.gate,
+                    reviewed_head=args.head,
+                    ci_evidence=context_pipeline.read_ci_evidence_file(args.ci_evidence),
+                )
         except (OSError, json.JSONDecodeError, context_pipeline.ContextError) as exc:
             raise LedgerError(f"invalid structured review result: {exc}") from exc
         args.verdict = structured["verdict"]
@@ -2653,6 +2670,16 @@ def cmd_complete_review(args: argparse.Namespace) -> None:
             .stdout.strip()
             .lower()
         )
+        if gate:
+            try:
+                context_pipeline.validate_review_output(
+                    result, gate, reviewed_head=actual_head
+                )
+            except context_pipeline.ContextError as exc:
+                raise LedgerError(
+                    "invalid completed review result: "
+                    f"{exc}; correct the result and retry with the same phase permit"
+                ) from exc
         root = shared_repository_root(project_root())
         receipt, already_completed = complete_review_permit(
             shared_root=root,
@@ -2740,6 +2767,10 @@ def parser() -> argparse.ArgumentParser:
     )
     record_parser.add_argument(
         "--phase-permit", help="single-use permit with a completed review receipt"
+    )
+    record_parser.add_argument(
+        "--ci-evidence",
+        help="exact-head check-runs JSON; required when the result has ci_verified checks",
     )
     record_parser.set_defaults(func=cmd_record)
 
