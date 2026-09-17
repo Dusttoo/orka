@@ -35,6 +35,27 @@ CLEAN_REVIEW = json.dumps(
 )
 
 
+BLOCKING_REVIEW = json.dumps(
+    {
+        "schema_version": 1,
+        "gate": "code-review",
+        "verdict": "FAIL",
+        "checks": [{"name": "diff", "status": "pass"}],
+        "findings": [
+            {
+                "component": "src/app.py:handler",
+                "disposition": "blocking",
+                "severity": "high",
+                "title": "unchecked input",
+                "explanation": "handler trusts the request body",
+                "regression": False,
+            }
+        ],
+    },
+    separators=(",", ":"),
+)
+
+
 DEFAULT_TEST_BUDGETS = """    max_usd_per_run: 1.00
     max_usd_per_ticket: 2.00
     max_usd_per_sprint: 5.00
@@ -1810,13 +1831,14 @@ self_check:
     def test_review_budget_incident_forces_bounded_final_verdict(self):
         # Nineteen $0.23 tool rounds fit a $5 review once each turn reserves a
         # realistic output bound; the refused twentieth becomes the verdict turn.
+        # A forced FAIL keeps its blocking findings authoritative.
         responses = [self._anthropic_tool_turn(index) for index in range(19)]
         responses.append(
             {
                 "id": "msg_verdict",
                 "stop_reason": "end_turn",
                 "usage": {"input_tokens": 20000, "output_tokens": 300},
-                "content": [{"type": "text", "text": CLEAN_REVIEW}],
+                "content": [{"type": "text", "text": BLOCKING_REVIEW}],
             }
         )
         transport = FakeTransport(responses, count=20000)
@@ -1836,7 +1858,7 @@ self_check:
         )
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["final_turn"], "budget")
-        self.assertEqual(result["review"]["verdict"], "PASS")
+        self.assertEqual(result["review"]["verdict"], "FAIL")
         self.assertEqual(agent.state["final_turn"], "budget")
         self.assertIn(
             "max_usd_per_code_review_phase", agent.state["final_turn_reason"]
@@ -1874,6 +1896,41 @@ self_check:
         permit = self._review_permit_record()
         self.assertTrue(permit.get("completion_receipt"))
         self.assertFalse(permit.get("cancelled_at"))
+
+    def test_forced_final_turn_pass_is_not_authoritative(self):
+        # A PASS written only because budget ran out may rest on partial
+        # evidence, so it must not clear a gate: no receipt, permit released.
+        responses = [self._anthropic_tool_turn(index) for index in range(19)]
+        responses.append(
+            {
+                "id": "msg_verdict",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 20000, "output_tokens": 300},
+                "content": [{"type": "text", "text": CLEAN_REVIEW}],
+            }
+        )
+        transport = FakeTransport(responses, count=20000)
+        agent = self.agent(
+            transport,
+            run_id="incident-forced-pass",
+            budgets=incident_budgets(),
+            pricing=INCIDENT_PRICING,
+        )
+        with self.assertRaisesRegex(api_agent.BudgetError, "not authoritative"):
+            agent.run(
+                {
+                    "model": "test-model",
+                    "max_tokens": 32768,
+                    "system": [],
+                    "messages": [{"role": "user", "content": "review"}],
+                }
+            )
+        self.assertEqual(agent.state["status"], "budget_blocked")
+        self.assertEqual(agent.state["final_turn"], "budget")
+        self.assertEqual(agent.state["review"]["verdict"], "PASS")
+        permit = self._review_permit_record()
+        self.assertFalse(permit.get("completion_receipt"))
+        self.assertTrue(permit.get("cancelled_at"))
 
     def test_full_output_allowance_refuses_review_at_half_budget(self):
         # Reserving the whole 32768-token allowance reproduces the incident:
@@ -2052,7 +2109,7 @@ self_check:
             "choices": [
                 {
                     "finish_reason": "stop",
-                    "message": {"role": "assistant", "content": CLEAN_REVIEW},
+                    "message": {"role": "assistant", "content": BLOCKING_REVIEW},
                 }
             ],
             "usage": {"prompt_tokens": 10, "completion_tokens": 2},
@@ -2062,13 +2119,13 @@ self_check:
                 "id": "msg_verdict",
                 "stop_reason": "end_turn",
                 "usage": {"input_tokens": 10, "output_tokens": 2},
-                "content": [{"type": "text", "text": CLEAN_REVIEW}],
+                "content": [{"type": "text", "text": BLOCKING_REVIEW}],
             },
             "openai": {
                 "id": "resp_verdict",
                 "status": "completed",
                 "usage": {"input_tokens": 10, "output_tokens": 2},
-                "output_text": CLEAN_REVIEW,
+                "output_text": BLOCKING_REVIEW,
                 "output": [],
             },
             "azure_adm": chat_verdict,
@@ -2080,7 +2137,7 @@ self_check:
                 "output": {
                     "message": {
                         "role": "assistant",
-                        "content": [{"text": CLEAN_REVIEW}],
+                        "content": [{"text": BLOCKING_REVIEW}],
                     }
                 },
             },

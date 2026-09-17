@@ -2934,6 +2934,27 @@ class ApiAgent:
                         raise AgentError(
                             f"reviewer returned invalid structured output: {exc}"
                         ) from exc
+                if (
+                    status == "completed"
+                    and final_turn
+                    and review is not None
+                    and review.get("verdict") == "PASS"
+                ):
+                    # A forced turn exists because the review could not finish.
+                    # Its FAIL findings are real, but a PASS may rest on partial
+                    # evidence, so it never earns a receipt; the permit is
+                    # released for a fresh review under a larger budget.
+                    error = (
+                        f"final verdict turn ({final_turn}) returned PASS, which is not "
+                        "authoritative; re-run the review with a larger phase budget"
+                    )
+                    self._save(
+                        status="budget_blocked",
+                        output_text=text,
+                        review=review,
+                        error=error,
+                    )
+                    raise BudgetError(error)
                 if status == "completed" and self.role in REVIEWER_ROLES:
                     completed_result: Any
                     try:

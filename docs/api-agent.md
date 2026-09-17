@@ -192,9 +192,13 @@ of losing its work:
 - At the tool-round limit, pending tool calls are answered as not executed.
 - The request is admitted like any other. If it does not fit either, the run is
   `budget_blocked` as before.
-- The output is validated and receives a completion receipt exactly like a
-  normal review. The run state and result record `final_turn` (`budget` or
-  `max_tool_rounds`) and `final_turn_reason`.
+- A FAIL is validated and receives a completion receipt exactly like a normal
+  review, so its blocking findings reach the repair brief. A PASS is never
+  authoritative: it may rest on partial evidence, so the run ends
+  `budget_blocked`, keeps the verdict in its state for inspection, creates no
+  receipt, and releases the permit for a fresh review under a larger budget.
+  The run state and result record `final_turn` (`budget` or `max_tool_rounds`)
+  and `final_turn_reason`.
 - There is never a second final turn. A final turn that returns tool calls is
   `budget_blocked`, and the review permit is released.
 
