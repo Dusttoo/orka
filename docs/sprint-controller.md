@@ -606,21 +606,42 @@ applied, still-live restart grant can supply this baseline. Ordinary retries,
 requeues, syncs, or checkpoint fields cannot reset the watchdog. Admission checks
 run before reservation, so an already-exhausted watchdog does not consume a launch.
 
-```text
-sudo /usr/local/libexec/orchestration-recovery-authority issue-restart \
-  --repository /absolute/repo --ticket PROJ-123 \
-  --allowances /operator/reviewed-allowances.json \
+Set the values once as shell variables. Do not type angle-bracket placeholders:
+the shell reads `<file>` as an input redirect.
+
+```sh
+REPO=/srv/app/repo                       # checkout the controller runs in
+PLUGIN=/opt/orka                         # Orka plugin root
+HELPER=/usr/local/libexec/orchestration-recovery-authority
+RUNTIME_USER=orchestrator                # user passed to install-operator-authority.sh
+SPRINT=65
+TICKET=PROJ-123
+ALLOWANCES=/root/reviewed-allowances.json
+
+cd "$REPO" && sudo "$HELPER" issue-restart \
+  --repository "$REPO" --ticket "$TICKET" \
+  --allowances "$ALLOWANCES" \
   --reason "Approved bounded continuation after reconciliation" \
   --expires-hours 24 \
-| python3 /absolute/plugin/scripts/sprint-controller.py restart-ticket \
-  --sprint 65 --ticket PROJ-123 --operator-capability-stdin
+| sudo -u "$RUNTIME_USER" python3 "$PLUGIN/scripts/sprint-controller.py" restart-ticket \
+  --sprint "$SPRINT" --ticket "$TICKET" --operator-capability-stdin
 ```
+
+Only the helper runs as root. `restart-ticket` must run as the runtime user from
+inside the repository, because the controller finds
+`.orchestration/config.yaml` from its working directory and writes the runtime
+user's checkpoint. From a root shell without `cd` and `sudo -u`, it looks for
+`/root/.orchestration/config.yaml` and fails with `configuration file not
+found`. The capability goes straight into the pipe and is not saved anywhere. If
+the controller half refuses, fix the cause and run the whole pipeline again to
+issue a new grant.
 
 The checkpoint must already contain the ticket. Restart refuses running,
 completed, or decomposed tickets, unknown execution identities, and outstanding
-provider reservations. Reconcile those first; reservations left by a native
-gateway timeout use the evidence manifest described in
-[API agent runner](api-agent.md#gateway-reservations). An existing PR routes to repair;
+provider reservations. The reservation refusal lists each blocking reservation id
+with its run id, projected cost, reservation time, and origin. Reconcile those
+first; reservations left by a native gateway timeout use the evidence manifest
+described in [API agent runner](api-agent.md#gateway-reservations). An existing PR routes to repair;
 its branch, execution fence, findings, failed reviews, and historical counters
 remain intact. A preserved scoping/product decision remains an operator decision.
 The grant does not authorize a merge, change Jira readiness, satisfy dependencies,

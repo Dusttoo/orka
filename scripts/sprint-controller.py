@@ -4879,6 +4879,29 @@ def requeue(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
     emit({"ticket": key, "state": "pending"})
 
 
+def outstanding_reservation_details(cfg: dict[str, Any], key: str) -> str:
+    """Name each open reservation blocking a ticket so the operator can look it up."""
+    blocking = sorted(
+        (
+            item
+            for item in UsageLedger(cfg["shared_root"]).summary()["open_reservations"]
+            if str(item.get("ticket") or "").strip().upper() == key
+        ),
+        key=lambda item: (str(item.get("timestamp") or ""), str(item.get("reservation_id") or "")),
+    )
+    listed = "; ".join(
+        f"{item.get('reservation_id')} (run {item.get('run_id')}, "
+        f"${item.get('projected_cost_usd')}, reserved {item.get('timestamp')}, "
+        f"origin {item.get('origin') or 'unmarked'})"
+        for item in blocking
+    )
+    return (
+        (listed or "see api_agent.py usage")
+        + ". Check each request with the provider, then use api_agent.py "
+        "reservation-migration-plan and reconcile-reservations"
+    )
+
+
 def restart_ticket(args, cfg):
     """Activate an operator allowance without deleting work or counters."""
     path = state_path(cfg["state_dir"], str(args.sprint))
@@ -4912,7 +4935,8 @@ def restart_ticket(args, cfg):
         usage = usage_snapshots(cfg).get(key, {})
         if usage.get("reserved_usd", 0):
             raise SprintError(
-                "restart requires reconciliation of outstanding provider reservations"
+                "restart requires reconciliation of outstanding provider reservations: "
+                + outstanding_reservation_details(cfg, key)
             )
         try:
             token = operator_capability(args)

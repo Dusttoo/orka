@@ -577,7 +577,9 @@ class GatewayReservationReconciliationTests(unittest.TestCase):
                        check=True)
         (self.root / ".orchestration").mkdir()
         (self.root / ".orchestration" / "config.yaml").write_text(
-            "sprint_checkpoint_dir: .orchestration/.sprint-state\n")
+            "sprint_checkpoint_dir: .orchestration/.sprint-state\n"
+            "llm:\n  pricing:\n    test:\n      input_per_mtok: 1\n      cache_write_per_mtok: 1\n"
+            "      cache_read_per_mtok: 1\n      output_per_mtok: 1\n")
         self.controller = api_agent.load_sprint_controller()
         self.state_dir = self.root / ".orchestration" / ".sprint-state"
         self.checkpoint = self.controller.state_path(self.state_dir, "65")
@@ -630,19 +632,26 @@ class GatewayReservationReconciliationTests(unittest.TestCase):
             self.controller.write_json(tombstone_path, record)
         return identity
 
+    def evidence_for(self, reservation_id):
+        # Evidence must name the reservation it was gathered for.
+        return f"{self.EVIDENCE} Searched for {reservation_id}."
+
     def manifest(self, entries=None, evidence=None, **overrides):
         plan = self.api_agent.reservation_migration_plan(self.root)
         chosen = entries if entries is not None else plan["entries"]
         for entry in chosen:
-            entry["evidence"] = self.EVIDENCE if evidence is None else evidence
+            entry["evidence"] = (self.evidence_for(entry["reservation_id"])
+                                 if evidence is None else evidence)
+            entry["outcome"] = entry.get("outcome") or "not-found"
             entry.update(overrides)
         plan["entries"] = chosen
         path = self.root / ".orchestration" / "reservation-migration.json"
         path.write_text(json.dumps(plan), encoding="utf-8")
         return path
 
-    def reconcile(self, path, apply=False):
-        args = argparse.Namespace(manifest=str(path), apply=apply)
+    def reconcile(self, path, apply=False, accept_above=()):
+        args = argparse.Namespace(manifest=str(path), apply=apply,
+                                  accept_cost_above_reservation=list(accept_above))
         return self.api_agent.reconcile_reservation_manifest(args, self.root)
 
     def open_ids(self):
@@ -684,7 +693,7 @@ class GatewayReservationReconciliationTests(unittest.TestCase):
         self.assertEqual((audit["ticket"], audit["sprint"]), ("BL-1760", "65"))
         record = audit["reservations"][self.reservation]
         self.assertEqual(record["outcome"], "not-found")
-        self.assertEqual(record["evidence"], self.EVIDENCE)
+        self.assertEqual(record["evidence"], self.evidence_for(self.reservation))
         self.assertEqual(record["execution"]["unit_status"], "absent")
         self.assertEqual(record["execution"]["stop_reason"], self.TIMEOUT)
         self.assertEqual(Path(record["execution"]["tombstone"]),
@@ -693,7 +702,7 @@ class GatewayReservationReconciliationTests(unittest.TestCase):
         releases = [e for e in UsageLedger(self.root).snapshot()
                     if e.get("kind") == "release" and e.get("reservation_id") == self.reservation]
         self.assertEqual(len(releases), 1)
-        self.assertIn(self.EVIDENCE, releases[0]["reason"])
+        self.assertIn(self.evidence_for(self.reservation), releases[0]["reason"])
 
     def test_reapply_is_idempotent_and_evidence_is_immutable(self):
         path = self.manifest()
@@ -707,7 +716,7 @@ class GatewayReservationReconciliationTests(unittest.TestCase):
                     if e.get("kind") == "release" and e.get("reservation_id") == self.reservation]
         self.assertEqual(len(releases), 1)
         changed = json.loads(path.read_text(encoding="utf-8"))
-        changed["entries"][0]["evidence"] = "a different story"
+        changed["entries"][0]["evidence"] = f"A different story about {self.reservation}."
         path.write_text(json.dumps(changed), encoding="utf-8")
         with self.assertRaisesRegex(AgentError, "not bound to open reservation"):
             self.reconcile(path, apply=True)
@@ -799,7 +808,7 @@ class GatewayReservationReconciliationTests(unittest.TestCase):
     def test_manifest_shape_refusals_are_preserved(self):
         entry = dict(run_id=self.invocation, reservation_id=self.reservation, outcome="not-found")
         with self.assertRaisesRegex(AgentError, "requires a valid run"):
-            self.reconcile(self.manifest([dict(entry)], outcome="completed"), apply=True)
+            self.reconcile(self.manifest([dict(entry)], outcome="released"), apply=True)
         with self.assertRaisesRegex(AgentError, "requires a valid run"):
             self.reconcile(self.manifest([dict(entry)], evidence="   "), apply=True)
         with self.assertRaisesRegex(AgentError, "duplicate reservation"):
@@ -811,6 +820,168 @@ class GatewayReservationReconciliationTests(unittest.TestCase):
         with self.assertRaisesRegex(AgentError, "inside the repository"):
             self.reconcile(outside / "manifest.json", apply=True)
         self.assertIn(self.reservation, self.open_ids())
+
+    def legacy_reservation(self, ticket, invocation, timestamp, projected="0.7174775"):
+        reservation = "resv_" + invocation[::-1]
+        UsageLedger(self.root).append({
+            "kind": "reservation", "logical_review_id": None, "timestamp": timestamp,
+            "reservation_id": reservation, "run_id": invocation, "role": "implementer",
+            "phase": "implementation", "ticket": ticket, "sprint": "65", "provider": "anthropic",
+            "model": "test", "projected_cost_usd": projected})
+        self.launch(ticket, invocation)
+        return reservation
+
+    def test_plan_leaves_gateway_outcome_and_evidence_to_the_operator(self):
+        plan = self.api_agent.reservation_migration_plan(self.root)
+        entry = plan["entries"][0]
+        self.assertEqual((entry["outcome"], entry["evidence"]), ("", ""))
+        reserved = next(e for e in UsageLedger(self.root).snapshot()
+                        if e.get("reservation_id") == self.reservation)
+        self.assertEqual(entry["request"]["reserved_at"], reserved["timestamp"])
+        self.assertEqual(entry["request"]["ticket"], "BL-1760")
+        self.assertIn(self.reservation, entry["evidence_must_name"])
+        path = self.root / ".orchestration" / "reservation-migration.json"
+        path.write_text(json.dumps(plan), encoding="utf-8")
+        with self.assertRaisesRegex(AgentError, "outcome"):
+            self.reconcile(path, apply=True)
+        self.assertIn(self.reservation, self.open_ids())
+
+    def test_copied_evidence_cannot_release_a_reservation_nobody_checked(self):
+        # The incident: one console search covered 22:36-22:46, but the same
+        # sentence was pasted onto BL-1762's 22:49 reservation as well.
+        import uuid
+        self.tickets.clear()
+        UsageLedger(self.root).release(self.reservation, self.invocation, "test setup")
+        checked = self.legacy_reservation("BL-1726", uuid.uuid4().hex, "2026-09-12T22:36:32.265414+00:00")
+        unchecked = self.legacy_reservation("BL-1762", uuid.uuid4().hex, "2026-09-12T22:49:10.001+00:00")
+        plan = self.api_agent.reservation_migration_plan(self.root)
+        self.assertEqual({e["reservation_id"] for e in plan["entries"]}, {checked, unchecked})
+        refusals = {
+            "range": "Anthropic Console logs searched 2026-09-12 22:30-22:50 UTC; no request found.",
+            "one time only": "Anthropic Console 2026-09-12 22:36 UTC: no request found.",
+            "placeholder": "TODO: 2026-09-12 22:36 and 22:49 UTC console check",
+            "template": "<console search for 2026-09-12 22:36 22:49>",
+            "too short": "22:36 22:49 2026-09-12",
+        }
+        for label, text in refusals.items():
+            with self.subTest(label):
+                with self.assertRaisesRegex(AgentError, "evidence"):
+                    self.reconcile(self.manifest(evidence=text), apply=True)
+                self.assertEqual(self.open_ids(), {checked, unchecked})
+        # The same sentence is accepted once it names every reservation it covers.
+        both = "Anthropic Console searched 2026-09-12: no request at 22:36 or 22:49 UTC."
+        self.reconcile(self.manifest(evidence=both), apply=True)
+        self.assertEqual(self.open_ids(), set())
+
+    def test_per_reservation_evidence_by_id_is_accepted(self):
+        import uuid
+        other = uuid.uuid4().hex
+        other_reservation = self.gateway_timeout("BL-1724", other)
+        self.launch("BL-1724", other)
+        with self.assertRaisesRegex(AgentError, other_reservation):
+            self.reconcile(self.manifest(evidence=self.evidence_for(self.reservation)), apply=True)
+        self.assertEqual(self.open_ids(), {self.reservation, other_reservation})
+        self.reconcile(self.manifest(), apply=True)
+        self.assertEqual(self.open_ids(), set())
+
+    def completed_entry(self, **fields):
+        entry = dict(run_id=self.invocation, reservation_id=self.reservation, outcome="completed",
+                     response_id="msg_01CompletedAfterTimeout", input_tokens=50,
+                     cache_write_tokens=10, cache_read_tokens=20, output_tokens=60)
+        entry.update(fields)
+        return entry
+
+    def test_completed_gateway_request_settles_actual_usage_with_audit(self):
+        path = self.manifest([self.completed_entry()])
+        validated = self.reconcile(path)
+        self.assertEqual(validated["applied_runs"], [])
+        self.assertIn(self.reservation, self.open_ids())
+        self.reconcile(path, apply=True)
+        self.assertNotIn(self.reservation, self.open_ids())
+        usage = [e for e in UsageLedger(self.root).snapshot()
+                 if e.get("kind") == "usage" and e.get("reservation_id") == self.reservation]
+        self.assertEqual(len(usage), 1)
+        self.assertEqual(usage[0]["response_id"], "msg_01CompletedAfterTimeout")
+        self.assertEqual((usage[0]["input_tokens"], usage[0]["cache_write_tokens"],
+                          usage[0]["cache_read_tokens"], usage[0]["output_tokens"]), (50, 10, 20, 60))
+        self.assertEqual(Decimal(usage[0]["cost_usd"]), Decimal("0.00014"))
+        self.assertEqual((usage[0]["ticket"], usage[0]["sprint"], usage[0]["run_id"]),
+                         ("BL-1760", "65", self.invocation))
+        self.assertFalse(any(e.get("kind") == "release" and e.get("reservation_id") == self.reservation
+                             for e in UsageLedger(self.root).snapshot()))
+        record = json.loads(self.audit_path().read_text(encoding="utf-8"))["reservations"][self.reservation]
+        self.assertEqual(record["outcome"], "completed")
+        self.assertEqual(record["response_id"], "msg_01CompletedAfterTimeout")
+        self.assertEqual(Decimal(record["cost_usd"]), Decimal("0.00014"))
+        self.assertFalse(record["cost_above_reservation"])
+        self.assertEqual(record["execution"]["unit_status"], "absent")
+        # Re-applying is a no-op; changed usage for a settled reservation is refused.
+        self.reconcile(path, apply=True)
+        self.assertEqual(len([e for e in UsageLedger(self.root).snapshot()
+                              if e.get("kind") == "usage" and e.get("reservation_id") == self.reservation]), 1)
+        with self.assertRaisesRegex(AgentError, "not bound to open reservation"):
+            self.reconcile(self.manifest([self.completed_entry(output_tokens=61)]), apply=True)
+
+    def test_completed_gateway_entry_requires_complete_provider_usage(self):
+        cases = {
+            "response id": self.completed_entry(response_id=""),
+            "cache read": {k: v for k, v in self.completed_entry().items() if k != "cache_read_tokens"},
+            "negative": self.completed_entry(output_tokens=-1),
+            "boolean": self.completed_entry(input_tokens=True),
+            "zero usage": self.completed_entry(input_tokens=0, cache_write_tokens=0,
+                                               cache_read_tokens=0, output_tokens=0),
+            "not-found with usage": self.completed_entry(outcome="not-found"),
+        }
+        for label, entry in cases.items():
+            with self.subTest(label):
+                with self.assertRaises(AgentError):
+                    self.reconcile(self.manifest([entry]), apply=True)
+        self.assertIn(self.reservation, self.open_ids())
+        self.assertFalse(self.audit_path().exists())
+
+    def test_completed_gateway_entry_still_requires_stopped_unit(self):
+        identity = self.controller.process_identity(str(os.getpid()))
+        self.tickets.clear()
+        self.launch("BL-1760", self.invocation, pid=identity["pid"],
+                    start_identity=identity["start_identity"])
+        with self.assertRaisesRegex(AgentError, "live"):
+            self.reconcile(self.manifest([self.completed_entry()]), apply=True)
+        self.assertIn(self.reservation, self.open_ids())
+        self.assertFalse(self.audit_path().exists())
+
+    def test_completed_cost_above_projection_requires_explicit_acceptance(self):
+        # Projected worst case is (100 input + 100 output) at $1/MTok = $0.0002.
+        entry = self.completed_entry(input_tokens=5000, cache_write_tokens=0, cache_read_tokens=0,
+                                     output_tokens=100)
+        path = self.manifest([entry])
+        with self.assertRaisesRegex(AgentError, "above the reservation"):
+            self.reconcile(path, apply=True)
+        self.assertIn(self.reservation, self.open_ids())
+        self.assertFalse(self.audit_path().exists())
+        with self.assertRaisesRegex(AgentError, "not in the manifest"):
+            self.reconcile(path, apply=True, accept_above=["resv_" + "0" * 32])
+        self.reconcile(path, apply=True, accept_above=[self.reservation])
+        usage = next(e for e in UsageLedger(self.root).snapshot()
+                     if e.get("kind") == "usage" and e.get("reservation_id") == self.reservation)
+        self.assertEqual(Decimal(usage["cost_usd"]), Decimal("0.0051"))
+        record = json.loads(self.audit_path().read_text(encoding="utf-8"))["reservations"][self.reservation]
+        self.assertTrue(record["cost_above_reservation"])
+        self.assertEqual(Decimal(record["projected_cost_usd"]), Decimal("0.0002"))
+
+    def test_completed_response_id_cannot_settle_two_reservations(self):
+        import uuid
+        other = uuid.uuid4().hex
+        other_reservation = self.gateway_timeout("BL-1724", other)
+        self.launch("BL-1724", other)
+        entries = [self.completed_entry(),
+                   self.completed_entry(run_id=other, reservation_id=other_reservation)]
+        with self.assertRaisesRegex(AgentError, "response"):
+            self.reconcile(self.manifest(entries), apply=True)
+        self.reconcile(self.manifest([self.completed_entry()]), apply=True)
+        with self.assertRaisesRegex(AgentError, "response"):
+            self.reconcile(self.manifest([self.completed_entry(
+                run_id=other, reservation_id=other_reservation)]), apply=True)
+        self.assertEqual(self.open_ids(), {other_reservation})
 
     def test_non_gateway_or_ambiguous_origins_are_refused(self):
         ledger = UsageLedger(self.root)
@@ -842,7 +1013,7 @@ class GatewayReservationReconciliationTests(unittest.TestCase):
                                   "--repo", str(self.root)], capture_output=True, text=True, check=True)
         plan = json.loads(planned.stdout)
         self.assertEqual([entry["source"] for entry in plan["entries"]], ["native-gateway"])
-        plan["entries"][0]["evidence"] = self.EVIDENCE
+        plan["entries"][0].update(outcome="not-found", evidence=self.evidence_for(self.reservation))
         path = self.root / ".orchestration" / "reservation-migration.json"
         path.write_text(json.dumps(plan), encoding="utf-8")
         command = [sys.executable, str(script), "reconcile-reservations", "--repo", str(self.root),
@@ -867,8 +1038,13 @@ class GatewayReservationReconciliationTests(unittest.TestCase):
         args = argparse.Namespace(sprint="65", ticket="BL-1760", operator_capability="")
         with patch.object(self.controller, "authorized_restart_grant", return_value=grant):
             self.assertGreater(self.controller.usage_snapshots(cfg)["BL-1760"]["reserved_usd"], 0)
-            with self.assertRaisesRegex(self.controller.SprintError, "outstanding provider reservations"):
+            with self.assertRaisesRegex(self.controller.SprintError,
+                                        "outstanding provider reservations") as refused:
                 self.controller.restart_ticket(args, cfg)
+            message = str(refused.exception)
+            self.assertIn(self.reservation, message)
+            self.assertIn(f"run {self.invocation}", message)
+            self.assertIn("$0.0002", message)
             self.reconcile(self.manifest(), apply=True)
             self.assertEqual(self.controller.usage_snapshots(cfg)["BL-1760"]["reserved_usd"], 0)
             with contextlib.redirect_stdout(io.StringIO()) as output:
