@@ -107,6 +107,21 @@ for file in skills/orchestrate-ticket/SKILL.md skills/gate-pr/SKILL.md commands/
   require_text "$file" "version_policy.py" "review workflows enforce repository minimum Orka version"
 done
 
+for file in skills/gate-pr/SKILL.md commands/gate.md docs/review-loop.md; do
+  require_text "$file" "record-security-gate" \
+    "the security-gate decision is bound to the review generation"
+  require_text "$file" "git worktree add --detach" \
+    "reviews of a PR head outside the checkout use a detached worktree"
+done
+for file in skills/gate-pr/SKILL.md commands/gate.md; do
+  require_text "$file" '`complete-review` is for desktop' \
+    "API reviewer runs record directly instead of re-completing their permit"
+  require_text "$file" "configured \`gates:\`" \
+    "configured gates are required regardless of issued permits"
+done
+require_text docs/review-loop.md "correct-repair-head" \
+  "abbreviated legacy repair heads have a documented recovery"
+
 require_text scripts/review-ledger.py "assert_minimum_version" \
   "review permits enforce repository minimum Orka version mechanically"
 require_text scripts/merge-guard.sh "orch_assert_minimum_version" \

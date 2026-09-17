@@ -158,11 +158,39 @@ def complete(
     timestamp: str,
     desktop: bool = False,
 ) -> str:
-    """Create a digest-bound completion receipt after successful review output.
+    """Create a digest-bound completion receipt after successful review output."""
+    return complete_with_status(
+        shared_root=shared_root,
+        ledger_dir=ledger_dir,
+        pr=pr,
+        token=token,
+        role=role,
+        head=head,
+        result=result,
+        timestamp=timestamp,
+        desktop=desktop,
+    )[0]
+
+
+def complete_with_status(
+    *,
+    shared_root: Path,
+    ledger_dir: str,
+    pr: str,
+    token: str,
+    role: str,
+    head: str,
+    result: Any,
+    timestamp: str,
+    desktop: bool = False,
+) -> tuple[str, bool]:
+    """Complete a permit, returning its receipt and whether it already existed.
 
     API reviewers must have started their permit first. A desktop reviewer uses
     this controller-owned atomic transition to start and complete the same
-    single permit after its structured result exists.
+    single permit after its structured result exists. The API runner completes
+    its own permit, so a repeated completion for the same role, head, and
+    identical result digest returns that unconsumed receipt instead of failing.
     """
     path = ledger_path(shared_root, ledger_dir, pr)
     lock_path = path.with_suffix(path.suffix + ".lock")
@@ -172,15 +200,15 @@ def complete(
         state = json.loads(path.read_text(encoding="utf-8"))
         permits = state.get("review_permits", [])
         permit = next((item for item in permits if item.get("token") == token), None)
-        if (
-            not permit
-            or permit.get("completion_receipt")
-            or permit.get("cancelled_at")
-            or permit.get("superseded_at")
-            or permit.get("receipt_consumed_at")
-        ):
+        if not permit:
+            raise ReviewPermitError("review phase permit is missing")
+        if permit.get("cancelled_at") or permit.get("superseded_at"):
             raise ReviewPermitError(
-                "review phase permit is missing or already completed"
+                "review phase permit was cancelled or superseded and cannot complete"
+            )
+        if permit.get("receipt_consumed_at"):
+            raise ReviewPermitError(
+                "review phase permit completion was already recorded in the ledger"
             )
         expected = {
             "work_subject": state.get("work_subject"),
@@ -193,6 +221,13 @@ def complete(
             )
         if permit.get("review_generation", 1) != state.get("review_generation", 1):
             raise ReviewPermitError("review phase changed after this permit was issued")
+        if permit.get("completion_receipt"):
+            if permit.get("result_sha256") != digest:
+                raise ReviewPermitError(
+                    "review phase permit already completed with a different result "
+                    "digest; record the result the reviewer originally completed"
+                )
+            return str(permit["completion_receipt"]), True
         if not permit.get("started_at"):
             if not desktop:
                 raise ReviewPermitError(
@@ -210,7 +245,7 @@ def complete(
             }
         )
         _save(path, state)
-    return receipt
+    return receipt, False
 
 
 def cancel_started(

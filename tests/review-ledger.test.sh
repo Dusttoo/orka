@@ -12,11 +12,18 @@ eq() { if [ "$2" = "$3" ]; then ok "$1"; else printf 'FAIL %s\n     want: [%s]\n
 
 TMP="$(mktemp -d)"
 LANE="${TMP}-lane"
-trap 'rm -rf "$TMP" "$LANE"' EXIT
+REVIEW_WT="${TMP}-review"
+trap 'rm -rf "$TMP" "$LANE" "$REVIEW_WT"' EXIT
 git -C "$TMP" init -q .
 git -C "$TMP" -c user.name=Test -c user.email=test@example.com commit --allow-empty -qm initial
 mkdir -p "$TMP/.orchestration"
-printf 'minimum_orka_version: ""\n' > "$TMP/.orchestration/config.yaml"
+CODE_GATE=$'gates:\n  - code-review\n'
+BOTH_GATES=$'gates:\n  - code-review\n  - security-review\n'
+write_config() { printf 'minimum_orka_version: %s\n%s' "${2:-\"\"}" "$1" > "$TMP/.orchestration/config.yaml"; }
+# Most scenarios below exercise one gate; configured-gate enforcement has its own section.
+write_config "$CODE_GATE"
+# A real, unreachable commit id that does not move HEAD.
+fake_commit() { git -C "$TMP" -c user.name=Test -c user.email=test@example.com commit-tree 'HEAD^{tree}' -p HEAD -m "$1"; }
 
 led() { (cd "$TMP" && python3 "$LEDGER" "$@"); }
 field() { python3 -c "import json,sys; v=json.load(sys.stdin)['$1']; print(','.join(v) if isinstance(v,list) else v)"; }
@@ -151,11 +158,12 @@ eq "the initial generation remains full-authority until a repair is recorded" \
   "full-authority" "$(printf '%s' "$out" | field next_scope_mode)"
 
 # --- the scope freeze ---------------------------------------------------------
-cat > "$TMP/scope-repair.json" <<'JSON'
-{"schema_version":1,"head":"abcdef2","findings":[{"component":"src/a.ts:foo","status":"closed","root_cause":"wrong branch","change":"corrected branch","verification":"named regression passes"},{"component":"src/b.ts:bar","status":"closed","root_cause":"missing guard","change":"added guard","verification":"guard regression passes"}]}
+SCOPE_REPAIR_HEAD="$(fake_commit scope-repair)"
+cat > "$TMP/scope-repair.json" <<JSON
+{"schema_version":1,"head":"$SCOPE_REPAIR_HEAD","findings":[{"component":"src/a.ts:foo","status":"closed","root_cause":"wrong branch","change":"corrected branch","verification":"named regression passes"},{"component":"src/b.ts:bar","status":"closed","root_cause":"missing guard","change":"added guard","verification":"guard regression passes"}]}
 JSON
 led record-repair 2 --report "$TMP/scope-repair.json" >/dev/null
-out="$(led record 2 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' --blocking 'src/new.ts:nit' --head abcdef2)"
+out="$(led record 2 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' --blocking 'src/new.ts:nit' --head "$SCOPE_REPAIR_HEAD")"
 eq "a new non-regression finding is demoted in a frozen round" "src/new.ts:nit" "$(printf '%s' "$out" | field demoted_to_advisory)"
 eq "a known component still blocks in a frozen round" "src/a.ts:foo" "$(printf '%s' "$out" | field accepted_blocking)"
 led complete-repair-review 2 >/dev/null
@@ -165,13 +173,14 @@ eq "the blocking set shrank" "src/a.ts:foo" "$(led status 2 | field open_blockin
 
 led open 3 >/dev/null
 led record 3 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' >/dev/null
-cat > "$TMP/regression-repair.json" <<'JSON'
-{"schema_version":1,"head":"abcdef3","findings":[{"component":"src/a.ts:foo","status":"closed","root_cause":"wrong branch","change":"corrected branch","verification":"named regression passes"}]}
+REGRESSION_REPAIR_HEAD="$(fake_commit regression-repair)"
+cat > "$TMP/regression-repair.json" <<JSON
+{"schema_version":1,"head":"$REGRESSION_REPAIR_HEAD","findings":[{"component":"src/a.ts:foo","status":"closed","root_cause":"wrong branch","change":"corrected branch","verification":"named regression passes"}]}
 JSON
 led record-repair 3 --report "$TMP/regression-repair.json" >/dev/null
 eq "a declared regression keeps blocking authority in a frozen round" \
   "src/a.ts:foo,src/broke.ts:oops" \
-  "$(led record 3 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' --blocking 'src/broke.ts:oops' --regression 'src/broke.ts:oops' --head abcdef3 | field accepted_blocking)"
+  "$(led record 3 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' --blocking 'src/broke.ts:oops' --regression 'src/broke.ts:oops' --head "$REGRESSION_REPAIR_HEAD" | field accepted_blocking)"
 
 # --- the security gate is never scope-frozen ----------------------------------
 led open 4 >/dev/null
@@ -191,14 +200,15 @@ eq "aggregate resolves only after every owning gate clears its claim" "" \
 led open staged-generation >/dev/null
 led record staged-generation --gate code-review --verdict FAIL --blocking 'src/staged.py:check' >/dev/null
 led record staged-generation --gate security-review --verdict FAIL --blocking 'src/staged.py:check' >/dev/null
-cat > "$TMP/staged-repair.json" <<'JSON'
-{"schema_version":1,"head":"abcdef9","findings":[{"component":"src/staged.py:check","status":"closed","root_cause":"shared boundary","change":"fixed shared boundary","verification":"both gate regressions pass"}]}
+STAGED_REPAIR_HEAD="$(fake_commit staged-repair)"
+cat > "$TMP/staged-repair.json" <<JSON
+{"schema_version":1,"head":"$STAGED_REPAIR_HEAD","findings":[{"component":"src/staged.py:check","status":"closed","root_cause":"shared boundary","change":"fixed shared boundary","verification":"both gate regressions pass"}]}
 JSON
 led record-repair staged-generation --report "$TMP/staged-repair.json" >/dev/null
-led record staged-generation --gate security-review --verdict FAIL --head abcdef9 >/dev/null
+led record staged-generation --gate security-review --verdict FAIL --head "$STAGED_REPAIR_HEAD" >/dev/null
 eq "partial generation does not finalize component claims" "src/staged.py:check" \
   "$(led status staged-generation | field open_blocking)"
-led record staged-generation --gate code-review --verdict FAIL --head abcdef9 >/dev/null
+led record staged-generation --gate code-review --verdict FAIL --head "$STAGED_REPAIR_HEAD" >/dev/null
 eq "all gate results remain staged until explicit generation finalization" "src/staged.py:check" \
   "$(led status staged-generation | field open_blocking)"
 eq "finalization applies every gate claim atomically" "" \
@@ -343,11 +353,11 @@ if led rebind-generation rebind-blocked --head "$BLOCKED_REBIND_HEAD" --reason '
 else ok "new-head rebind cannot bypass open blocking findings"; fi
 
 led open minimum-version-review >/dev/null
-printf 'minimum_orka_version: 99.0.0\n' > "$TMP/.orchestration/config.yaml"
+write_config "$CODE_GATE" 99.0.0
 if led permit-review minimum-version-review --role code-reviewer --head "$BLOCKED_REBIND_HEAD" >/dev/null 2>&1; then
   bad "review permits fail closed below the repository minimum Orka version"
 else ok "review permits fail closed below the repository minimum Orka version"; fi
-printf 'minimum_orka_version: ""\n' > "$TMP/.orchestration/config.yaml"
+write_config "$CODE_GATE"
 
 # Recreate the exact legacy corruption: security PASS was stored as round one,
 # then code FAIL was scope-frozen as round two and its blocker became advisory.
@@ -392,29 +402,31 @@ else ok "cancelled permit cannot complete"; fi
 # --- explicit repairs, redesign, and the cap ----------------------------------
 led open 5 --max-rounds 2 >/dev/null
 STALE_HEAD="$(git -C "$TMP" rev-parse HEAD)"
+REPAIR_ONE_HEAD="$(fake_commit repair-one)"
+REPAIR_TWO_HEAD="$(fake_commit repair-two)"
 STALE_PERMIT="$(led permit-review 5 --role code-reviewer --head "$STALE_HEAD" | field review_phase_permit)"
-led record 5 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' --head abcdef1 >/dev/null
+led record 5 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' --head "$REPAIR_ONE_HEAD" >/dev/null
 led repair-brief 5 | grep -q 'stable finding ID' && ok "repair brief carries stable IDs" || bad "repair brief carries stable IDs"
-cat > "$TMP/repair-1.json" <<'JSON'
-{"schema_version":1,"head":"abcdef1","findings":[{"component":"src/a.ts:foo","status":"closed","root_cause":"wrong branch","change":"corrected branch","verification":"named regression passes"}]}
+cat > "$TMP/repair-1.json" <<JSON
+{"schema_version":1,"head":"$REPAIR_ONE_HEAD","findings":[{"component":"src/a.ts:foo","status":"closed","root_cause":"wrong branch","change":"corrected branch","verification":"named regression passes"}]}
 JSON
 eq "recording a repair starts a pending review" "True" "$(led record-repair 5 --report "$TMP/repair-1.json" | field repair_pending_review)"
 if led complete-review 5 --role code-reviewer --phase-permit "$STALE_PERMIT" --result "$TMP/concurrent-code.json" >/dev/null 2>&1; then
   bad "superseded generation permit cannot complete"
 else ok "superseded generation permit cannot complete"; fi
-if led record 5 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' --head abcdef2 >/dev/null 2>&1; then
+if led record 5 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' --head "$REPAIR_TWO_HEAD" >/dev/null 2>&1; then
   bad "a reviewer cannot record against the wrong repaired head"
 else ok "a reviewer cannot record against the wrong repaired head"; fi
-led record 5 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' --head abcdef1 >/dev/null
+led record 5 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' --head "$REPAIR_ONE_HEAD" >/dev/null
 eq "a repaired head must complete its required gate set" \
   "redesign" "$(led complete-repair-review 5 | field next_action)"
 eq "a passing design gate releases the component for another fix" \
   "review" "$(led redesign 5 --key 'src/a.ts:foo' --verdict PASS | field next_action)"
-cat > "$TMP/repair-2.json" <<'JSON'
-{"schema_version":1,"head":"abcdef2","findings":[{"component":"src/a.ts:foo","status":"closed","root_cause":"boundary missed","change":"fixed boundary","verification":"boundary regression passes"}]}
+cat > "$TMP/repair-2.json" <<JSON
+{"schema_version":1,"head":"$REPAIR_TWO_HEAD","findings":[{"component":"src/a.ts:foo","status":"closed","root_cause":"boundary missed","change":"fixed boundary","verification":"boundary regression passes"}]}
 JSON
 led record-repair 5 --report "$TMP/repair-2.json" >/dev/null
-led record 5 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' --head abcdef2 >/dev/null
+led record 5 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' --head "$REPAIR_TWO_HEAD" >/dev/null
 eq "spending the round cap with findings open stops the loop" \
   "escalate-human" "$(led complete-repair-review 5 | field next_action)"
 if led record 5 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' >/dev/null 2>&1; then
@@ -550,12 +562,13 @@ if led brief 7 | grep -q 'Key every finding as `\[component:'; then
   bad "review brief does not instruct reviewers to wrap JSON component keys"
 else ok "review brief does not instruct reviewers to wrap JSON component keys"; fi
 led brief 7 | grep -q "Investigate uncertainty before the verdict" && ok "round 1 briefs require evidence before blocking" || bad "round 1 briefs require evidence before blocking"
-led record 7 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' --head abcdef7 >/dev/null
-cat > "$TMP/repair-7.json" <<'JSON'
-{"schema_version":1,"head":"abcdef7","findings":[{"component":"src/a.ts:foo","status":"closed","root_cause":"bad condition","change":"fixed condition","verification":"regression passes"}]}
+REPAIR_SEVEN_HEAD="$(fake_commit repair-seven)"
+led record 7 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' --head "$REPAIR_SEVEN_HEAD" >/dev/null
+cat > "$TMP/repair-7.json" <<JSON
+{"schema_version":1,"head":"$REPAIR_SEVEN_HEAD","findings":[{"component":"src/a.ts:foo","status":"closed","root_cause":"bad condition","change":"fixed condition","verification":"regression passes"}]}
 JSON
 led record-repair 7 --report "$TMP/repair-7.json" >/dev/null
-led record 7 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' --head abcdef7 >/dev/null
+led record 7 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' --head "$REPAIR_SEVEN_HEAD" >/dev/null
 led complete-repair-review 7 >/dev/null
 led brief 7 | grep -q "ADVISORY and name the exact evidence" && ok "round 3 briefs advisory-on-doubt" || bad "round 3 briefs advisory-on-doubt"
 led brief 7 | grep -q "REDESIGN REQUIRED" && ok "the brief flags a component needing redesign" || bad "the brief flags a component needing redesign"
@@ -636,11 +649,12 @@ eq "direct recording resolves persisted aliases" "src/a.ts:canonical" \
   "$(led record recorded-alias --gate code-review --verdict FAIL --blocking 'src/a.ts:old' | field accepted_blocking)"
 eq "direct recording cannot recreate an aliased component" "src/a.ts:canonical" \
   "$(led status recorded-alias | python3 -c 'import json,sys; print(",".join(sorted(json.load(sys.stdin)["components"])))')"
-cat > "$TMP/recorded-alias-repair.json" <<'JSON'
-{"schema_version":1,"head":"abcdef8","findings":[{"component":"src/a.ts:canonical","status":"closed","root_cause":"drift","change":"canonicalized","verification":"alias regression"}]}
+ALIAS_REPAIR_HEAD="$(fake_commit alias-repair)"
+cat > "$TMP/recorded-alias-repair.json" <<JSON
+{"schema_version":1,"head":"$ALIAS_REPAIR_HEAD","findings":[{"component":"src/a.ts:canonical","status":"closed","root_cause":"drift","change":"canonicalized","verification":"alias regression"}]}
 JSON
 led record-repair recorded-alias --report "$TMP/recorded-alias-repair.json" >/dev/null
-led record recorded-alias --gate code-review --verdict FAIL --blocking 'src/a.ts:old' --head abcdef8 >/dev/null
+led record recorded-alias --gate code-review --verdict FAIL --blocking 'src/a.ts:old' --head "$ALIAS_REPAIR_HEAD" >/dev/null
 led complete-repair-review recorded-alias >/dev/null
 eq "staged recording resolves persisted aliases" "src/a.ts:canonical" \
   "$(led status recorded-alias | field open_blocking)"
@@ -653,6 +667,262 @@ eq "v0.7 failed passes retain their spent repair budget" "1" "$(led status legac
 if led --ledger-dir "$TMP/fresh-ledger" open escape >/dev/null 2>&1; then
   bad "absolute review ledger override must fail closed"
 else ok "absolute review ledger override fails closed"; fi
+
+# --- configured gates are required whether or not a permit was issued ---------
+# Required gates used to be derived only from issued permits, so a generation
+# that issued only a security permit could clear without any code review.
+write_config "$BOTH_GATES"
+led open security-permit-only >/dev/null
+SECURITY_ONLY_HEAD="$(git -C "$TMP" rev-parse HEAD)"
+led permit-review security-permit-only --role security-reviewer --head "$SECURITY_ONLY_HEAD" >/dev/null
+record_pass security-permit-only security >/dev/null
+security_only_status="$(led status security-permit-only)"
+eq "a configured code gate is required without an issued code permit" "code-review" \
+  "$(printf '%s' "$security_only_status" | field missing_gates)"
+eq "a security-only generation cannot clear configured gates" "review" \
+  "$(printf '%s' "$security_only_status" | field next_action)"
+
+write_config $'gates: [code-review, security-review]  # flow list\n'
+led open flow-list-gates >/dev/null
+eq "a one-line flow gate list is enforced like a block list" "security-review" \
+  "$(record_pass flow-list-gates code | field missing_gates)"
+
+write_config ""
+led open default-gates >/dev/null
+eq "a missing gates key fails closed to the template gate set" "code-review,security-review" \
+  "$(led status default-gates | field required_gates)"
+
+write_config "$CODE_GATE"
+led open configured-code-only >/dev/null
+eq "a code-only gate configuration requires only code review" "code-review" \
+  "$(led status configured-code-only | field required_gates)"
+eq "a code-only gate configuration clears after code review" "gates-clear" \
+  "$(record_pass configured-code-only code | field next_action)"
+
+write_config "$BOTH_GATES"
+led open security-decision-missing >/dev/null
+missing_decision="$(record_pass security-decision-missing code)"
+eq "a configured security gate without a recorded decision stays required" "security-review" \
+  "$(printf '%s' "$missing_decision" | field missing_gates)"
+eq "a missing security decision cannot clear the gates" "review" \
+  "$(printf '%s' "$missing_decision" | field next_action)"
+
+SECURITY_DECISION_HEAD="$(git -C "$TMP" rev-parse HEAD)"
+cat > "$TMP/security-not-required.json" <<'JSON'
+{"reasons":[],"required":false,"source_branch":"feature/docs","target_branch":"develop"}
+JSON
+cat > "$TMP/security-required.json" <<'JSON'
+{"reasons":[{"kind":"diff_path","pattern":"auth","value":"src/auth.ts"}],"required":true,"source_branch":"feature/auth","target_branch":"develop"}
+JSON
+cat > "$TMP/security-inconsistent.json" <<'JSON'
+{"reasons":[{"kind":"diff","pattern":"always","value":"always"}],"required":false,"source_branch":"feature/x","target_branch":"develop"}
+JSON
+led open security-decision-waived >/dev/null
+waived="$(led record-security-gate security-decision-waived --head "$SECURITY_DECISION_HEAD" --decision "$TMP/security-not-required.json")"
+eq "a not-required security decision waives the configured security gate" "code-review" \
+  "$(printf '%s' "$waived" | field required_gates)"
+eq "the waived generation reports its security decision" "not-required" \
+  "$(printf '%s' "$waived" | field security_gate_decision)"
+eq "a waived security gate clears with only code review" "gates-clear" \
+  "$(record_pass security-decision-waived code | field next_action)"
+if led record-security-gate security-decision-waived --head "${SECURITY_DECISION_HEAD:0:12}" \
+  --decision "$TMP/security-not-required.json" >/dev/null 2>&1; then
+  bad "a security decision requires the exact full head"
+else ok "a security decision requires the exact full head"; fi
+if led record-security-gate security-decision-waived --head "$SECURITY_DECISION_HEAD" \
+  --decision "$TMP/security-inconsistent.json" >/dev/null 2>&1; then
+  bad "a security decision whose reasons contradict required=false is refused"
+else ok "a security decision whose reasons contradict required=false is refused"; fi
+git -C "$TMP" -c user.name=Test -c user.email=test@example.com commit --allow-empty -qm security-rebind
+SECURITY_REBIND_HEAD="$(git -C "$TMP" rev-parse HEAD)"
+eq "a security waiver does not carry into a new-head generation" "code-review,security-review" \
+  "$(led rebind-generation security-decision-waived --head "$SECURITY_REBIND_HEAD" --reason 'merged develop' | field required_gates)"
+
+led open security-decision-required >/dev/null
+led record-security-gate security-decision-required --head "$SECURITY_REBIND_HEAD" \
+  --decision "$TMP/security-required.json" >/dev/null
+led record-security-gate security-decision-required --head "$SECURITY_REBIND_HEAD" \
+  --decision "$TMP/security-not-required.json" >/dev/null
+eq "any required security decision for the generation keeps the gate required" "code-review,security-review" \
+  "$(led status security-decision-required | field required_gates)"
+
+led open security-permit-decision >/dev/null
+led permit-review security-permit-decision --role security-reviewer --head "$SECURITY_REBIND_HEAD" >/dev/null
+led record-security-gate security-permit-decision --head "$SECURITY_REBIND_HEAD" \
+  --decision "$TMP/security-not-required.json" >/dev/null
+eq "an issued security permit keeps the gate required despite a waiver" "code-review,security-review" \
+  "$(led status security-permit-decision | field required_gates)"
+
+# Ledgers written by the affected runtime stored a short gate set on the
+# pending repair attempt. Reading them must recompute the configured set.
+led open short-repair-gates >/dev/null
+led record short-repair-gates --gate code-review --verdict FAIL --blocking 'src/short.ts:gate' >/dev/null
+SHORT_GATES_HEAD="$(fake_commit short-repair-gates)"
+cat > "$TMP/short-repair-gates.json" <<JSON
+{"schema_version":1,"head":"$SHORT_GATES_HEAD","findings":[{"component":"src/short.ts:gate","status":"closed","root_cause":"missing gate","change":"added gate","verification":"gate regression passes"}]}
+JSON
+led record-repair short-repair-gates --report "$TMP/short-repair-gates.json" >/dev/null
+SHORT_GATES_LEDGER="$(led open short-repair-gates | field ledger)"
+python3 - "$SHORT_GATES_LEDGER" <<'PY'
+import json,sys
+state=json.load(open(sys.argv[1]))
+state["repair_attempts"][-1]["required_gates"]=["code-review"]
+json.dump(state,open(sys.argv[1],"w"),indent=2,sort_keys=True)
+PY
+led record short-repair-gates --gate code-review --verdict FAIL --head "$SHORT_GATES_HEAD" >/dev/null
+eq "a stored short repair gate set is recomputed from configured gates" "security-review" \
+  "$(led status short-repair-gates | field missing_gates)"
+if led complete-repair-review short-repair-gates >/dev/null 2>&1; then
+  bad "a repair review cannot complete without a configured-required gate"
+else ok "a repair review cannot complete without a configured-required gate"; fi
+write_config "$CODE_GATE"
+
+# --- abbreviated repaired heads resolve to one exact commit -------------------
+led open abbreviated-repair >/dev/null
+led record abbreviated-repair --gate code-review --verdict FAIL --blocking 'src/abbrev.ts:head' >/dev/null
+ABBREV_HEAD="$(git -C "$TMP" rev-parse HEAD)"
+cat > "$TMP/abbreviated-repair.json" <<JSON
+{"schema_version":1,"head":"${ABBREV_HEAD:0:7}","findings":[{"component":"src/abbrev.ts:head","status":"closed","root_cause":"short sha","change":"full sha","verification":"head regression passes"}]}
+JSON
+eq "record-repair stores the full resolved repaired head" "$ABBREV_HEAD" \
+  "$(led record-repair abbreviated-repair --report "$TMP/abbreviated-repair.json" | field head)"
+if record_pass abbreviated-repair code >/dev/null 2>&1; then
+  ok "an abbreviated repair report accepts the full-SHA review"
+else bad "an abbreviated repair report accepts the full-SHA review"; fi
+eq "an abbreviated repair report no longer deadlocks the ledger" "gates-clear" \
+  "$(led complete-repair-review abbreviated-repair 2>/dev/null | field next_action)"
+
+led open unresolvable-repair >/dev/null
+led record unresolvable-repair --gate code-review --verdict FAIL --blocking 'src/abbrev.ts:missing' >/dev/null
+cat > "$TMP/unresolvable-repair.json" <<'JSON'
+{"schema_version":1,"head":"0000000","findings":[{"component":"src/abbrev.ts:missing","status":"closed","root_cause":"x","change":"y","verification":"z"}]}
+JSON
+if led record-repair unresolvable-repair --report "$TMP/unresolvable-repair.json" >/dev/null 2>&1; then
+  bad "a repair head that does not resolve to a commit is refused"
+else ok "a repair head that does not resolve to a commit is refused"; fi
+
+# Existing ledgers already stored the abbreviation.
+legacy_abbreviate() {
+  python3 - "$(led open "$1" | field ledger)" <<'PY'
+import json,sys
+state=json.load(open(sys.argv[1]))
+state["repair_attempts"][-1]["head"]=state["repair_attempts"][-1]["head"][:7]
+json.dump(state,open(sys.argv[1],"w"),indent=2,sort_keys=True)
+PY
+}
+led open legacy-abbreviated >/dev/null
+led record legacy-abbreviated --gate code-review --verdict FAIL --blocking 'src/abbrev.ts:legacy' >/dev/null
+cat > "$TMP/legacy-abbreviated.json" <<JSON
+{"schema_version":1,"head":"$ABBREV_HEAD","findings":[{"component":"src/abbrev.ts:legacy","status":"closed","root_cause":"short sha","change":"full sha","verification":"head regression passes"}]}
+JSON
+led record-repair legacy-abbreviated --report "$TMP/legacy-abbreviated.json" >/dev/null
+legacy_abbreviate legacy-abbreviated
+OTHER_ABBREV_HEAD="$(fake_commit other-abbreviated)"
+if led record legacy-abbreviated --gate code-review --verdict FAIL --head "$OTHER_ABBREV_HEAD" >/dev/null 2>&1; then
+  bad "a stored abbreviation does not accept an unrelated full head"
+else ok "a stored abbreviation does not accept an unrelated full head"; fi
+if record_pass legacy-abbreviated code >/dev/null 2>&1; then
+  ok "a stored abbreviation accepts its unambiguous full expansion"
+else bad "a stored abbreviation accepts its unambiguous full expansion"; fi
+
+led open correct-abbreviated >/dev/null
+led record correct-abbreviated --gate code-review --verdict FAIL --blocking 'src/abbrev.ts:correct' >/dev/null
+cat > "$TMP/correct-abbreviated.json" <<JSON
+{"schema_version":1,"head":"$ABBREV_HEAD","findings":[{"component":"src/abbrev.ts:correct","status":"closed","root_cause":"short sha","change":"full sha","verification":"head regression passes"}]}
+JSON
+led record-repair correct-abbreviated --report "$TMP/correct-abbreviated.json" >/dev/null
+legacy_abbreviate correct-abbreviated
+if led correct-repair-head correct-abbreviated --head "$OTHER_ABBREV_HEAD" --reason 'wrong commit' >/dev/null 2>&1; then
+  bad "correct-repair-head refuses a different commit"
+else ok "correct-repair-head refuses a different commit"; fi
+if led correct-repair-head correct-abbreviated --head "$ABBREV_HEAD" --reason ' ' >/dev/null 2>&1; then
+  bad "correct-repair-head requires an audit reason"
+else ok "correct-repair-head requires an audit reason"; fi
+corrected="$(led correct-repair-head correct-abbreviated --head "$ABBREV_HEAD" --reason 'expand abbreviated repair head')"
+eq "correct-repair-head stores the unambiguous full expansion" "$ABBREV_HEAD" \
+  "$(printf '%s' "$corrected" | field head)"
+CORRECT_LEDGER="$(led open correct-abbreviated | field ledger)"
+eq "correct-repair-head records an audit entry" "${ABBREV_HEAD:0:7}->$ABBREV_HEAD:expand abbreviated repair head" \
+  "$(python3 -c 'import json,sys; e=json.load(open(sys.argv[1]))["repair_head_corrections"][-1]; print(e["from_head"]+"->"+e["head"]+":"+e["reason"])' "$CORRECT_LEDGER")"
+if led correct-repair-head correct-abbreviated --head "$ABBREV_HEAD" --reason 'again' >/dev/null 2>&1; then
+  bad "correct-repair-head refuses a non-abbreviated stored head"
+else ok "correct-repair-head refuses a non-abbreviated stored head"; fi
+record_pass correct-abbreviated code >/dev/null
+led complete-repair-review correct-abbreviated >/dev/null
+python3 - "$CORRECT_LEDGER" <<'PY'
+import json,sys
+state=json.load(open(sys.argv[1]))
+state["repair_attempts"][-1]["head"]=state["repair_attempts"][-1]["head"][:7]
+json.dump(state,open(sys.argv[1],"w"),indent=2,sort_keys=True)
+PY
+if led correct-repair-head correct-abbreviated --head "$ABBREV_HEAD" --reason 'completed' >/dev/null 2>&1; then
+  bad "correct-repair-head refuses a completed repair attempt"
+else ok "correct-repair-head refuses a completed repair attempt"; fi
+
+# --- complete-review after an API runner already completed the permit ---------
+led open api-completed >/dev/null
+API_HEAD="$(git -C "$TMP" rev-parse HEAD)"
+API_PERMIT="$(led permit-review api-completed --role code-reviewer --head "$API_HEAD" | field review_phase_permit)"
+cat > "$TMP/api-completed.json" <<'JSON'
+{"schema_version":1,"gate":"code-review","verdict":"PASS","checks":[{"name":"review","status":"pass"}],"findings":[]}
+JSON
+API_RECEIPT="$(python3 - "$TMP" "$API_PERMIT" "$API_HEAD" "$LEDGER" "$TMP/api-completed.json" <<'PY'
+import importlib.util,json,sys
+from pathlib import Path
+spec=importlib.util.spec_from_file_location("review_permit",str(Path(sys.argv[4]).with_name("review_permit.py")))
+module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+common=dict(shared_root=Path(sys.argv[1]),ledger_dir=".orchestration/.review-ledger",pr="api-completed",token=sys.argv[2],role="code-reviewer",head=sys.argv[3])
+module.consume(**common,timestamp="start")
+print(module.complete(**common,result=json.load(open(sys.argv[5])),timestamp="done"))
+PY
+)"
+api_complete="$(led complete-review api-completed --role code-reviewer --phase-permit "$API_PERMIT" --result "$TMP/api-completed.json" 2>/dev/null)"
+eq "complete-review returns the API runner's existing receipt" "$API_RECEIPT" \
+  "$(printf '%s' "$api_complete" | field completion_receipt 2>/dev/null)"
+eq "complete-review reports an already completed permit" "True" \
+  "$(printf '%s' "$api_complete" | field already_completed 2>/dev/null)"
+if led complete-review api-completed --role code-reviewer --phase-permit "$API_PERMIT" \
+  --result "$TMP/invalid-output-review.json" >/dev/null 2>&1; then
+  bad "an invalid result cannot reuse a completed permit"
+else ok "an invalid result cannot reuse a completed permit"; fi
+if led complete-review api-completed --role code-reviewer --phase-permit "$API_PERMIT" \
+  --result "$TMP/corrected-output-review.json" > /dev/null 2> "$TMP/api-digest-error"; then
+  bad "a different result cannot reuse a completed permit"
+elif grep -q 'different result' "$TMP/api-digest-error"; then
+  ok "a different result cannot reuse a completed permit"
+else bad "a different result explains the digest mismatch"; fi
+eq "the API receipt records directly after completion" "gates-clear" \
+  "$(led record api-completed --gate code-review --result "$TMP/api-completed.json" --head "$API_HEAD" --phase-permit "$API_PERMIT" | field next_action)"
+if led complete-review api-completed --role code-reviewer --phase-permit "$API_PERMIT" \
+  --result "$TMP/api-completed.json" > /dev/null 2> "$TMP/api-consumed-error"; then
+  bad "a consumed completion receipt cannot be returned again"
+elif grep -q 'already recorded' "$TMP/api-consumed-error"; then
+  ok "a consumed completion receipt cannot be returned again"
+else bad "a consumed completion receipt explains that it was recorded"; fi
+
+# --- review from a detached worktree at the exact PR head ---------------------
+led open worktree-review >/dev/null
+WORKTREE_PR_HEAD="$(fake_commit worktree-pr-head)"
+MAIN_HEAD="$(git -C "$TMP" rev-parse HEAD)"
+if led permit-review worktree-review --role code-reviewer --head "$WORKTREE_PR_HEAD" \
+  > /dev/null 2> "$TMP/head-mismatch-error"; then
+  bad "permit-review refuses a PR head that is not checked out"
+elif grep -q "$MAIN_HEAD" "$TMP/head-mismatch-error" \
+  && grep -q 'git worktree add --detach' "$TMP/head-mismatch-error"; then
+  ok "the head mismatch names the actual HEAD and the review worktree procedure"
+else bad "the head mismatch names the actual HEAD and the review worktree procedure"; fi
+git -C "$TMP" worktree add -q --detach "$REVIEW_WT" "$WORKTREE_PR_HEAD"
+wt() { (cd "$REVIEW_WT" && python3 "$LEDGER" "$@"); }
+if WT_PERMIT="$(wt permit-review worktree-review --role code-reviewer --head "$WORKTREE_PR_HEAD" | field review_phase_permit)"; then
+  ok "permit-review succeeds from a detached worktree at the PR head"
+else bad "permit-review succeeds from a detached worktree at the PR head"; fi
+wt complete-review worktree-review --role code-reviewer --phase-permit "$WT_PERMIT" --result "$TMP/api-completed.json" >/dev/null
+wt record worktree-review --gate code-review --result "$TMP/api-completed.json" --head "$WORKTREE_PR_HEAD" --phase-permit "$WT_PERMIT" >/dev/null
+git -C "$TMP" worktree remove "$REVIEW_WT"
+eq "the main checkout sees the review recorded from the review worktree" "gates-clear" \
+  "$(led status worktree-review | field next_action)"
+eq "the review worktree bound the exact PR head" "$WORKTREE_PR_HEAD" \
+  "$(led status worktree-review | field generation_head)"
 
 echo
 if [ "$fails" -eq 0 ]; then echo "review ledger tests passed"; else echo "$fails FAILED"; fi

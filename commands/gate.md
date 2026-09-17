@@ -38,6 +38,20 @@ from the valid ledger phase with `review-ledger.py permit-review <pr>
 acknowledgement; a provider id, timeout after submission, or uncertain state
 must be reconciled and never duplicated.
 
+`permit-review` binds the local `git rev-parse HEAD`, because reviewers and
+receipts read the local tree. When the current checkout is not at the exact PR
+head, review from a detached worktree instead of moving this checkout:
+
+```bash
+git fetch origin <headRefName>
+git worktree add --detach <review-path> <full-exact-head>
+cd <review-path>   # run permit-review, reviewers, complete-review, record here
+git worktree remove <review-path>   # after the round is recorded
+```
+
+Linked worktrees resolve the same shared review ledger and canonical config, so
+the ledger state is identical from either checkout.
+
 0. **Open the ledger and build the round brief.** The failure ledger lives on
    disk, not in this conversation -- it survives compaction, normalizes component
    keys so a repeated defect actually accumulates strikes, and decides when the
@@ -78,10 +92,21 @@ must be reconciled and never duplicated.
    `${CLAUDE_PLUGIN_ROOT}/scripts/orchestration-engine.py security-gate
    --source-branch <headRefName> --target-branch <baseRefName> --diff-file
    <raw-diff-file>`. This evaluates diff, source-branch, and target-branch
-   triggers. If `required` is true, launch the
+   triggers. Save its JSON output and bind it to the generation:
+
+   ```bash
+   ${CLAUDE_PLUGIN_ROOT}/scripts/review-ledger.py record-security-gate <pr> \
+     --head <full-exact-head> --decision <security-gate-output.json>
+   ```
+
+   The ledger requires every configured `gates:` entry. A configured
+   `security-review` is waived only by a recorded `required: false` decision for
+   this generation's exact head; with no decision it stays required. Record a
+   new decision after every `record-repair` or `rebind-generation`. If
+   `required` is true, launch the
    `orchestration-security-reviewer` agent (another fresh agent) with that same
    raw unified diff and diff-isolated context. It must return the same concise
-   structured review JSON. If false, record the empty reasons and skip. If PR
+   structured review JSON. If false, record the decision and skip. If PR
    metadata, diff capture, or the decision fails, stop fail-closed.
 
 3. **Record the round.** Record every completed gate through the ledger, blocking
@@ -95,6 +120,12 @@ must be reconciled and never duplicated.
      --result .orchestration/.review-results/code-review.json --head <exact-sha> \
      --phase-permit <token>
    ```
+
+   `complete-review` is for desktop reviewers only. An API run through
+   `api_agent.py run --review-authorization <token>` completes its own permit
+   on success, so go straight to `record` with the same token. A repeated
+   `complete-review` with the identical result returns the existing receipt
+   with `already_completed: true`; a different result is refused.
 
    The validated result carries blocking, advisory, severity, regression, and
    finding explanations. The ledger increments strikes, auto-resolves components this gate
@@ -114,7 +145,9 @@ must be reconciled and never duplicated.
      `review-ledger.py repair-brief <pr>`. Give it to one fresh implementer on the
      same branch. Require root cause, change, affected boundaries, objective
      closure, and verification for every stable finding ID. Record its strict
-     JSON with `record-repair`, re-run code and required security reviews
+     JSON with `record-repair` (it stores the full commit id git resolves from
+     the report head), record that head's `record-security-gate` decision,
+     re-run code and required security reviews
      concurrently against that exact repaired head, record both, then call
      `record ... --head <exact-sha>` and `complete-repair-review`. Advisory
      findings never enter the repair brief.

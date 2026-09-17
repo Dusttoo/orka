@@ -81,8 +81,11 @@ review-ledger.py open <pr>                    # once per PR
 review-ledger.py brief <pr>                   # paste into every reviewer brief
 review-ledger.py record <pr> --gate code-review \
   --result .orchestration/.review-results/code-review.json
+review-ledger.py record-security-gate <pr> --head <full-exact-head> \
+  --decision .orchestration/.review-results/security-gate.json
 review-ledger.py repair-brief <pr>
 review-ledger.py record-repair <pr> --report .orchestration/.review-results/repair.json
+review-ledger.py correct-repair-head <pr> --head <full-exact-head> --reason "<reason>"
 review-ledger.py complete-repair-review <pr>
 review-ledger.py rebind-generation <pr> --head <full-exact-head> --reason "<reason>"
 review-ledger.py metrics <pr>
@@ -98,6 +101,53 @@ a complete authoritative generation with no open blockers or outstanding
 permits. It keeps all history, findings, strikes, and repair-cycle accounting,
 then binds the next generation to the new head. Use `record-repair` instead when
 the commit addresses an open finding.
+
+### Required gates
+
+Every configured `gates:` entry the ledger owns (`code-review`,
+`security-review`) is required for each generation, whether or not a permit was
+issued for it. A missing or empty `gates:` key fails closed to both, matching
+`templates/config.yaml`. Issued permits, rebinds, and a pending repair can only
+add to that set, and `complete-repair-review` recomputes it, so a ledger that
+stored a shorter set is corrected on read.
+
+A configured `security-review` is waived only by the output of
+`orchestration-engine.py security-gate` recorded with `record-security-gate`
+for the current generation's exact head with `required: false`. With no
+decision it stays required; any `required: true` decision or any issued
+security permit keeps it required. Decisions never carry into a repair or
+rebind generation, because the new head has a new diff: record a new one.
+
+### Exact heads
+
+`permit-review`, `rebind-generation`, and `record-security-gate` bind the local
+`git rev-parse HEAD`, because reviewers and completion receipts read the local
+tree. To review a PR head that the current checkout is not on, use a detached
+worktree rather than moving the checkout:
+
+```bash
+git worktree add --detach <review-path> <full-exact-head>
+cd <review-path>   # permit-review, reviewers, complete-review, record
+git worktree remove <review-path>
+```
+
+Linked worktrees resolve the same shared ledger directory and canonical config
+from the main checkout, so every ledger command sees identical state.
+
+`record-repair` resolves the report `head` with `git rev-parse --verify` and
+stores the full commit id; a head that does not resolve to exactly one commit
+is refused. Ledgers written earlier may hold an abbreviation. `record` accepts
+its full expansion only when git resolves the abbreviation unambiguously to
+that commit, and `correct-repair-head` rewrites a pending attempt's
+abbreviation to that same expansion with an audit entry. It refuses any other
+commit, a completed attempt, or a head that is already full, so it needs no
+operator capability.
+
+`complete-review` is for desktop reviewers. An API reviewer run completes its
+own permit, so its result goes straight to `record`. Repeating
+`complete-review` with the identical result returns the existing unconsumed
+receipt (`already_completed: true`); a different result digest, or a
+recorded, cancelled, or superseded permit, is refused.
 
 An escalated ledger is immutable to workers. If a human decides that the same
 PR should receive more repair cycles, issue a PR-bound capability with an

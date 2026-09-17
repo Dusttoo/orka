@@ -57,8 +57,18 @@ acknowledgement; submitted, timed-out, or uncertain work must be reconciled
 instead of duplicated.
 For a native desktop reviewer, write its final structured JSON first, then run
 `review-ledger.py complete-review <pr> --role <role>
---phase-permit <token> --result <file>`. API execution creates the same
-completion receipt after successful provider output.
+--phase-permit <token> --result <file>`. `complete-review` is for desktop
+reviewers only: API execution creates the same completion receipt after
+successful provider output, so an API run goes straight to `record` with its
+token. Repeating `complete-review` with the identical result returns the
+existing receipt with `already_completed: true`; a different result is refused.
+
+`permit-review` binds the local `git rev-parse HEAD`, because reviewers and
+receipts read the local tree. When the current checkout is not at the exact PR
+head, do not move it: `git worktree add --detach <review-path>
+<full-exact-head>`, run `permit-review`, the reviewers, `complete-review`, and
+`record` from `<review-path>`, then `git worktree remove <review-path>`. Linked
+worktrees resolve the same shared review ledger and canonical config.
 
 1. Read `.orchestration/config.yaml` and run
    `orchestration-engine.py validate-config`. For `schema_version: 2`, use
@@ -110,10 +120,16 @@ completion receipt after successful provider output.
    --target-branch <baseRefName> --diff-file <raw-diff-file>`. This shared
    decision evaluates `security_required_when`,
    `security_required_source_branches`, and
-   `security_required_target_branches`. If `required` is true, run a fresh
+   `security_required_target_branches`. Save its JSON output and bind it to the
+   generation with `review-ledger.py record-security-gate <pr> --head
+   <full-exact-head> --decision <security-gate-output.json>`. The ledger
+   requires every configured `gates:` entry; a configured `security-review` is
+   waived only by a recorded `required: false` decision for this generation's
+   exact head, and stays required when none is recorded. Record a new decision
+   after every `record-repair` or `rebind-generation`. If `required` is true, run a fresh
    security-review pass using `orchestration-security-reviewer.md` with the same
-   raw unified diff and diff-isolated context. If it is false, record the empty
-   reasons list and skip. If metadata, diff capture, configuration validation,
+   raw unified diff and diff-isolated context. If it is false, record the
+   decision and skip. If metadata, diff capture, configuration validation,
    or the decision command fails, stop fail-closed; never infer that security is
    optional.
 5. Wait for both launched reviewers, then record every completed gate through the
@@ -134,7 +150,9 @@ completion receipt after successful provider output.
      planned change, affected boundaries, objective closure condition, and named
      verification before editing. After editing it writes the strict repair JSON
      named by the brief; record it with `review-ledger.py record-repair <pr>
-     --report <file>`. A claimed closure is not proof. Re-run code and required
+     --report <file>`; it stores the full commit id git resolves from the report
+     head. Record that head's `record-security-gate` decision. A claimed
+     closure is not proof. Re-run code and required
      security reviewers concurrently against that exact repaired head, record
      both with `record ... --head <exact-sha>`, then call `review-ledger.py
      complete-repair-review <pr>`. Advisory
