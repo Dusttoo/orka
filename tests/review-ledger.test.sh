@@ -826,6 +826,11 @@ led open flow-list-gates >/dev/null
 eq "a one-line flow gate list is enforced like a block list" "security-review" \
   "$(record_pass flow-list-gates code | field missing_gates)"
 
+write_config $'gates:\n  [code-review]  # Prettier wraps long flow lists\n'
+led open prettier-gates >/dev/null
+eq "a Prettier-wrapped gate list is read like the one-line form" "code-review" \
+  "$(led status prettier-gates | field required_gates)"
+
 write_config ""
 led open default-gates >/dev/null
 eq "a missing gates key fails closed to the template gate set" "code-review,security-review" \

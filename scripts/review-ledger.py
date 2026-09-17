@@ -18,6 +18,7 @@ import argparse
 import contextlib
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -115,30 +116,30 @@ def config_scalar(path: Path, key: str, default: str) -> str:
 
 
 def config_list(path: Path, key: str) -> list[str] | None:
-    """Read a top-level block list or one-line flow list; None when absent."""
+    """Read a top-level list through the engine's shared parser; None when absent.
+
+    Block lists, one-line flow lists, and Prettier-wrapped flow lists resolve
+    exactly as every other Orka command reads them. A config the parser refuses
+    fails closed rather than silently changing the required gate set.
+    """
     if not path.exists():
         return None
-    lines = path.read_text(encoding="utf-8").splitlines()
-    header = re.compile(rf"^{re.escape(key)}:\s*(.*?)\s*(?:#.*)?$")
-    for index, line in enumerate(lines):
-        match = header.match(line)
-        if not match:
-            continue
-        value = match.group(1)
-        if value.startswith("[") and value.endswith("]"):
-            return [unquote(item) for item in value[1:-1].split(",") if item.strip()]
-        if value:
-            return [unquote(value)]
-        items: list[str] = []
-        for item in lines[index + 1 :]:
-            if not item.strip() or item.lstrip().startswith("#"):
-                continue
-            entry = re.match(r"^\s+-\s+(.*?)\s*(?:#.*)?$", item)
-            if not entry:
-                break
-            items.append(unquote(entry.group(1)))
-        return items
-    return None
+    engine_path = Path(__file__).with_name("orchestration-engine.py")
+    spec = importlib.util.spec_from_file_location("orka_ledger_config_parser", engine_path)
+    if spec is None or spec.loader is None:
+        raise LedgerError("could not load orchestration configuration parser")
+    engine = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(engine)
+    try:
+        parsed = engine.load_simple_yaml(path)
+    except engine.EngineError as exc:
+        raise LedgerError(f"invalid config syntax in {path}: {exc}") from exc
+    value = parsed.get(key) if isinstance(parsed, dict) else None
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        return [str(value)]
+    return [str(item).strip() for item in value if item is not None and str(item).strip()]
 
 
 def configured_review_gates() -> set[str]:
