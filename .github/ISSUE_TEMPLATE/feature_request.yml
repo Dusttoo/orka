@@ -1,0 +1,48 @@
+name: Feature request
+description: Propose a bounded, backward-compatible Orka capability.
+title: "[Feature]: "
+labels:
+  - enhancement
+  - "status: needs design"
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Describe the workflow failure or limitation, not only the desired implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: What observable behavior should change?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed approach
+      description: Include state transitions, failure behavior, and compatibility when relevant.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      placeholder: |
+        - [ ] ...
+        - [ ] ...
+    validations:
+      required: true
+  - type: checkboxes
+    id: boundaries
+    attributes:
+      label: Boundaries
+      options:
+        - label: The proposal keeps scheduling, budgets, and merge authority in deterministic host code.
+          required: true
+        - label: The proposal contains no repository-specific or private project information.
+          required: true

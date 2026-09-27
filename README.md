@@ -386,6 +386,23 @@ The harness is designed to move across codebases with only a config change. See
 [docs/workflow-configuration.md](docs/workflow-configuration.md) for schema v2
 workflow design.
 
+## Contributing
+
+Orka is open source and welcomes focused bug fixes, tests, documentation,
+provider adapters, observability improvements, and work toward the durable
+supervisor runtime. Start with [CONTRIBUTING.md](CONTRIBUTING.md), search the
+[issue tracker](https://github.com/Dusttoo/orka/issues), and comment before
+starting an issue so work is not duplicated.
+
+Issues labelled `status: ready` have an accepted implementation boundary.
+Cross-cutting state-machine, persistence, recovery-authority, spending, and
+merge-policy changes begin with an architecture proposal. The accepted Orka 2
+direction is described in
+[docs/orka-2-durable-runtime.md](docs/orka-2-durable-runtime.md).
+
+Please report security-sensitive findings privately according to
+[SECURITY.md](SECURITY.md) and follow the [Code of Conduct](CODE_OF_CONDUCT.md).
+
 ## Releasing a change (every PR bumps the version)
 
 **Every PR MUST bump the version** in BOTH manifests, including PRs limited to

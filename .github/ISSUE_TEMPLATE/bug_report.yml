@@ -1,0 +1,73 @@
+name: Bug report
+description: Report a reproducible Orka defect with sanitized evidence.
+title: "[Bug]: "
+labels:
+  - bug
+  - "status: needs triage"
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Search existing issues first. Never include credentials, private source
+        code, customer data, or unsanitized model transcripts.
+  - type: input
+    id: version
+    attributes:
+      label: Orka version
+      placeholder: 1.8.0
+    validations:
+      required: true
+  - type: dropdown
+    id: host
+    attributes:
+      label: Host
+      options:
+        - Codex
+        - Claude Code
+        - Both
+        - Direct API runner
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What failed, and what should have happened?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Include exact commands and sanitized state transitions where possible.
+      placeholder: |
+        1. Configure ...
+        2. Run ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Sanitized evidence
+      description: Logs, state excerpts, PR heads, or test fixtures with secrets and private data removed.
+      render: shell
+  - type: textarea
+    id: impact
+    attributes:
+      label: Impact and scope
+      description: Does this affect one ticket, one route, the repository, spending, or a security boundary?
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Safety checks
+      options:
+        - label: I searched for an existing issue.
+          required: true
+        - label: I removed credentials, private code, customer data, and unsanitized transcripts.
+          required: true
+        - label: This is not a security vulnerability requiring private disclosure.
+          required: true
