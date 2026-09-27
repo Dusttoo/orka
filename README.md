@@ -349,6 +349,9 @@ items. Repositories provide configuration and project-specific acceptance
 criteria; they do not vendor the controller or its tests.
 See [docs/sprint-controller.md](docs/sprint-controller.md) for the trust boundary,
 impossible guarantees, restart invariant, and rejected fragile designs.
+The accepted Orka 2 lifecycle semantics are specified separately in the
+[durable supervisor lifecycle contract](docs/supervisor-lifecycle-contract.md);
+the contract is not yet an implementation of the supervisor runtime.
 
 ## The merge-guard
 

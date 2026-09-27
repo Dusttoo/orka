@@ -93,7 +93,8 @@ concerns.
 
 ## Proposed delivery sequence
 
-1. Specify lifecycle transitions, invariants, and event semantics.
+1. Specify lifecycle transitions, invariants, and event semantics in the
+   [versioned supervisor contract](supervisor-lifecycle-contract.md).
 2. Add a host-owned supervisor loop around the existing controller.
 3. Add durable resource exclusions and fair queue admission.
 4. Automate evidence-backed worker and preserved-PR recovery.
@@ -121,4 +122,3 @@ Cross-cutting state-machine or persistence changes require an accepted
 architecture issue before implementation. Focused tests, documentation,
 adapters, observability, and isolated transition handlers can proceed as
 separate issues when their contracts are already accepted.
-

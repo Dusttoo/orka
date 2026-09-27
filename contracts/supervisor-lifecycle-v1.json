@@ -1,0 +1,435 @@
+{
+  "schema_version": 1,
+  "contract_id": "orka.supervisor-lifecycle",
+  "description": "Deterministic supervisor and job lifecycle contract for the Orka 2 durable runtime.",
+  "entities": {
+    "supervisor": {
+      "states": [
+        "starting",
+        "active",
+        "paused",
+        "draining",
+        "degraded",
+        "takeover_pending",
+        "stopped"
+      ],
+      "terminal_states": ["stopped"]
+    },
+    "job": {
+      "states": [
+        "queued",
+        "reserved",
+        "running",
+        "retry_wait",
+        "repair_ready",
+        "recovery_ready",
+        "decomposition_ready",
+        "parked_decision",
+        "parked_external",
+        "blocked",
+        "completed",
+        "decomposed",
+        "cancelled"
+      ],
+      "terminal_states": ["completed", "decomposed", "cancelled"]
+    }
+  },
+  "events": {
+    "preflight_succeeded": {
+      "entity": "supervisor",
+      "scope": "global",
+      "required_evidence": ["config_digest", "runtime_fingerprint", "lease_id"],
+      "replay": "no_op_if_applied"
+    },
+    "preflight_failed": {
+      "entity": "supervisor",
+      "scope": "global",
+      "required_evidence": ["failure_class", "diagnostic_digest"],
+      "replay": "no_op_if_applied"
+    },
+    "operator_paused": {
+      "entity": "supervisor",
+      "scope": "global",
+      "required_evidence": ["operator_request_id", "pause_mode"],
+      "replay": "no_op_if_applied"
+    },
+    "operator_resumed": {
+      "entity": "supervisor",
+      "scope": "global",
+      "required_evidence": ["operator_request_id"],
+      "replay": "no_op_if_applied"
+    },
+    "drain_requested": {
+      "entity": "supervisor",
+      "scope": "global",
+      "required_evidence": ["operator_request_id"],
+      "replay": "no_op_if_applied"
+    },
+    "drain_completed": {
+      "entity": "supervisor",
+      "scope": "global",
+      "required_evidence": ["active_job_count", "queue_snapshot_digest"],
+      "replay": "no_op_if_applied"
+    },
+    "route_degraded": {
+      "entity": "supervisor",
+      "scope": "route",
+      "required_evidence": ["route_identity", "incident_id", "retry_at"],
+      "replay": "reconcile_then_no_op"
+    },
+    "route_recovered": {
+      "entity": "supervisor",
+      "scope": "route",
+      "required_evidence": ["route_identity", "health_receipt"],
+      "replay": "reconcile_then_no_op"
+    },
+    "all_routes_unavailable": {
+      "entity": "supervisor",
+      "scope": "global",
+      "required_evidence": ["route_incidents", "next_probe_at"],
+      "replay": "reconcile_then_no_op"
+    },
+    "routes_available": {
+      "entity": "supervisor",
+      "scope": "global",
+      "required_evidence": ["route_health_receipts"],
+      "replay": "reconcile_then_no_op"
+    },
+    "takeover_requested": {
+      "entity": "supervisor",
+      "scope": "global",
+      "required_evidence": ["claimant_identity", "observed_lease"],
+      "replay": "reject_if_stale"
+    },
+    "predecessor_absent": {
+      "entity": "supervisor",
+      "scope": "global",
+      "required_evidence": ["absence_receipt", "new_lease_id"],
+      "replay": "reject_if_stale"
+    },
+    "predecessor_live": {
+      "entity": "supervisor",
+      "scope": "global",
+      "required_evidence": ["liveness_receipt"],
+      "replay": "no_op_if_applied"
+    },
+    "lease_lost": {
+      "entity": "supervisor",
+      "scope": "global",
+      "required_evidence": ["lease_id", "observed_owner"],
+      "replay": "no_op_if_applied"
+    },
+    "durable_state_invalid": {
+      "entity": "supervisor",
+      "scope": "global",
+      "required_evidence": ["state_digest", "validation_error"],
+      "replay": "no_op_if_applied"
+    },
+    "hard_sprint_budget_exhausted": {
+      "entity": "supervisor",
+      "scope": "global",
+      "required_evidence": ["budget_receipt", "absolute_ceiling"],
+      "replay": "reconcile_then_no_op"
+    },
+    "sprint_completed": {
+      "entity": "supervisor",
+      "scope": "global",
+      "required_evidence": ["summary_digest", "authenticated_completion_receipts"],
+      "replay": "no_op_if_applied"
+    },
+    "job_admitted": {
+      "entity": "job",
+      "scope": "ticket",
+      "required_evidence": ["queue_version", "reservation_id", "route_identity", "exclusion_set"],
+      "replay": "reject_if_stale"
+    },
+    "repair_admitted": {
+      "entity": "job",
+      "scope": "ticket",
+      "required_evidence": ["queue_version", "reservation_id", "review_ledger_digest"],
+      "replay": "reject_if_stale"
+    },
+    "recovery_admitted": {
+      "entity": "job",
+      "scope": "ticket",
+      "required_evidence": ["queue_version", "reservation_id", "recovery_receipt"],
+      "replay": "reject_if_stale"
+    },
+    "worker_attached": {
+      "entity": "job",
+      "scope": "ticket",
+      "required_evidence": ["attempt_token", "execution_unit_identity", "launch_receipt"],
+      "replay": "no_op_if_applied"
+    },
+    "launch_rejected_transient": {
+      "entity": "job",
+      "scope": "ticket",
+      "required_evidence": ["attempt_token", "rejection_receipt", "retry_at"],
+      "replay": "reconcile_then_no_op"
+    },
+    "launch_rejected_permanent": {
+      "entity": "job",
+      "scope": "ticket",
+      "required_evidence": ["attempt_token", "rejection_receipt"],
+      "replay": "no_op_if_applied"
+    },
+    "worker_completed": {
+      "entity": "job",
+      "scope": "ticket",
+      "required_evidence": ["attempt_token", "merge_receipt"],
+      "replay": "no_op_if_applied"
+    },
+    "worker_needs_repair": {
+      "entity": "job",
+      "scope": "ticket",
+      "required_evidence": ["attempt_token", "pr_identity", "review_ledger_digest"],
+      "replay": "no_op_if_applied"
+    },
+    "worker_recoverable": {
+      "entity": "job",
+      "scope": "ticket",
+      "required_evidence": ["attempt_token", "terminal_receipt", "preserved_work_identity"],
+      "replay": "reconcile_then_no_op"
+    },
+    "worker_needs_decomposition": {
+      "entity": "job",
+      "scope": "ticket",
+      "required_evidence": ["attempt_token", "scope_artifact_digest"],
+      "replay": "no_op_if_applied"
+    },
+    "worker_external_blocked": {
+      "entity": "job",
+      "scope": "ticket",
+      "required_evidence": ["attempt_token", "external_dependency_receipt"],
+      "replay": "reconcile_then_no_op"
+    },
+    "worker_operator_decision": {
+      "entity": "job",
+      "scope": "ticket",
+      "required_evidence": ["attempt_token", "decision_class", "decision_question"],
+      "replay": "no_op_if_applied"
+    },
+    "worker_irrecoverable": {
+      "entity": "job",
+      "scope": "ticket",
+      "required_evidence": ["attempt_token", "terminal_receipt", "failure_class"],
+      "replay": "no_op_if_applied"
+    },
+    "worker_result_invalid": {
+      "entity": "job",
+      "scope": "ticket",
+      "required_evidence": ["attempt_token", "validation_error", "result_digest"],
+      "replay": "no_op_if_applied"
+    },
+    "worker_timed_out_with_progress": {
+      "entity": "job",
+      "scope": "ticket",
+      "required_evidence": ["attempt_token", "terminal_receipt", "progress_receipt"],
+      "replay": "reconcile_then_no_op"
+    },
+    "worker_timed_out_without_progress": {
+      "entity": "job",
+      "scope": "ticket",
+      "required_evidence": ["attempt_token", "terminal_receipt", "spend_receipt"],
+      "replay": "reconcile_then_no_op"
+    },
+    "worker_cancelled": {
+      "entity": "job",
+      "scope": "ticket",
+      "required_evidence": ["attempt_token", "cancellation_receipt", "terminal_receipt"],
+      "replay": "reconcile_then_no_op"
+    },
+    "cooldown_elapsed": {
+      "entity": "job",
+      "scope": "ticket",
+      "required_evidence": ["timer_id", "observed_at"],
+      "replay": "no_op_if_applied"
+    },
+    "retry_exhausted": {
+      "entity": "job",
+      "scope": "ticket",
+      "required_evidence": ["attempt_history_digest", "absolute_attempt_ceiling"],
+      "replay": "no_op_if_applied"
+    },
+    "decomposition_succeeded": {
+      "entity": "job",
+      "scope": "ticket",
+      "required_evidence": ["decomposition_receipt", "child_inventory_digest"],
+      "replay": "reconcile_then_no_op"
+    },
+    "decomposition_retryable_failure": {
+      "entity": "job",
+      "scope": "ticket",
+      "required_evidence": ["failure_receipt", "retry_at"],
+      "replay": "reconcile_then_no_op"
+    },
+    "decision_resolved": {
+      "entity": "job",
+      "scope": "ticket",
+      "required_evidence": ["decision_receipt", "decision_class"],
+      "replay": "no_op_if_applied"
+    },
+    "external_dependency_resolved": {
+      "entity": "job",
+      "scope": "ticket",
+      "required_evidence": ["authenticated_dependency_receipt"],
+      "replay": "reconcile_then_no_op"
+    },
+    "operator_requeued": {
+      "entity": "job",
+      "scope": "ticket",
+      "required_evidence": ["operator_decision_receipt", "absence_receipt"],
+      "replay": "reject_if_stale"
+    },
+    "hard_ticket_breaker": {
+      "entity": "job",
+      "scope": "ticket",
+      "required_evidence": ["breaker_receipt", "absolute_ceiling"],
+      "replay": "reconcile_then_no_op"
+    },
+    "dependency_became_external": {
+      "entity": "job",
+      "scope": "ticket",
+      "required_evidence": ["authenticated_dependency_receipt"],
+      "replay": "reconcile_then_no_op"
+    },
+    "ticket_cancelled": {
+      "entity": "job",
+      "scope": "ticket",
+      "required_evidence": ["operator_request_id", "execution_unit_terminal_receipt"],
+      "replay": "no_op_if_applied"
+    }
+  },
+  "transitions": [
+    {"entity": "supervisor", "from": "starting", "event": "preflight_succeeded", "to": "active"},
+    {"entity": "supervisor", "from": "starting", "event": "preflight_failed", "to": "stopped"},
+    {"entity": "supervisor", "from": "active", "event": "operator_paused", "to": "paused"},
+    {"entity": "supervisor", "from": "degraded", "event": "operator_paused", "to": "paused"},
+    {"entity": "supervisor", "from": "active", "event": "drain_requested", "to": "draining"},
+    {"entity": "supervisor", "from": "degraded", "event": "drain_requested", "to": "draining"},
+    {"entity": "supervisor", "from": "draining", "event": "drain_completed", "to": "paused"},
+    {"entity": "supervisor", "from": "active", "event": "route_degraded", "to": "degraded"},
+    {"entity": "supervisor", "from": "degraded", "event": "route_degraded", "to": "degraded"},
+    {"entity": "supervisor", "from": "degraded", "event": "route_recovered", "to": "active", "guard": "all required routes are healthy or another eligible route can run queued work"},
+    {"entity": "supervisor", "from": "active", "event": "all_routes_unavailable", "to": "paused"},
+    {"entity": "supervisor", "from": "degraded", "event": "all_routes_unavailable", "to": "paused"},
+    {"entity": "supervisor", "from": "paused", "event": "routes_available", "to": "active", "guard": "pause reason is all_routes_unavailable"},
+    {"entity": "supervisor", "from": "paused", "event": "operator_resumed", "to": "active", "guard": "no hard global blocker remains"},
+    {"entity": "supervisor", "from": "active", "event": "takeover_requested", "to": "takeover_pending"},
+    {"entity": "supervisor", "from": "degraded", "event": "takeover_requested", "to": "takeover_pending"},
+    {"entity": "supervisor", "from": "paused", "event": "takeover_requested", "to": "takeover_pending"},
+    {"entity": "supervisor", "from": "draining", "event": "takeover_requested", "to": "takeover_pending"},
+    {"entity": "supervisor", "from": "takeover_pending", "event": "predecessor_absent", "to": "active"},
+    {"entity": "supervisor", "from": "takeover_pending", "event": "predecessor_live", "to": "stopped"},
+    {"entity": "supervisor", "from": "active", "event": "hard_sprint_budget_exhausted", "to": "paused"},
+    {"entity": "supervisor", "from": "degraded", "event": "hard_sprint_budget_exhausted", "to": "paused"},
+    {"entity": "supervisor", "from": "active", "event": "sprint_completed", "to": "stopped"},
+    {"entity": "supervisor", "from": "degraded", "event": "sprint_completed", "to": "stopped"},
+    {"entity": "supervisor", "from": "draining", "event": "sprint_completed", "to": "stopped"},
+    {"entity": "supervisor", "from": "active", "event": "lease_lost", "to": "stopped"},
+    {"entity": "supervisor", "from": "degraded", "event": "lease_lost", "to": "stopped"},
+    {"entity": "supervisor", "from": "paused", "event": "lease_lost", "to": "stopped"},
+    {"entity": "supervisor", "from": "draining", "event": "lease_lost", "to": "stopped"},
+    {"entity": "supervisor", "from": "takeover_pending", "event": "lease_lost", "to": "stopped"},
+    {"entity": "supervisor", "from": "active", "event": "durable_state_invalid", "to": "stopped"},
+    {"entity": "supervisor", "from": "degraded", "event": "durable_state_invalid", "to": "stopped"},
+    {"entity": "supervisor", "from": "paused", "event": "durable_state_invalid", "to": "stopped"},
+    {"entity": "supervisor", "from": "draining", "event": "durable_state_invalid", "to": "stopped"},
+    {"entity": "supervisor", "from": "takeover_pending", "event": "durable_state_invalid", "to": "stopped"},
+
+    {"entity": "job", "from": "queued", "event": "job_admitted", "to": "reserved"},
+    {"entity": "job", "from": "repair_ready", "event": "repair_admitted", "to": "reserved"},
+    {"entity": "job", "from": "recovery_ready", "event": "recovery_admitted", "to": "reserved"},
+    {"entity": "job", "from": "reserved", "event": "worker_attached", "to": "running"},
+    {"entity": "job", "from": "reserved", "event": "launch_rejected_transient", "to": "retry_wait"},
+    {"entity": "job", "from": "reserved", "event": "launch_rejected_permanent", "to": "blocked"},
+    {"entity": "job", "from": "running", "event": "worker_completed", "to": "completed"},
+    {"entity": "job", "from": "running", "event": "worker_needs_repair", "to": "repair_ready"},
+    {"entity": "job", "from": "running", "event": "worker_recoverable", "to": "recovery_ready"},
+    {"entity": "job", "from": "running", "event": "worker_needs_decomposition", "to": "decomposition_ready"},
+    {"entity": "job", "from": "running", "event": "worker_external_blocked", "to": "parked_external"},
+    {"entity": "job", "from": "running", "event": "worker_operator_decision", "to": "parked_decision"},
+    {"entity": "job", "from": "running", "event": "worker_irrecoverable", "to": "blocked"},
+    {"entity": "job", "from": "running", "event": "worker_result_invalid", "to": "recovery_ready"},
+    {"entity": "job", "from": "running", "event": "worker_timed_out_with_progress", "to": "recovery_ready"},
+    {"entity": "job", "from": "running", "event": "worker_timed_out_without_progress", "to": "retry_wait"},
+    {"entity": "job", "from": "running", "event": "worker_cancelled", "to": "recovery_ready"},
+    {"entity": "job", "from": "retry_wait", "event": "cooldown_elapsed", "to": "queued"},
+    {"entity": "job", "from": "retry_wait", "event": "retry_exhausted", "to": "blocked"},
+    {"entity": "job", "from": "decomposition_ready", "event": "decomposition_succeeded", "to": "decomposed"},
+    {"entity": "job", "from": "decomposition_ready", "event": "decomposition_retryable_failure", "to": "retry_wait"},
+    {"entity": "job", "from": "parked_decision", "event": "decision_resolved", "to": "queued"},
+    {"entity": "job", "from": "parked_external", "event": "external_dependency_resolved", "to": "queued"},
+    {"entity": "job", "from": "blocked", "event": "operator_requeued", "to": "queued"},
+    {"entity": "job", "from": "queued", "event": "hard_ticket_breaker", "to": "parked_decision"},
+    {"entity": "job", "from": "reserved", "event": "hard_ticket_breaker", "to": "parked_decision"},
+    {"entity": "job", "from": "running", "event": "hard_ticket_breaker", "to": "parked_decision"},
+    {"entity": "job", "from": "retry_wait", "event": "hard_ticket_breaker", "to": "parked_decision"},
+    {"entity": "job", "from": "repair_ready", "event": "hard_ticket_breaker", "to": "parked_decision"},
+    {"entity": "job", "from": "recovery_ready", "event": "hard_ticket_breaker", "to": "parked_decision"},
+    {"entity": "job", "from": "decomposition_ready", "event": "hard_ticket_breaker", "to": "parked_decision"},
+    {"entity": "job", "from": "queued", "event": "dependency_became_external", "to": "parked_external"},
+    {"entity": "job", "from": "retry_wait", "event": "dependency_became_external", "to": "parked_external"},
+    {"entity": "job", "from": "repair_ready", "event": "dependency_became_external", "to": "parked_external"},
+    {"entity": "job", "from": "recovery_ready", "event": "dependency_became_external", "to": "parked_external"},
+    {"entity": "job", "from": "decomposition_ready", "event": "dependency_became_external", "to": "parked_external"},
+    {"entity": "job", "from": "queued", "event": "ticket_cancelled", "to": "cancelled"},
+    {"entity": "job", "from": "reserved", "event": "ticket_cancelled", "to": "cancelled"},
+    {"entity": "job", "from": "running", "event": "ticket_cancelled", "to": "cancelled"},
+    {"entity": "job", "from": "retry_wait", "event": "ticket_cancelled", "to": "cancelled"},
+    {"entity": "job", "from": "repair_ready", "event": "ticket_cancelled", "to": "cancelled"},
+    {"entity": "job", "from": "recovery_ready", "event": "ticket_cancelled", "to": "cancelled"},
+    {"entity": "job", "from": "decomposition_ready", "event": "ticket_cancelled", "to": "cancelled"},
+    {"entity": "job", "from": "parked_decision", "event": "ticket_cancelled", "to": "cancelled"},
+    {"entity": "job", "from": "parked_external", "event": "ticket_cancelled", "to": "cancelled"},
+    {"entity": "job", "from": "blocked", "event": "ticket_cancelled", "to": "cancelled"}
+  ],
+  "worker_terminal_results": {
+    "completed": "worker_completed",
+    "needs_repair": "worker_needs_repair",
+    "recoverable": "worker_recoverable",
+    "needs_decomposition": "worker_needs_decomposition",
+    "external_blocked": "worker_external_blocked",
+    "operator_decision": "worker_operator_decision",
+    "blocked": "worker_irrecoverable",
+    "malformed_result": "worker_result_invalid",
+    "timeout_with_progress": "worker_timed_out_with_progress",
+    "timeout_without_progress": "worker_timed_out_without_progress",
+    "cancelled_attempt": "worker_cancelled"
+  },
+  "current_ticket_state_compatibility": {
+    "pending": {"job_state": "queued", "interpretation": "Eligible or waiting work remains in the durable queue."},
+    "running": {"job_state": "running", "interpretation": "A reserved attempt has an attached execution unit."},
+    "completed": {"job_state": "completed", "interpretation": "Completion remains bound to authenticated merge evidence."},
+    "blocked": {"job_state": "blocked", "interpretation": "Irrecoverable technical failure remains parked until an explicit requeue decision."},
+    "decomposed": {"job_state": "decomposed", "interpretation": "The parent remains complete only through its exact bound child set."},
+    "external_blocked": {"job_state": "parked_external", "interpretation": "External dependency waits without consuming a worker lane."},
+    "operator_decision": {"job_state": "parked_decision", "interpretation": "A classified human decision waits without stopping independent work."},
+    "user_action": {"job_state": "parked_decision", "interpretation": "Legacy state requires classification before it may re-enter the queue."},
+    "needs_decomposition": {"job_state": "decomposition_ready", "interpretation": "Approved technical decomposition is executable scheduler work."},
+    "needs_repair": {"job_state": "repair_ready", "interpretation": "The existing PR and review ledger remain bound to the next repair attempt."},
+    "recoverable": {"job_state": "recovery_ready", "interpretation": "Preserved work may resume only after the recovery predicate succeeds."}
+  },
+  "operator_only_decisions": [
+    {"class": "product_or_security_policy", "description": "A product requirement, trust model, or security policy has no repository-authoritative answer."},
+    {"class": "accept_failed_gate", "description": "Proceeding would knowingly accept a failed review, security, CI, or verification gate."},
+    {"class": "destructive_external_action", "description": "The next action can irreversibly alter production, data, infrastructure, or credentials."},
+    {"class": "increase_hard_ceiling", "description": "More work requires raising a hard cost, attempt, or repair ceiling."},
+    {"class": "ambiguous_external_side_effect", "description": "Provider, Jira, GitHub, or deployment evidence cannot prove whether a side effect occurred."},
+    {"class": "trust_boundary_change", "description": "Continuation requires a stronger host, identity, containment, or credential boundary."}
+  ],
+  "global_admission_stops": [
+    "operator_paused",
+    "lease_lost",
+    "durable_state_invalid",
+    "hard_sprint_budget_exhausted",
+    "all_routes_unavailable",
+    "sprint_completed"
+  ],
+  "queue_policy": {
+    "eligibility_checks_are_non_consuming": true,
+    "skipped_jobs_remain_queued": true,
+    "ticket_local_events_never_stop_supervisor": true,
+    "worker_context_reuse_across_tickets": false
+  }
+}
