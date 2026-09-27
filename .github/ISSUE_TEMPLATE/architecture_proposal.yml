@@ -1,0 +1,62 @@
+name: Architecture proposal
+description: Propose a state-machine, persistence, recovery, trust, or breaking change.
+title: "[Architecture]: "
+labels:
+  - architecture
+  - "status: needs design"
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Use this form before implementing cross-cutting runtime changes. The
+        issue should reach an accepted contract before a large pull request is opened.
+  - type: textarea
+    id: context
+    attributes:
+      label: Context and failure mode
+    validations:
+      required: true
+  - type: textarea
+    id: invariants
+    attributes:
+      label: Invariants that must remain true
+      placeholder: |
+        - ...
+        - ...
+    validations:
+      required: true
+  - type: textarea
+    id: transitions
+    attributes:
+      label: Proposed states and transitions
+      description: Include success, failure, retry, restart, and cancellation behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: persistence
+    attributes:
+      label: Persistence and idempotency
+      description: Explain durable evidence, replay, external side effects, and crash recovery.
+    validations:
+      required: true
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Compatibility and migration
+      description: Describe impact on existing configs, checkpoints, caches, and host installations.
+    validations:
+      required: true
+  - type: textarea
+    id: tests
+    attributes:
+      label: Required tests
+      description: Name unit, integration, restart, concurrency, and fault-injection coverage.
+    validations:
+      required: true
+  - type: checkboxes
+    id: approval
+    attributes:
+      label: Before implementation
+      options:
+        - label: "I will wait for the issue to be labelled `status: ready` before opening a large implementation PR."
+          required: true
