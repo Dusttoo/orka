@@ -43,7 +43,8 @@ propose, confirm before writing.
    bundled `hooks/hooks.json`. The scripted merge and configured cleanup paths
    remain authoritative without hooks. Gitignore `.orchestration/.gate-status/`,
    `.orchestration/.gate-logs/`,
-   `.orchestration/.sprint-state/`, `.orchestration/.review-ledger/`,
+   `.orchestration/.sprint-state/`, `.orchestration/.supervisor/`,
+   `.orchestration/.review-ledger/`,
    `.orchestration/.review-results/`, `.orchestration/.env`,
    `.orchestration/.llm-runs/`, `.orchestration/.llm-usage/`, and the worktree
    base.

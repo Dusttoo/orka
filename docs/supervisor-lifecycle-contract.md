@@ -40,6 +40,11 @@ stateDiagram-v2
     active --> paused: operator_paused / all_routes_unavailable / hard sprint budget
     degraded --> paused: operator_paused / all_routes_unavailable / hard sprint budget
     paused --> active: operator_resumed / routes_available
+    active --> stopped: operator_stopped
+    degraded --> stopped: operator_stopped
+    paused --> stopped: operator_stopped
+    draining --> stopped: operator_stopped
+    takeover_pending --> stopped: operator_stopped
     active --> draining: drain_requested
     degraded --> draining: drain_requested
     draining --> paused: drain_completed
@@ -138,6 +143,7 @@ Route incidents move the supervisor to `degraded` while eligible work on healthy
 routes continues. New admission stops globally only for:
 
 - explicit operator pause;
+- explicit operator stop;
 - lost repository lease;
 - invalid durable state;
 - exhausted hard sprint budget;

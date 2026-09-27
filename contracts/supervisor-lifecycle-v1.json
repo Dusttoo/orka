@@ -53,6 +53,12 @@
       "required_evidence": ["operator_request_id", "pause_mode"],
       "replay": "no_op_if_applied"
     },
+    "operator_stopped": {
+      "entity": "supervisor",
+      "scope": "global",
+      "required_evidence": ["operator_request_id", "reason"],
+      "replay": "no_op_if_applied"
+    },
     "operator_resumed": {
       "entity": "supervisor",
       "scope": "global",
@@ -305,6 +311,11 @@
     {"entity": "supervisor", "from": "starting", "event": "preflight_failed", "to": "stopped"},
     {"entity": "supervisor", "from": "active", "event": "operator_paused", "to": "paused"},
     {"entity": "supervisor", "from": "degraded", "event": "operator_paused", "to": "paused"},
+    {"entity": "supervisor", "from": "active", "event": "operator_stopped", "to": "stopped"},
+    {"entity": "supervisor", "from": "degraded", "event": "operator_stopped", "to": "stopped"},
+    {"entity": "supervisor", "from": "paused", "event": "operator_stopped", "to": "stopped"},
+    {"entity": "supervisor", "from": "draining", "event": "operator_stopped", "to": "stopped"},
+    {"entity": "supervisor", "from": "takeover_pending", "event": "operator_stopped", "to": "stopped"},
     {"entity": "supervisor", "from": "active", "event": "drain_requested", "to": "draining"},
     {"entity": "supervisor", "from": "degraded", "event": "drain_requested", "to": "draining"},
     {"entity": "supervisor", "from": "draining", "event": "drain_completed", "to": "paused"},
@@ -420,6 +431,7 @@
   ],
   "global_admission_stops": [
     "operator_paused",
+    "operator_stopped",
     "lease_lost",
     "durable_state_invalid",
     "hard_sprint_budget_exhausted",

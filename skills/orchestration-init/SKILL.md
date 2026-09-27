@@ -51,7 +51,7 @@ working directory.
    in `rules_docs`; if missing, offer to create a starter so the project's real
    conventions have a place to live.
 4. Gitignore `.orchestration/.gate-status/`, `.orchestration/.gate-logs/`,
-   `.orchestration/.sprint-state/`,
+   `.orchestration/.sprint-state/`, `.orchestration/.supervisor/`,
    `.orchestration/.review-ledger/`, `.orchestration/.review-results/`, `.orchestration/.env`, `.orchestration/.llm-runs/`,
    `.orchestration/.llm-usage/`, and the configured worktree base.
 5. Do not copy hook commands into project settings. Claude Code and current

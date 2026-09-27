@@ -114,6 +114,10 @@ check "Claude init gitignores sprint checkpoints" \
   rg -q '\.orchestration/\.sprint-state/' "$ROOT/commands/orchestration-init.md"
 check "Codex init gitignores sprint checkpoints" \
   rg -q '\.orchestration/\.sprint-state/' "$ROOT/skills/orchestration-init/SKILL.md"
+check "Claude init gitignores supervisor runtime state" \
+  rg -q '\.orchestration/\.supervisor/' "$ROOT/commands/orchestration-init.md"
+check "Codex init gitignores supervisor runtime state" \
+  rg -q '\.orchestration/\.supervisor/' "$ROOT/skills/orchestration-init/SKILL.md"
 check "Claude init gitignores API run state" \
   rg -q '\.orchestration/\.llm-runs/' "$ROOT/commands/orchestration-init.md"
   rg -q '\.orchestration/\.review-results/' "$ROOT/commands/orchestration-init.md"
