@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Run and control Orka's host-owned repository supervisor process.
 
-This first Orka 2 runtime slice owns only the repository lease and supervisor
-lifecycle. Planning and worker dispatch are deliberately left to later slices.
+The supervisor owns the repository lease and a deterministic synchronization /
+planning loop.  It reports controller-authorized work but does not reserve or
+launch workers; dispatch belongs to the next Orka 2 runtime slice.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import hashlib
 import json
 import os
 import re
+import selectors
 import signal
 import socket
 import stat
@@ -31,6 +33,13 @@ from runtime_state import (
     shared_repository_root,
     shared_runtime_path,
     working_repository_root,
+)
+from api_agent import AgentError, load_yaml
+from supervisor_planning import (
+    ControllerAdapter,
+    PlanningError,
+    canonical_digest,
+    planning_cycle,
 )
 
 
@@ -372,7 +381,34 @@ def status_response(state: dict[str, Any]) -> dict[str, Any]:
     result["process_status"] = process_status(state.get("process"))
     result["lease_released_at"] = (state.get("lease") or {}).get("released_at", "")
     result["lease_release_count"] = (state.get("lease") or {}).get("release_count", 0)
+    result["planning"] = state.get("planning") or {"enabled": False}
     return result
+
+
+def planning_settings(repository: Path) -> dict[str, Any]:
+    """Resolve optional planning settings without breaking lifecycle-only repos."""
+
+    try:
+        config = load_yaml(canonical_config_path(repository))
+    except (AgentError, RuntimeStateError) as exc:
+        raise SupervisorError(str(exc)) from exc
+    configured = str(config.get("sprint_id") or "").strip()
+    raw_interval = config.get("supervisor_sync_interval_seconds", 60)
+    try:
+        interval = float(raw_interval)
+    except (TypeError, ValueError) as exc:
+        raise SupervisorError(
+            "supervisor_sync_interval_seconds must be numeric"
+        ) from exc
+    if interval < 5 or interval > 3600:
+        raise SupervisorError(
+            "supervisor_sync_interval_seconds must be from 5 through 3600"
+        )
+    return {
+        "enabled": bool(configured),
+        "requested_sprint": configured,
+        "sync_interval_seconds": interval,
+    }
 
 
 def prior_response(
@@ -406,12 +442,22 @@ def apply_control(
             "operator_paused",
             {"operator_request_id": request_id, "pause_mode": "hold"},
         )
+        state.setdefault("planning", {})["pause_cause"] = "operator_paused"
     elif command == "resume":
+        pause_cause = (state.get("planning") or {}).get("pause_cause")
+        if pause_cause in {
+            "all_routes_unavailable",
+            "hard_sprint_budget_exhausted",
+        }:
+            raise SupervisorError(
+                f"cannot override global pause condition: {pause_cause}"
+            )
         lifecycle.transition(
             state,
             "operator_resumed",
             {"operator_request_id": request_id, "blockers_checked": True},
         )
+        state.setdefault("planning", {})["pause_cause"] = ""
     elif command == "drain":
         lifecycle.transition(
             state, "drain_requested", {"operator_request_id": request_id}
@@ -424,6 +470,7 @@ def apply_control(
                 "queue_snapshot_digest": digest_bytes(b"[]"),
             },
         )
+        state.setdefault("planning", {})["pause_cause"] = "operator_drain"
     elif command == "stop":
         lifecycle.transition(
             state,
@@ -606,6 +653,16 @@ def run_daemon(repository: Path, handshake: Path) -> int:
             state["config_digest"] = config_digest
             state["runtime_fingerprint"] = runtime_fingerprint
             state["contract_digest"] = contract_digest
+            state["planning"] = planning_settings(repository)
+            state["planning"].update(
+                {
+                    "cycle_count": 0,
+                    "last_sync_at": "",
+                    "last_error": "",
+                    "next_wake_epoch": 0.0,
+                    "plan_digest": "",
+                }
+            )
             persist_state()
         except (OSError, RuntimeStateError, SupervisorError) as exc:
             diagnostic = str(exc)
@@ -628,7 +685,9 @@ def run_daemon(repository: Path, handshake: Path) -> int:
         server.bind(str(paths["socket"]))
         paths["socket"].chmod(0o600)
         server.listen(8)
-        server.settimeout(0.25)
+        server.setblocking(False)
+        selector = selectors.DefaultSelector()
+        selector.register(server, selectors.EVENT_READ)
         write_handshake(handshake, response_for(state))
 
         signal_number = 0
@@ -641,6 +700,7 @@ def run_daemon(repository: Path, handshake: Path) -> int:
         signal.signal(signal.SIGINT, stop_from_signal)
 
         should_stop = False
+        integrity_due = time.time()
         while not should_stop:
             if signal_number:
                 lifecycle.transition(
@@ -654,42 +714,231 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                 persist_state()
                 should_stop = True
                 continue
-            try:
-                observed_state_digest = digest_bytes(paths["state"].read_bytes())
-            except OSError:
-                observed_state_digest = "missing"
-            if observed_state_digest != expected_state_digest:
-                lifecycle.transition(
-                    state,
-                    "durable_state_invalid",
-                    {
-                        "state_digest": observed_state_digest,
-                        "validation_error": "durable supervisor state changed outside its owner",
-                    },
+            current_time = time.time()
+            if current_time >= integrity_due:
+                try:
+                    observed_state_digest = digest_bytes(paths["state"].read_bytes())
+                except OSError:
+                    observed_state_digest = "missing"
+                if observed_state_digest != expected_state_digest:
+                    lifecycle.transition(
+                        state,
+                        "durable_state_invalid",
+                        {
+                            "state_digest": observed_state_digest,
+                            "validation_error": "durable supervisor state changed outside its owner",
+                        },
+                    )
+                    persist_state()
+                    should_stop = True
+                    continue
+                if not lease_is_current(lock_handle, paths["lock"]):
+                    lifecycle.transition(
+                        state,
+                        "lease_lost",
+                        {
+                            "lease_id": lease_id,
+                            "observed_owner": "lease path no longer names the held inode",
+                        },
+                    )
+                    persist_state()
+                    should_stop = True
+                    continue
+                integrity_due = current_time + 1.0
+
+            planning = state.get("planning") or {}
+            pause_cause = planning.get("pause_cause")
+            system_pause = state.get("lifecycle_state") == "paused" and pause_cause in {
+                "all_routes_unavailable",
+                "hard_sprint_budget_exhausted",
+            }
+            planning_due = (
+                bool(planning.get("enabled"))
+                and (
+                    state.get("lifecycle_state") in {"active", "degraded"}
+                    or system_pause
                 )
-                persist_state()
-                should_stop = True
-                continue
-            if not lease_is_current(lock_handle, paths["lock"]):
-                lifecycle.transition(
-                    state,
-                    "lease_lost",
-                    {
-                        "lease_id": lease_id,
-                        "observed_owner": "lease path no longer names the held inode",
-                    },
-                )
-                persist_state()
-                should_stop = True
+                and current_time >= float(planning.get("next_wake_epoch") or 0)
+            )
+            if planning_due:
+                try:
+                    snapshot = planning_cycle(
+                        ControllerAdapter(repository, paths["directory"]),
+                        repository,
+                        planning,
+                        current_time=current_time,
+                        sync_interval=float(planning["sync_interval_seconds"]),
+                    )
+                    previous_digest = str(planning.get("plan_digest") or "")
+                    previous_provider_holds = list(planning.get("provider_holds") or [])
+                    planning.update(
+                        {
+                            **snapshot,
+                            "cycle_count": int(planning.get("cycle_count") or 0) + 1,
+                            "last_sync_at": now(),
+                            "last_error": "",
+                        }
+                    )
+                    if snapshot["plan_digest"] != previous_digest:
+                        state.setdefault("history", []).append(
+                            {
+                                "at": now(),
+                                "event": "controller_plan_updated",
+                                "from": state["lifecycle_state"],
+                                "to": state["lifecycle_state"],
+                                "evidence": {
+                                    "plan_digest": snapshot["plan_digest"],
+                                    "sync_receipt_digest": snapshot[
+                                        "sync_receipt_digest"
+                                    ],
+                                },
+                            }
+                        )
+                        state["history"] = state["history"][-256:]
+                    if snapshot["sprint_complete"] and state["lifecycle_state"] in {
+                        "active",
+                        "degraded",
+                        "draining",
+                    }:
+                        lifecycle.transition(
+                            state,
+                            "sprint_completed",
+                            {
+                                "summary_digest": snapshot["plan_digest"],
+                                "authenticated_completion_receipts": snapshot[
+                                    "sync_receipt_digest"
+                                ],
+                            },
+                        )
+                        should_stop = True
+                    elif snapshot["budget"].get("exhausted") and state[
+                        "lifecycle_state"
+                    ] in {"active", "degraded"}:
+                        lifecycle.transition(
+                            state,
+                            "hard_sprint_budget_exhausted",
+                            {
+                                "budget_receipt": snapshot["budget"]["digest"],
+                                "absolute_ceiling": snapshot["budget"][
+                                    "absolute_ceiling_usd"
+                                ],
+                            },
+                        )
+                        planning["pause_cause"] = "hard_sprint_budget_exhausted"
+                    elif snapshot["all_routes_unavailable"] and state[
+                        "lifecycle_state"
+                    ] in {"active", "degraded"}:
+                        lifecycle.transition(
+                            state,
+                            "all_routes_unavailable",
+                            {
+                                "route_incidents": canonical_digest(
+                                    snapshot["provider_holds"]
+                                ),
+                                "next_probe_at": snapshot["next_wake_epoch"],
+                            },
+                        )
+                        planning["pause_cause"] = "all_routes_unavailable"
+                    elif (
+                        snapshot["provider_holds"]
+                        and state["lifecycle_state"] == "active"
+                    ):
+                        lifecycle.transition(
+                            state,
+                            "route_degraded",
+                            {
+                                "route_identity": canonical_digest(
+                                    snapshot["provider_holds"]
+                                ),
+                                "incident_id": canonical_digest(
+                                    {
+                                        "holds": snapshot["provider_holds"],
+                                        "plan": snapshot["plan_digest"],
+                                    }
+                                ),
+                                "retry_at": snapshot["next_wake_epoch"],
+                            },
+                        )
+                    elif (
+                        not snapshot["provider_holds"]
+                        and state["lifecycle_state"] == "degraded"
+                    ):
+                        lifecycle.transition(
+                            state,
+                            "route_recovered",
+                            {
+                                "route_identity": canonical_digest(
+                                    previous_provider_holds
+                                ),
+                                "health_receipt": snapshot["plan_digest"],
+                            },
+                        )
+                    elif (
+                        system_pause
+                        and pause_cause == "all_routes_unavailable"
+                        and not snapshot["all_routes_unavailable"]
+                    ):
+                        lifecycle.transition(
+                            state,
+                            "routes_available",
+                            {"route_health_receipts": snapshot["plan_digest"]},
+                        )
+                        planning["pause_cause"] = ""
+                    elif (
+                        system_pause
+                        and pause_cause == "hard_sprint_budget_exhausted"
+                        and not snapshot["budget"].get("exhausted")
+                    ):
+                        # Budget authority changed outside the supervisor. Keep
+                        # the explicit pause, but allow a subsequent operator
+                        # resume now that the hard blocker is gone.
+                        planning["pause_cause"] = ""
+                    persist_state()
+                except PlanningError as exc:
+                    planning["last_error"] = str(exc)
+                    planning["last_sync_at"] = now()
+                    planning["next_wake_epoch"] = current_time + float(
+                        planning["sync_interval_seconds"]
+                    )
+                    state.setdefault("history", []).append(
+                        {
+                            "at": now(),
+                            "event": "controller_sync_failed",
+                            "from": state["lifecycle_state"],
+                            "to": state["lifecycle_state"],
+                            "evidence": {
+                                "diagnostic_digest": digest_bytes(
+                                    str(exc).encode("utf-8")
+                                )
+                            },
+                        }
+                    )
+                    state["history"] = state["history"][-256:]
+                    persist_state()
+
+            deadlines = [integrity_due]
+            if planning.get("enabled") and (
+                state.get("lifecycle_state") in {"active", "degraded"} or system_pause
+            ):
+                deadlines.append(float(planning.get("next_wake_epoch") or current_time))
+            timeout = max(0.0, min(deadlines) - time.time())
+            events = selector.select(timeout)
+            if not events:
                 continue
             try:
                 connection, _ = server.accept()
-            except TimeoutError:
+            except BlockingIOError:
                 continue
             with connection:
+                connection.setblocking(True)
                 try:
                     request = read_request(connection)
                     response, request_stop = apply_control(state, lifecycle, request)
+                    if request["command"] == "resume" and state.get("planning", {}).get(
+                        "enabled"
+                    ):
+                        state["planning"]["next_wake_epoch"] = 0.0
+                        state["planning"]["pause_cause"] = ""
                     persist_state()
                     send_response(connection, response)
                     should_stop = should_stop or request_stop

@@ -351,11 +351,12 @@ See [docs/sprint-controller.md](docs/sprint-controller.md) for the trust boundar
 impossible guarantees, restart invariant, and rejected fragile designs.
 The accepted Orka 2 lifecycle semantics are specified separately in the
 [durable supervisor lifecycle contract](docs/supervisor-lifecycle-contract.md);
-the first implementation slice provides a
-[host-owned supervisor lifecycle process](docs/sprint-supervisor.md) with an
-exclusive repository lease, detached session, and deterministic pause, drain,
-resume, and stop transitions. Ticket planning and worker dispatch remain on the
-Orka 2 roadmap and are not performed by this process yet.
+the current implementation provides a
+[host-owned supervisor process](docs/sprint-supervisor.md) with an exclusive
+repository lease, detached session, deterministic synchronization/planning,
+durable cooldown wakes, and explicit pause, drain, resume, and stop
+transitions. It publishes controller-authorized work without model turns;
+worker reservation and dispatch remain the next Orka 2 slice.
 
 ## The merge-guard
 

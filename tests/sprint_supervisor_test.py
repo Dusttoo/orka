@@ -12,9 +12,151 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+import sys
 
 ROOT = Path(__file__).resolve().parent.parent
 SUPERVISOR = ROOT / "scripts/sprint-supervisor.py"
+sys.path.insert(0, str(ROOT / "scripts"))
+
+from supervisor_planning import (  # noqa: E402
+    classify_cycle,
+    due_health_roles,
+    planning_cycle,
+)
+
+
+class FakePlanningAdapter:
+    def __init__(self, plan: dict, summary: dict):
+        self.plan_value = plan
+        self.summary_value = summary
+        self.probes: list[str] = []
+
+    def health_probe(self, role: str) -> dict:
+        self.probes.append(role)
+        return {"state": "healthy"}
+
+    def synchronize(self) -> dict:
+        return {
+            "checkpoint": "/tmp/checkpoint.json",
+            "sprint": {"id": "99", "name": "Test Sprint"},
+            "tickets": 2,
+        }
+
+    def plan(self, sprint: str) -> dict:
+        assert sprint == "99"
+        return self.plan_value
+
+    def summary(self, sprint: str) -> dict:
+        assert sprint == "99"
+        return self.summary_value
+
+
+class PlanningLoopTests(unittest.TestCase):
+    def budget(self) -> dict:
+        return {
+            "spent_usd": "0",
+            "reserved_usd": "0",
+            "projected_usd": "0",
+            "absolute_ceiling_usd": "20",
+            "digest": "budget-receipt",
+            "exhausted": False,
+        }
+
+    def test_independent_blocked_ticket_does_not_hide_ready_work(self) -> None:
+        plan = {
+            "sprint": {"id": "99"},
+            "launch": ["PNP-2"],
+            "waiting": [{"key": "PNP-1", "reasons": ["dependency blocked"]}],
+            "autonomous_work_remaining": True,
+        }
+        result = classify_cycle(
+            plan,
+            {"sprint_complete": False},
+            self.budget(),
+            current_time=100,
+            sync_interval=60,
+        )
+        self.assertEqual(result["plan"]["launch"], ["PNP-2"])
+        self.assertFalse(result["autonomous_work_exhausted"])
+        self.assertFalse(result["all_routes_unavailable"])
+
+    def test_provider_cooldown_is_waitable_and_sets_exact_deadline(self) -> None:
+        plan = {
+            "sprint": {"id": "99"},
+            "provider_holds": [
+                {"provider": "openai", "state": "rate_limited", "retry_at": 125}
+            ],
+            "health_probes": [
+                {"provider": "openai", "role": "sprint-worker", "retry_at": 125}
+            ],
+            "autonomous_work_remaining": True,
+        }
+        result = classify_cycle(
+            plan,
+            {"sprint_complete": False},
+            self.budget(),
+            current_time=100,
+            sync_interval=60,
+        )
+        self.assertEqual(result["next_wake_epoch"], 125)
+        self.assertEqual(result["wait_reason"], "durable-deadline")
+        self.assertTrue(result["all_routes_unavailable"])
+        self.assertFalse(result["autonomous_work_exhausted"])
+        self.assertEqual(due_health_roles(plan, 125), ["sprint-worker"])
+
+    def test_true_exhaustion_is_distinct_from_authenticated_completion(self) -> None:
+        exhausted = classify_cycle(
+            {"sprint": {"id": "99"}, "autonomous_work_remaining": False},
+            {"sprint_complete": False},
+            self.budget(),
+            current_time=100,
+        )
+        self.assertTrue(exhausted["autonomous_work_exhausted"])
+        self.assertFalse(exhausted["sprint_complete"])
+
+        completed = classify_cycle(
+            {"sprint": {"id": "99"}, "autonomous_work_remaining": False},
+            {"sprint_complete": True},
+            self.budget(),
+            current_time=100,
+        )
+        self.assertTrue(completed["sprint_complete"])
+
+    def test_replayed_evidence_produces_the_same_plan_digest(self) -> None:
+        repository = Path(tempfile.mkdtemp(prefix="orka-planning-test-"))
+        try:
+            config = repository / ".orchestration/config.yaml"
+            config.parent.mkdir(parents=True)
+            config.write_text(
+                "schema_version: 1\nllm:\n  budgets:\n    max_usd_per_sprint: 20\n",
+                encoding="utf-8",
+            )
+            plan = {
+                "sprint": {"id": "99"},
+                "launch": ["PNP-2"],
+                "autonomous_work_remaining": True,
+            }
+            adapter = FakePlanningAdapter(plan, {"sprint_complete": False})
+            first = planning_cycle(
+                adapter,
+                repository,
+                {},
+                current_time=100,
+                sync_interval=60,
+            )
+            second = planning_cycle(
+                adapter,
+                repository,
+                first,
+                current_time=101,
+                sync_interval=60,
+            )
+            self.assertEqual(first["plan_digest"], second["plan_digest"])
+            self.assertEqual(
+                first["sync_receipt_digest"], second["sync_receipt_digest"]
+            )
+        finally:
+            shutil.rmtree(repository, ignore_errors=True)
 
 
 class SupervisorProcessTests(unittest.TestCase):
