@@ -131,6 +131,17 @@ value["verdict"] = "PASS"
 json.dump(value, open(sys.argv[2], "w"))
 PY
 run_fail "PASS with a blocking finding is rejected" "$PIPELINE" validate-review --gate code-review --input "$TMP/contradictory-review.json"
+cat > "$TMP/empty-checks-pass-review.json" <<'JSON'
+{"schema_version":1,"gate":"code-review","verdict":"PASS","checks":[],"findings":[]}
+JSON
+run_fail "PASS with zero checks is rejected" "$PIPELINE" validate-review --gate code-review --input "$TMP/empty-checks-pass-review.json"
+python3 - "$TMP/empty-checks-pass-review.json" "$TMP/empty-checks-security-pass.json" <<'PY'
+import json, sys
+value = json.load(open(sys.argv[1]))
+value["gate"] = "security-review"
+json.dump(value, open(sys.argv[2], "w"))
+PY
+run_fail "security gate PASS with zero checks is rejected" "$PIPELINE" validate-review --gate security-review --input "$TMP/empty-checks-security-pass.json"
 
 # --- CI-verified checks --------------------------------------------------------
 # A check the repository forbids running locally (for example a DB integration
