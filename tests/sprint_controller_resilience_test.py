@@ -1153,6 +1153,42 @@ class ResilienceTests(unittest.TestCase):
             "product_or_security_policy",
         )
 
+    def test_finish_replay_is_idempotent_but_changed_terminal_is_rejected(self):
+        path = controller.state_path(self.cfg["state_dir"], "1")
+        path.parent.mkdir(parents=True)
+        self.ticket("PROJ-1", "running")
+        controller.save(path, self.state)
+        result = argparse.Namespace(
+            sprint="1",
+            ticket="PROJ-1",
+            outcome="needs_repair",
+            summary="review found a bounded defect",
+            branch="1-fixture",
+            pr="123",
+            attempt_token="token",
+            decision_class="",
+            decision_question="",
+            external_dependency=[],
+            external_dependency_receipt="",
+        )
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            controller.finish(result, self.cfg)
+            controller.finish(result, self.cfg)
+        responses = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertFalse(responses[0]["duplicate"])
+        self.assertTrue(responses[1]["duplicate"])
+        ticket = controller.load(path)["tickets"]["PROJ-1"]
+        self.assertEqual(
+            len([item for item in ticket["history"] if item["event"] == "finished"]),
+            1,
+        )
+
+        changed = copy.copy(result)
+        changed.summary = "different terminal result"
+        with self.assertRaises(controller.SprintError):
+            controller.finish(changed, self.cfg)
+
     def test_live_recovery_retains_lane_until_unit_is_absent(self):
         self.ticket(
             "PROJ-1",

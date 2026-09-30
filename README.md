@@ -357,9 +357,10 @@ the current implementation provides a
 repository lease, detached session, deterministic synchronization/planning,
 durable cooldown wakes, controller-owned worker dispatch, strict terminal-result
 bindings, ticket-local parking and decision resolution, authenticated external
-dependency wakeups, immediate lane refill, and explicit pause, drain, resume,
-and stop transitions. Desktop and API workers pass through the same versioned
-lifecycle contract; stale or malformed results cannot become successful work.
+dependency wakeups, authenticated crash takeover, immediate lane refill, and
+explicit pause, drain, resume, and stop transitions. Desktop and API workers
+pass through the same versioned lifecycle contract; stale or malformed results
+cannot become successful work.
 
 ## The merge-guard
 

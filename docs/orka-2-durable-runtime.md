@@ -1,10 +1,11 @@
 # Orka 2: durable supervisor runtime
 
 Status: accepted architectural direction; implementation in independently
-releasable slices. Orka 1.8.6 provides the detached supervisor, repository
+releasable slices. Orka 1.8.7 provides the detached supervisor, repository
 lease lifecycle, deterministic synchronization/planning loop, controller-owned
 desktop/API worker dispatch, versioned terminal-result transitions, ticket-local
-parking, durable retry wakeups, and classified operator-decision resolution.
+parking, durable retry wakeups, classified operator-decision resolution, and
+authenticated restart after a mechanically proven supervisor death.
 
 Orka's current controller has durable checkpoints and mechanical gates, but a
 model-driven captain still performs the outer `plan -> launch -> wait -> finish

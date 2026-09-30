@@ -1,6 +1,6 @@
 # Host-owned sprint supervisor
 
-Orka 1.8.6 extends the detached Orka 2 supervisor with a deterministic outer
+Orka 1.8.7 extends the detached Orka 2 supervisor with a deterministic outer
 planning loop. The host process owns one repository lease, synchronizes through
 the existing authenticated Jira/GitHub/controller/provider adapters, publishes
 controller-authorized work, fills available lanes through controller-owned
@@ -21,6 +21,7 @@ The state snapshot records:
 - the resolved repository identity;
 - the lease UUID, monotonic generation, lock inode, acquisition, and release;
 - the exact host process birth identity and detached session;
+- a separate durable digest receipt for the last fully persisted snapshot;
 - bounded transition and operator-request history;
 - the latest synchronized plan, evidence digests, hard-budget receipt, and next
   wake deadline.
@@ -124,9 +125,18 @@ If the prior worker cannot be proven absent from its authenticated tombstone,
 pipe a root-issued recovery capability through `--operator-capability-stdin`;
 the capability is never placed in the process argument list.
 
-An unclean process death leaves a nonterminal state. Automatic takeover is
-intentionally refused until issue #77 adds heartbeat, predecessor-absence, and
-split-brain proofs. This is safer than silently inventing a clean stop.
+An unclean supervisor exit does not discard work. A new `start` first acquires
+the unchanged lease inode, verifies the prior state-digest receipt, proves the
+exact predecessor process identity absent, and requires identical config,
+runtime, and lifecycle-contract digests. It then records
+`takeover_requested -> predecessor_absent`, advances the lease generation, and
+preserves the plan, jobs, attempts, terminal receipts, requests, timers, and
+pause or drain mode. Live or ambiguous predecessor status, a replaced lease,
+tampered state, or changed runtime policy is refused without modifying the prior
+checkpoint. Stop cleanly before upgrading Orka or changing configuration.
+
+See [Supervisor restart and failure injection](supervisor-restart-testing.md)
+for reproducible operator checks.
 
 ## Compatibility and current limitations
 
@@ -136,6 +146,7 @@ continues in lifecycle-only mode. The optional
 must each be 5 through 3600 seconds.
 Initialization should gitignore `.orchestration/.supervisor/`.
 
-This slice does not recover a crashed supervisor, add preserved-PR recovery or
-resource exclusions, or weaken existing review, security, budget, and merge
-gates.
+Restart does not invent missing worker or provider receipts. Ambiguous launches
+remain fenced for reconciliation, and preserved-PR recovery still requires its
+existing controller authority. Resource exclusions remain a later slice. No
+review, security, budget, or merge gate is weakened.

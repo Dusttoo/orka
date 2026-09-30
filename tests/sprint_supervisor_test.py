@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import shutil
@@ -205,6 +206,145 @@ class PlanningLoopTests(unittest.TestCase):
         self.assertEqual(result["dispatch"]["retrying"], ["PNP-2"])
         self.assertEqual(result["dispatch"]["parked"], ["PNP-3"])
         self.assertEqual(result["dispatch"]["blocked"], ["PNP-4"])
+
+
+class TakeoverStateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = Path(tempfile.mkdtemp(prefix="orka-takeover-state-test-"))
+        subprocess.run(["git", "init", "-q", str(self.temp)], check=True)
+        self.contract_digest = "contract"
+        self.config_digest = "config"
+        self.runtime_digest = "runtime"
+        self.settings = {
+            "enabled": False,
+            "requested_sprint": "",
+            "sync_interval_seconds": 60,
+            "concurrency_max": 3,
+            "ticket_retry_seconds": 30,
+        }
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.temp, ignore_errors=True)
+
+    def previous(self, lifecycle_state: str) -> dict:
+        jobs = {
+            state: {"ticket": f"PROJ-{index}", "state": state}
+            for index, state in enumerate(
+                (
+                    "queued",
+                    "reserved",
+                    "running",
+                    "retry_wait",
+                    "repair_ready",
+                    "recovery_ready",
+                    "decomposition_ready",
+                    "parked_decision",
+                    "parked_external",
+                    "blocked",
+                ),
+                1,
+            )
+        }
+        value = {
+            "schema_version": 1,
+            "contract_id": "orka.supervisor-lifecycle",
+            "contract_schema_version": 1,
+            "repository": str(self.temp),
+            "lifecycle_state": lifecycle_state,
+            "last_event": "fixture",
+            "started_at": "before",
+            "updated_at": "before",
+            "stopped_at": "",
+            "process": {"pid": 99999, "start_fingerprint": "old-process"},
+            "lease": {"id": "old-lease", "generation": 4},
+            "control_socket": "old-socket",
+            "history": [],
+            "requests": [
+                {
+                    "request_id": "pause-1",
+                    "command": "pause",
+                    "response": {"status": "ok"},
+                }
+            ],
+            "config_digest": self.config_digest,
+            "runtime_fingerprint": self.runtime_digest,
+            "contract_digest": self.contract_digest,
+            "planning": {"pause_cause": "operator_paused", "next_wake_epoch": 99},
+            "dispatch": {"jobs": jobs, "launch_count": 10, "terminal_count": 2},
+        }
+        if lifecycle_state == "takeover_pending":
+            value["takeover"] = {"resume_state": "active"}
+        return value
+
+    def test_every_nonterminal_supervisor_state_preserves_jobs_on_takeover(self) -> None:
+        _contract, lifecycle, _digest = sprint_supervisor.contract()
+        for source in (
+            "starting",
+            "active",
+            "degraded",
+            "paused",
+            "draining",
+            "takeover_pending",
+        ):
+            with self.subTest(source=source):
+                previous = self.previous(source)
+                jobs = copy.deepcopy(previous["dispatch"]["jobs"])
+                with patch.object(
+                    sprint_supervisor, "process_status", return_value="absent"
+                ):
+                    recovered = sprint_supervisor.takeover_state(
+                        previous,
+                        identity={
+                            "pid": 123,
+                            "start_fingerprint": "new-process",
+                            "session_id": 123,
+                        },
+                        lease={"id": "new-lease", "generation": 5},
+                        lifecycle=lifecycle,
+                        config_digest=self.config_digest,
+                        runtime_digest=self.runtime_digest,
+                        contract_digest=self.contract_digest,
+                        settings=self.settings,
+                    )
+                expected = source if source in {"paused", "draining"} else "active"
+                self.assertEqual(recovered["lifecycle_state"], expected)
+                self.assertEqual(recovered["dispatch"]["jobs"], jobs)
+                self.assertEqual(recovered["requests"], previous["requests"])
+                events = [item["event"] for item in recovered["history"]]
+                self.assertIn("takeover_requested", events)
+                self.assertIn("predecessor_absent", events)
+
+    def test_takeover_rejects_live_unknown_or_changed_predecessor_evidence(self) -> None:
+        _contract, lifecycle, _digest = sprint_supervisor.contract()
+        arguments = {
+            "identity": {
+                "pid": 123,
+                "start_fingerprint": "new-process",
+                "session_id": 123,
+            },
+            "lease": {"id": "new-lease", "generation": 5},
+            "lifecycle": lifecycle,
+            "config_digest": self.config_digest,
+            "runtime_digest": self.runtime_digest,
+            "contract_digest": self.contract_digest,
+            "settings": self.settings,
+        }
+        for status in ("live", "unknown"):
+            with self.subTest(status=status), patch.object(
+                sprint_supervisor, "process_status", return_value=status
+            ):
+                with self.assertRaises(sprint_supervisor.SupervisorError):
+                    sprint_supervisor.takeover_state(self.previous("active"), **arguments)
+        with patch.object(sprint_supervisor, "process_status", return_value="absent"):
+            changed = dict(arguments, runtime_digest="changed")
+            with self.assertRaises(sprint_supervisor.SupervisorError):
+                sprint_supervisor.takeover_state(self.previous("active"), **changed)
+            changed = dict(
+                arguments,
+                lease={"id": "new-lease", "generation": 5, "lock_inode": 2},
+            )
+            with self.assertRaises(sprint_supervisor.SupervisorError):
+                sprint_supervisor.takeover_state(self.previous("active"), **changed)
 
 
 class SupervisorProcessTests(unittest.TestCase):
@@ -440,19 +580,64 @@ class SupervisorProcessTests(unittest.TestCase):
         self.assertEqual(state["lease"]["release_count"], 1)
         self.assertFalse(self.process_live(state))
 
-    def test_unclean_process_death_requires_future_takeover_authority(self) -> None:
+    def test_unclean_process_death_resumes_with_exact_absence_receipt(self) -> None:
+        repository = self.repository()
+        first = self.output(self.run_cli("start", repository))
+        state = self.read_state(repository)
+        os.kill(state["process"]["pid"], signal.SIGKILL)
+        self.wait_for(lambda: not self.process_live(state))
+
+        replacement = self.output(self.run_cli("start", repository))
+        self.assertEqual(replacement["lifecycle_state"], "active")
+        self.assertEqual(replacement["lease_generation"], 2)
+        self.assertNotEqual(replacement["lease_id"], first["lease_id"])
+        recovered = self.read_state(repository)
+        self.assertEqual(recovered["takeover"]["absence_receipt"]["status"], "absent")
+        self.assertEqual(
+            recovered["takeover"]["predecessor_lease"]["id"], first["lease_id"]
+        )
+        events = [item["event"] for item in recovered["history"]]
+        self.assertIn("takeover_requested", events)
+        self.assertIn("predecessor_absent", events)
+
+    def test_pause_and_idempotent_request_survive_unclean_restart(self) -> None:
+        repository = self.repository()
+        self.run_cli("start", repository)
+        self.run_cli("pause", repository, "--request-id", "pause-1")
+        before = self.read_state(repository)
+        os.kill(before["process"]["pid"], signal.SIGKILL)
+        self.wait_for(lambda: not self.process_live(before))
+
+        restarted = self.output(self.run_cli("start", repository))
+        self.assertEqual(restarted["lifecycle_state"], "paused")
+        state = self.read_state(repository)
+        pause_events = [
+            item for item in state["history"] if item["event"] == "operator_paused"
+        ]
+        replay = self.output(
+            self.run_cli("pause", repository, "--request-id", "pause-1")
+        )
+        self.assertEqual(replay["lifecycle_state"], "paused")
+        after = self.read_state(repository)
+        self.assertEqual(
+            len([item for item in after["history"] if item["event"] == "operator_paused"]),
+            len(pause_events),
+        )
+
+    def test_unclean_restart_rejects_tampered_durable_state(self) -> None:
         repository = self.repository()
         self.run_cli("start", repository)
         state = self.read_state(repository)
         os.kill(state["process"]["pid"], signal.SIGKILL)
         self.wait_for(lambda: not self.process_live(state))
 
+        state_path = repository / ".orchestration/.supervisor/state.json"
+        altered = self.read_state(repository)
+        altered["updated_at"] = "tampered-after-crash"
+        state_path.write_text(json.dumps(altered), encoding="utf-8")
         replacement = self.run_cli("start", repository, check=False)
         self.assertEqual(replacement.returncode, 2)
-        self.assertIn("takeover authority", replacement.stderr)
-        unchanged = self.read_state(repository)
-        self.assertEqual(unchanged["lease"]["id"], state["lease"]["id"])
-        self.assertEqual(unchanged["lifecycle_state"], "active")
+        self.assertIn("state digest does not match", replacement.stderr)
 
 
 if __name__ == "__main__":
