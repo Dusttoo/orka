@@ -177,6 +177,11 @@ The controller repeats the observation while holding its checkpoint lock and
 records evidence and preservation digests before clearing only execution-scoped
 fields. A replay sees the already-pending ticket and cannot create another
 attempt, worker, provider request, or reservation. Ambiguous launches remain
-fenced for reconciliation, and preserved-PR recovery still requires its
-existing controller authority. No review, security, budget, or merge gate is
+fenced for reconciliation. Clean, quiescent preserved PRs with exact execution,
+GitHub, worktree, revision, provider-settlement, and review-history evidence are
+reconciled automatically before lane allocation. The supervisor immediately
+replans and routes the same PR through the bounded continuation pipeline without
+creating a branch, worktree, attempt history, or review generation. Dirty,
+active, moved, unknown, or financially unsettled PRs remain visible through
+stable recovery reason codes. No review, security, budget, or merge gate is
 weakened.

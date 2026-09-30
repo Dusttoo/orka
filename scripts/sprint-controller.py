@@ -1161,9 +1161,11 @@ def reconcile_authenticated_external_holds(
             continue
         classification = ticket.get("terminal_classification") or {}
         dependencies = classification.get("dependencies")
-        if classification.get("kind") != "external_dependency" or not isinstance(
-            dependencies, list
-        ) or not dependencies:
+        if (
+            classification.get("kind") != "external_dependency"
+            or not isinstance(dependencies, list)
+            or not dependencies
+        ):
             continue
         if any(
             dependency not in ticket.get("dependencies", [])
@@ -1178,8 +1180,7 @@ def reconcile_authenticated_external_holds(
             else:
                 raw_status = state.get("dependency_status", {}).get(dependency)
                 complete = bool(
-                    isinstance(raw_status, str)
-                    and raw_status.casefold() in cfg["done"]
+                    isinstance(raw_status, str) and raw_status.casefold() in cfg["done"]
                 )
             if not complete:
                 all_complete = False
@@ -1212,7 +1213,9 @@ def reconcile_authenticated_external_holds(
         previous_reason = ticket.get("reason", "")
         ticket["state"] = "pending"
         ticket["reason"] = "authenticated external dependencies are complete"
-        ticket["next_launch_continuation"] = bool(ticket.get("pr") or ticket.get("branch"))
+        ticket["next_launch_continuation"] = bool(
+            ticket.get("pr") or ticket.get("branch")
+        )
         _clear_finished_execution(ticket)
         classification["resolved_receipt"] = receipt
         ticket.setdefault("history", []).append(
@@ -2601,7 +2604,6 @@ def preserved_pr_reconciliation_candidate(ticket, cfg, spend):
         and ticket.get("pr")
         and ticket.get("branch")
         and int(ticket.get("attempts") or 0) > 0
-        and not spend.get("reserved_usd", 0)
         and (
             ticket.get("verified_commits")
             or any(
@@ -2649,8 +2651,13 @@ def branch_worktree(root: Path, branch: str, configured_base: str) -> Path:
 
 def worktree_is_quiescent(path: Path) -> bool:
     """Require a clean Linux worktree with no process cwd or open fd beneath it."""
+    return worktree_recovery_status(path) == "clean"
+
+
+def worktree_recovery_status(path: Path) -> str:
+    """Classify a preserved worktree without treating uncertainty as absence."""
     if not sys.platform.startswith("linux") or not Path("/proc").is_dir():
-        return False
+        return "unknown"
     try:
         status = subprocess.run(
             ["git", "status", "--porcelain", "--untracked-files=all"],
@@ -2661,9 +2668,9 @@ def worktree_is_quiescent(path: Path) -> bool:
             timeout=15,
         )
     except (OSError, subprocess.SubprocessError):
-        return False
+        return "unknown"
     if status.stdout.strip():
-        return False
+        return "dirty"
     prefix = str(path) + os.sep
     for process in Path("/proc").glob("[0-9]*"):
         if process.name == str(os.getpid()):
@@ -2679,8 +2686,8 @@ def worktree_is_quiescent(path: Path) -> bool:
             except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
                 continue
             if target == str(path) or target.startswith(prefix):
-                return False
-    return True
+                return "active"
+    return "clean"
 
 
 def worktree_revision(path: Path) -> dict[str, str]:
@@ -2715,15 +2722,175 @@ def verify_worktree_receipt(path: Path, receipt: dict[str, Any]) -> None:
         )
 
 
-def observe_preserved_pr(
-    cfg: dict[str, Any], ticket: dict[str, Any]
-) -> dict[str, Any]:
+def observe_preserved_pr(cfg: dict[str, Any], ticket: dict[str, Any]) -> dict[str, Any]:
     from github_progress import ProgressError, observe
 
     try:
         return observe(cfg["shared_root"], ticket, "pr_opened", str(ticket["pr"]))
     except ProgressError as exc:
         raise SprintError(str(exc)) from exc
+
+
+def _recovery_execution_evidence(
+    ticket: dict[str, Any],
+    cfg: dict[str, Any],
+    *,
+    status: str | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """Return the shared execution evidence used by every automatic recovery path."""
+
+    identity = ticket.get("worker_identity")
+    identity = identity if isinstance(identity, dict) else {}
+    launch = ticket.get("launch_evidence")
+    launch = launch if isinstance(launch, dict) else {}
+    invocation_id = str(identity.get("invocation_id") or "")
+    containment = str(identity.get("containment") or "")
+    profile = (
+        "isolated"
+        if containment in {"cgroup-v2-systemd-scope", "test-supervisor"}
+        else "cooperative"
+    )
+    observed_status = (
+        status
+        if status in {"live", "absent", "unknown"}
+        else execution_unit_status(identity)
+        if identity.get("kind") == "execution_unit"
+        else "unknown"
+    )
+    receipt, terminal_receipt = _recovery_terminal_receipt(identity)
+    identity_bound = bool(
+        identity.get("kind") == "execution_unit"
+        and invocation_id
+        and launch.get("invocation_id") == invocation_id
+        and launch.get("identity") == identity
+        and launch.get("status") == "launched"
+        and launch.get("ticket") == ticket.get("key")
+        and int(ticket.get("attempts") or 0) > 0
+        and int(launch.get("attempt") or 0) == int(ticket.get("attempts") or 0)
+        and launch.get("attempt_token") == ticket.get("attempt_token")
+        and ticket.get("attempt_token")
+        and ticket.get("run_ref")
+    )
+    descendants = "unknown"
+    cleanup_complete = False
+    cooperative_authorized = bool(
+        containment == "cooperative-session"
+        and cfg.get("cooperative_auto_recovery")
+        and launch.get("cooperative_auto_recovery")
+    )
+    if observed_status == "live":
+        descendants = "live"
+    elif observed_status == "absent" and terminal_receipt:
+        if profile == "isolated":
+            descendants = "absent"
+        else:
+            cleanup = (receipt or {}).get("cooperative_cleanup") or {}
+            pgid = cleanup.get("worker_pgid")
+            if (
+                cleanup.get("gateway_closed") is True
+                and isinstance(pgid, int)
+                and not isinstance(pgid, bool)
+                and pgid > 1
+            ):
+                try:
+                    os.killpg(pgid, 0)
+                except ProcessLookupError:
+                    cleanup_complete = True
+                    descendants = "absent"
+                except OSError:
+                    descendants = "unknown"
+                else:
+                    descendants = "live"
+    return profile, {
+        "status": observed_status,
+        "identity_bound": identity_bound,
+        "terminal_receipt": terminal_receipt,
+        "descendants": descendants,
+        "cooperative_authorized": cooperative_authorized,
+        "cleanup_complete": cleanup_complete,
+    }
+
+
+def preserved_pr_recovery_assessment(
+    ticket: dict[str, Any],
+    cfg: dict[str, Any],
+    spend: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Authenticate a preserved PR and evaluate it through the shared contract."""
+
+    spend = (
+        spend
+        if spend is not None
+        else usage_snapshots(cfg).get(str(ticket.get("key") or ""), {})
+    )
+    profile, execution = _recovery_execution_evidence(ticket, cfg)
+    preservation = recovery_preservation_snapshot(ticket, spend, cfg)
+    receipt: dict[str, Any] = {}
+    observation: dict[str, Any] = {}
+    worktree: Path | None = None
+    worktree_status = "unknown"
+    revision_match = False
+    try:
+        observation = observe_preserved_pr(cfg, ticket)
+        receipt = observation.get("receipt") or {}
+    except (OSError, SprintError):
+        pass
+    try:
+        configured_base = config_scalar(
+            cfg["config"], "worktree_base", ".claude/worktrees"
+        )
+        worktree = branch_worktree(
+            cfg["shared_root"], str(ticket.get("branch") or ""), configured_base
+        )
+        worktree_status = worktree_recovery_status(worktree)
+        if worktree_status == "active":
+            # A live owner is a wait condition. Re-evaluate its revision only
+            # after the worktree becomes quiescent instead of misclassifying it.
+            revision_match = True
+        if worktree_status == "clean" and receipt:
+            revision = worktree_revision(worktree)
+            revision_match = bool(
+                revision["head"] == receipt.get("head")
+                and revision["tree"] == receipt.get("tree")
+            )
+    except (OSError, SprintError):
+        pass
+    binding_complete = bool(
+        execution["identity_bound"]
+        and ticket.get("key")
+        and int(ticket.get("attempts") or 0) > 0
+        and worktree
+        and receipt.get("branch") == ticket.get("branch")
+        and str(receipt.get("url") or "") == str(ticket.get("pr") or "")
+        and receipt.get("head")
+        and receipt.get("tree")
+    )
+    evidence = {
+        "schema": RECOVERY_SCHEMA,
+        "profile": profile,
+        "execution": execution,
+        "provider": {
+            "state": (
+                "pending" if float(spend.get("reserved_usd") or 0) > 0 else "settled"
+            )
+        },
+        "work": {
+            "kind": "preserved_pr",
+            "binding_complete": binding_complete,
+            "worktree": worktree_status,
+            "revision_match": revision_match,
+        },
+        "history": {"preserved_fields": list(preservation)},
+    }
+    evaluation = evaluate_recovery(evidence)
+    evaluation["preservation_digest"] = recovery_digest(preservation)
+    return {
+        "evaluation": evaluation,
+        "observation": observation,
+        "receipt": receipt,
+        "worktree": worktree,
+        "preservation": preservation,
+    }
 
 
 def verify_recovery_binding(
@@ -2744,9 +2911,7 @@ def verify_recovery_binding(
             raise SprintError(
                 "preserved PR changed after recovery authentication; reconcile again"
             )
-    configured_base = config_scalar(
-        cfg["config"], "worktree_base", ".claude/worktrees"
-    )
+    configured_base = config_scalar(cfg["config"], "worktree_base", ".claude/worktrees")
     worktree = branch_worktree(
         cfg["shared_root"], str(binding["branch"]), configured_base
     )
@@ -2771,32 +2936,34 @@ def reconcile_preserved_pr(args: argparse.Namespace, cfg: dict[str, Any]) -> Non
                 f"ticket {key} is not eligible for preserved PR reconciliation"
             )
         snapshot = json.loads(json.dumps(ticket))
-    observation = observe_preserved_pr(cfg, snapshot)
-    configured_base = config_scalar(cfg["config"], "worktree_base", ".claude/worktrees")
-    worktree = branch_worktree(
-        cfg["shared_root"], str(snapshot["branch"]), configured_base
-    )
-    if not worktree_is_quiescent(worktree):
-        raise SprintError(
-            "preserved PR worktree is dirty, active, or cannot be proven quiescent"
-        )
-    verify_worktree_receipt(worktree, observation["receipt"])
-    identity = snapshot.get("worker_identity")
-    mechanically_absent = (
-        isinstance(identity, dict)
-        and identity.get("kind") == "execution_unit"
-        and execution_unit_status(identity) == "absent"
-    )
-    operator_attested = not mechanically_absent
+    assessment = preserved_pr_recovery_assessment(snapshot, cfg, spend)
+    evaluation = assessment["evaluation"]
+    if not evaluation["eligible"]:
+        detail = ", ".join(evaluation["reason_codes"]) or "ineligible"
+        raise SprintError(f"preserved PR recovery is {evaluation['verdict']}: {detail}")
+    observation = assessment["observation"]
+    worktree = assessment["worktree"]
+    if not isinstance(worktree, Path):
+        raise SprintError("preserved PR worktree cannot be authenticated")
     with locked(path):
         state = load(path)
         ticket = state["tickets"].get(key)
         if ticket != snapshot:
             raise SprintError("ticket changed during preserved PR verification; retry")
-        refreshed = observe_preserved_pr(cfg, ticket)
+        refreshed_spend = usage_snapshots(cfg).get(key, {})
+        refreshed_assessment = preserved_pr_recovery_assessment(
+            ticket, cfg, refreshed_spend
+        )
+        refreshed_evaluation = refreshed_assessment["evaluation"]
+        if not refreshed_evaluation["eligible"]:
+            detail = ", ".join(refreshed_evaluation["reason_codes"]) or "ineligible"
+            raise SprintError(f"preserved PR changed during authentication: {detail}")
+        refreshed = refreshed_assessment["observation"]
         if refreshed["receipt"] != observation["receipt"]:
             raise SprintError("preserved PR changed during authentication; retry")
-        if not worktree_is_quiescent(worktree):
+        if refreshed_assessment["worktree"] != worktree:
+            raise SprintError("preserved PR worktree changed during authentication")
+        if worktree_recovery_status(worktree) != "clean":
             raise SprintError(
                 "preserved PR worktree changed or became active during verification"
             )
@@ -2806,23 +2973,6 @@ def reconcile_preserved_pr(args: argparse.Namespace, cfg: dict[str, Any]) -> Non
             UsageLedger(cfg["shared_root"]).fence_recovery(key, recovery_id)
         except Exception as exc:
             raise SprintError(str(exc)) from exc
-        if operator_attested:
-            try:
-                consume_recovery(
-                    cfg["shared_root"],
-                    key,
-                    int(snapshot.get("attempts") or 0),
-                    operator_capability(args),
-                )
-            except AuthorityError as exc:
-                UsageLedger(cfg["shared_root"]).release_recovery_fence(
-                    key, recovery_id
-                )
-                raise SprintError(
-                    "preserved PR execution unit is not proven absent; "
-                    "a separately issued one-shot recovery capability is required: "
-                    + str(exc)
-                ) from exc
         ticket["state"] = "pending"
         ticket["reason"] = (
             "preserved PR and clean quiescent worktree verified for bounded repair"
@@ -2838,7 +2988,15 @@ def reconcile_preserved_pr(args: argparse.Namespace, cfg: dict[str, Any]) -> Non
         ticket["recovery_binding"] = {
             "kind": "preserved_pr",
             "recovery_id": recovery_id,
-            "absence_proof": "operator-capability" if operator_attested else "execution-unit",
+            "absence_proof": "recovery-eligibility-contract",
+            "eligibility_evidence_digest": refreshed_evaluation["evidence_digest"],
+            "preservation_digest": refreshed_evaluation["preservation_digest"],
+            "review_findings_digest": recovery_digest(
+                refreshed_assessment["preservation"]["review_findings"]
+            ),
+            "review_generation_digest": recovery_digest(
+                refreshed_assessment["preservation"]["review_generation"]
+            ),
             "at": now(),
             "attempt": int(ticket.get("attempts") or 0),
             "invocation_id": str(
@@ -2855,6 +3013,7 @@ def reconcile_preserved_pr(args: argparse.Namespace, cfg: dict[str, Any]) -> Non
                 "at": now(),
                 "event": "preserved-pr-reconciled",
                 "binding": ticket["recovery_binding"],
+                "reason_codes": refreshed_evaluation["reason_codes"],
             }
         )
         save(path, state)
@@ -2921,9 +3080,9 @@ def ticket_resource_claims(ticket: dict[str, Any]) -> list[dict[str, Any]]:
         claims.append(
             {
                 "kind": "worktree",
-                "key": hashlib.sha256(
-                    str(recovery["worktree"]).encode()
-                ).hexdigest()[:32],
+                "key": hashlib.sha256(str(recovery["worktree"]).encode()).hexdigest()[
+                    :32
+                ],
                 "units": 1,
                 "capacity": 1,
                 "source": "controller",
@@ -3015,14 +3174,26 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
     )
     pr_reconciliation = []
     pr_reconciliation_requires_authority = []
+    pr_reconciliation_waiting = []
+    pr_reconciliation_evaluations: dict[str, dict[str, Any]] = {}
     for key in preserved_candidates:
-        identity = state["tickets"][key].get("worker_identity")
-        if (
-            isinstance(identity, dict)
-            and identity.get("kind") == "execution_unit"
-            and execution_unit_status(identity) == "absent"
-        ):
+        ticket = state["tickets"][key]
+        try:
+            evaluation = preserved_pr_recovery_assessment(
+                ticket, cfg, spend.get(key, {})
+            )["evaluation"]
+        except (OSError, SprintError, RecoveryEvidenceError, AuthorityError) as exc:
+            evaluation = {
+                "verdict": "operator_action",
+                "eligible": False,
+                "reason_codes": ["binding_incomplete"],
+                "reasons": [str(exc)],
+            }
+        pr_reconciliation_evaluations[key] = evaluation
+        if evaluation["eligible"]:
             pr_reconciliation.append(key)
+        elif evaluation["verdict"] == "waiting":
+            pr_reconciliation_waiting.append(key)
         else:
             pr_reconciliation_requires_authority.append(key)
     pr_reconciliation_set = set(preserved_candidates)
@@ -3033,14 +3204,19 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
         key, status = ticket["key"], ticket["state"]
         if key in pr_reconciliation_set:
             if key in pr_reconciliation_requires_authority:
+                evaluation = pr_reconciliation_evaluations[key]
                 decisions.append(
                     {
                         "key": key,
-                        "reason": (
-                            "preserved PR execution absence requires a separately "
-                            "issued one-shot recovery capability"
-                        ),
-                        "action": "reconcile-preserved-pr-with-operator-capability",
+                        "state": status,
+                        "reasons": [
+                            f"preserved PR recovery {evaluation['verdict']} "
+                            f"({code}): {reason}"
+                            for code, reason in zip(
+                                evaluation["reason_codes"], evaluation["reasons"]
+                            )
+                        ],
+                        "action": "resolve-preserved-pr-recovery-evidence",
                     }
                 )
             continue
@@ -3107,7 +3283,12 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
                         status=unit_status,
                         spend=spend.get(key, {}),
                     )
-                except (OSError, SprintError, RecoveryEvidenceError, AuthorityError) as exc:
+                except (
+                    OSError,
+                    SprintError,
+                    RecoveryEvidenceError,
+                    AuthorityError,
+                ) as exc:
                     evaluation = {
                         "verdict": "operator_action",
                         "eligible": False,
@@ -3174,12 +3355,8 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
         for dependency in ticket.get("dependencies", [])
         if dependency in state["tickets"]
     }
-    dependency_unlocking_ready = [
-        key for key in fresh_ready if key in dependency_keys
-    ]
-    ordinary_fresh_ready = [
-        key for key in fresh_ready if key not in dependency_keys
-    ]
+    dependency_unlocking_ready = [key for key in fresh_ready if key in dependency_keys]
+    ordinary_fresh_ready = [key for key in fresh_ready if key not in dependency_keys]
     allocation_candidates = {
         "repair": [] if runtime_hold else list(repair),
         "recovery": [] if runtime_hold else list(recovery),
@@ -3257,6 +3434,8 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
         "recovery": [] if runtime_hold else recovery,
         "pr_reconciliation": pr_reconciliation,
         "pr_reconciliation_requires_authority": pr_reconciliation_requires_authority,
+        "pr_reconciliation_waiting": pr_reconciliation_waiting,
+        "pr_reconciliation_evaluations": pr_reconciliation_evaluations,
         "recovery_waiting": recovery_waiting,
         "recovery_evaluations": recovery_evaluations,
         "retry_waiting": retry_waiting,
@@ -3273,6 +3452,7 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
             or (repair and not runtime_hold)
             or (recovery and not runtime_hold)
             or pr_reconciliation
+            or pr_reconciliation_waiting
             or recovery_waiting
             or (retry_waiting and not runtime_hold)
         ),
@@ -3999,9 +4179,7 @@ def reserve(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             ticket_key
             for queue_class in ("continuation", "dependency_unlocking", "fresh")
             for ticket_key in (
-                (current_plan.get("allocation_candidates") or {}).get(
-                    queue_class, []
-                )
+                (current_plan.get("allocation_candidates") or {}).get(queue_class, [])
             )
         }
         allowed = key in current_plan["launch"] or (
@@ -4184,9 +4362,7 @@ def authenticate_supervisor_context(
     command_sha256 = hashlib.sha256(
         json.dumps(original_command, separators=(",", ":")).encode()
     ).hexdigest()
-    capability_sha256 = hashlib.sha256(
-        args.supervisor_capability.encode()
-    ).hexdigest()
+    capability_sha256 = hashlib.sha256(args.supervisor_capability.encode()).hexdigest()
     if (
         evidence.get("status") != "launching"
         or evidence.get("invocation_id") != args.invocation_id
@@ -4207,7 +4383,9 @@ def authenticate_supervisor_context(
         f"execution-{args.invocation_id}.claim.json"
     )
     if claim_path != expected_claim_path:
-        raise SprintError("supervisor claim path differs from persisted launch evidence")
+        raise SprintError(
+            "supervisor claim path differs from persisted launch evidence"
+        )
     claim_value = {
         "invocation_id": args.invocation_id,
         "pid": os.getpid(),
@@ -4248,7 +4426,9 @@ def authenticate_supervisor_context(
             text=True,
         ).stdout.strip()
     except (OSError, subprocess.SubprocessError) as exc:
-        raise SprintError("worker cwd must be a checkout of the managed repository") from exc
+        raise SprintError(
+            "worker cwd must be a checkout of the managed repository"
+        ) from exc
     if Path(shared_common_dir).resolve() != Path(worker_common_dir).resolve():
         raise SprintError("worker cwd belongs to a different git repository")
 
@@ -4262,9 +4442,9 @@ def supervise_local(args: argparse.Namespace, _cfg: dict[str, Any]) -> None:
         raise SprintError("supervisor requires a worker command")
     original_command = list(command)
     explicit_worker_cwd = hasattr(args, "worker_cwd")
-    worker_cwd = Path(
-        getattr(args, "worker_cwd", _cfg["shared_root"])
-    ).expanduser().resolve()
+    worker_cwd = (
+        Path(getattr(args, "worker_cwd", _cfg["shared_root"])).expanduser().resolve()
+    )
     # Production invocations can only arrive through the parser, where this
     # controller-owned argument is required. The fallback exists solely for
     # older in-process test fixtures.
@@ -4788,7 +4968,10 @@ def launch_local(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         if not ticket or ticket["state"] != "running":
             raise SprintError(f"ticket {key} is not running")
         recovery_binding = verify_recovery_binding(cfg, ticket)
-        if isinstance(recovery_binding, dict) and recovery_binding.get("kind") == "preserved_pr":
+        if (
+            isinstance(recovery_binding, dict)
+            and recovery_binding.get("kind") == "preserved_pr"
+        ):
             worker_cwd = Path(str(recovery_binding["worktree"])).resolve()
         expected = str(ticket.get("attach_capability") or "")
         if (
@@ -4829,9 +5012,13 @@ def launch_local(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
                 while index < len(command):
                     option = command[index]
                     if not option.startswith("--") or index + 1 >= len(command):
-                        raise SprintError("API sprint-worker command has malformed arguments")
+                        raise SprintError(
+                            "API sprint-worker command has malformed arguments"
+                        )
                     if option in values:
-                        raise SprintError("API sprint-worker command repeats an argument")
+                        raise SprintError(
+                            "API sprint-worker command repeats an argument"
+                        )
                     values[option] = command[index + 1]
                     index += 2
                 capability = ticket.get("attempt_capability") or {}
@@ -4850,7 +5037,9 @@ def launch_local(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
                         "API sprint-worker command differs from the controller reservation"
                     )
                 if set(values) != {*required, "--request", "--result"}:
-                    raise SprintError("API sprint-worker command contains unsupported arguments")
+                    raise SprintError(
+                        "API sprint-worker command contains unsupported arguments"
+                    )
                 for name in ("--request", "--result"):
                     _repository_path(cfg["shared_root"], values[name], label=name[2:])
         invocation_id = uuid.uuid4().hex
@@ -4862,7 +5051,9 @@ def launch_local(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             try:
                 prompt = input_path.read_text(encoding="utf-8")
             except OSError as exc:
-                raise SprintError(f"cannot read worker input for identity binding: {exc}") from exc
+                raise SprintError(
+                    f"cannot read worker input for identity binding: {exc}"
+                ) from exc
             placeholder = "COPY_ORCHESTRATOR_INVOCATION_ID"
             if prompt.count(placeholder) != 1:
                 raise SprintError(
@@ -4873,10 +5064,7 @@ def launch_local(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             )
             descriptor = os.open(
                 temporary,
-                os.O_WRONLY
-                | os.O_CREAT
-                | os.O_EXCL
-                | getattr(os, "O_NOFOLLOW", 0),
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
                 0o600,
             )
             try:
@@ -5030,12 +5218,12 @@ def launch_local(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         ticket["launch_evidence"] = evidence
         # The binding remains active through the supervisor's final pre-spawn
         # validation. Only a proved child launch consumes it.
-        recovery_id = str((ticket.get("recovery_binding") or {}).get("recovery_id") or "")
+        recovery_id = str(
+            (ticket.get("recovery_binding") or {}).get("recovery_id") or ""
+        )
         if recovery_id:
             try:
-                UsageLedger(cfg["shared_root"]).release_recovery_fence(
-                    key, recovery_id
-                )
+                UsageLedger(cfg["shared_root"]).release_recovery_fence(key, recovery_id)
             except Exception as exc:
                 worker.terminate()
                 evidence.update({"status": "launch-failed", "error": str(exc)})
@@ -5156,7 +5344,9 @@ def finish(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             raise SprintError("external blocker requires at least one Jira dependency")
     else:
         if external_receipt or raw_dependencies:
-            raise SprintError("external dependency metadata is allowed only for external_blocked")
+            raise SprintError(
+                "external dependency metadata is allowed only for external_blocked"
+            )
         dependencies = []
     finish_payload = {
         "sprint": str(args.sprint),
@@ -5275,12 +5465,16 @@ def resolve_decision(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
                 "legacy or scoping decisions must use repository decision policy"
             )
         if classification.get("decision_class") != decision_class:
-            raise SprintError("decision receipt class does not match the parked decision")
+            raise SprintError(
+                "decision receipt class does not match the parked decision"
+            )
         require_worker_stopped(ticket, operator_capability(args), cfg)
         previous_reason = ticket.get("reason", "")
         ticket["state"] = "pending"
         ticket["reason"] = reason
-        ticket["next_launch_continuation"] = bool(ticket.get("pr") or ticket.get("branch"))
+        ticket["next_launch_continuation"] = bool(
+            ticket.get("pr") or ticket.get("branch")
+        )
         _clear_finished_execution(ticket)
         classification["resolved"] = {
             "receipt_digest": receipt_digest,
@@ -5407,7 +5601,10 @@ def outstanding_reservation_details(cfg: dict[str, Any], key: str) -> str:
             for item in UsageLedger(cfg["shared_root"]).summary()["open_reservations"]
             if str(item.get("ticket") or "").strip().upper() == key
         ),
-        key=lambda item: (str(item.get("timestamp") or ""), str(item.get("reservation_id") or "")),
+        key=lambda item: (
+            str(item.get("timestamp") or ""),
+            str(item.get("reservation_id") or ""),
+        ),
     )
     listed = "; ".join(
         f"{item.get('reservation_id')} (run {item.get('run_id')}, "
@@ -5596,12 +5793,11 @@ def recover_terminal(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         ticket = state["tickets"].get(key)
         current = ticket.get("state") if ticket else "missing"
         tokenless_preserved_repair = bool(
-            ticket
-            and current == "needs_repair"
-            and not ticket.get("attempt_token")
+            ticket and current == "needs_repair" and not ticket.get("attempt_token")
         )
         if not ticket or (
-            current not in {
+            current
+            not in {
                 "blocked",
                 "external_blocked",
                 "operator_decision",
@@ -5797,87 +5993,23 @@ def automatic_recovery_evaluation(
 ) -> dict[str, Any]:
     """Observe one stopped attempt and evaluate it without mutating state."""
 
-    identity = ticket.get("worker_identity")
-    identity = identity if isinstance(identity, dict) else {}
-    launch = ticket.get("launch_evidence")
-    launch = launch if isinstance(launch, dict) else {}
-    invocation_id = str(identity.get("invocation_id") or "")
-    containment = str(identity.get("containment") or "")
-    profile = (
-        "isolated"
-        if containment in {"cgroup-v2-systemd-scope", "test-supervisor"}
-        else "cooperative"
-    )
-    observed_status = (
-        status
-        if status in {"live", "absent", "unknown"}
-        else execution_unit_status(identity)
-        if identity.get("kind") == "execution_unit"
-        else "unknown"
-    )
-    receipt, terminal_receipt = _recovery_terminal_receipt(identity)
-    identity_bound = bool(
-        identity.get("kind") == "execution_unit"
-        and invocation_id
-        and launch.get("invocation_id") == invocation_id
-        and launch.get("identity") == identity
-        and launch.get("status") == "launched"
-        and launch.get("ticket") == ticket.get("key")
-        and int(ticket.get("attempts") or 0) > 0
-        and int(launch.get("attempt") or 0) == int(ticket.get("attempts") or 0)
-        and launch.get("attempt_token") == ticket.get("attempt_token")
-        and ticket.get("attempt_token")
-        and ticket.get("run_ref")
-    )
-    descendants = "unknown"
-    cleanup_complete = False
-    cooperative_authorized = bool(
-        containment == "cooperative-session"
-        and cfg.get("cooperative_auto_recovery")
-        and launch.get("cooperative_auto_recovery")
-    )
-    if observed_status == "live":
-        descendants = "live"
-    elif observed_status == "absent" and terminal_receipt:
-        if profile == "isolated":
-            descendants = "absent"
-        else:
-            cleanup = (receipt or {}).get("cooperative_cleanup") or {}
-            pgid = cleanup.get("worker_pgid")
-            if (
-                cleanup.get("gateway_closed") is True
-                and isinstance(pgid, int)
-                and not isinstance(pgid, bool)
-                and pgid > 1
-            ):
-                try:
-                    os.killpg(pgid, 0)
-                except ProcessLookupError:
-                    cleanup_complete = True
-                    descendants = "absent"
-                except OSError:
-                    descendants = "unknown"
-                else:
-                    descendants = "live"
+    profile, execution = _recovery_execution_evidence(ticket, cfg, status=status)
 
-    spend = spend if spend is not None else usage_snapshots(cfg).get(ticket.get("key"), {})
-    provider_state = "pending" if float(spend.get("reserved_usd") or 0) > 0 else "settled"
+    spend = (
+        spend if spend is not None else usage_snapshots(cfg).get(ticket.get("key"), {})
+    )
+    provider_state = (
+        "pending" if float(spend.get("reserved_usd") or 0) > 0 else "settled"
+    )
     preservation = recovery_preservation_snapshot(ticket, spend, cfg)
     evidence = {
         "schema": RECOVERY_SCHEMA,
         "profile": profile,
-        "execution": {
-            "status": observed_status,
-            "identity_bound": identity_bound,
-            "terminal_receipt": terminal_receipt,
-            "descendants": descendants,
-            "cooperative_authorized": cooperative_authorized,
-            "cleanup_complete": cleanup_complete,
-        },
+        "execution": execution,
         "provider": {"state": provider_state},
         "work": {
             "kind": "attempt",
-            "binding_complete": identity_bound,
+            "binding_complete": execution["identity_bound"],
             "worktree": "not_applicable",
             "revision_match": True,
         },
@@ -6284,9 +6416,7 @@ def parser() -> argparse.ArgumentParser:
     decision_parser.add_argument("--reason", required=True)
     decision_capability = decision_parser.add_mutually_exclusive_group()
     decision_capability.add_argument("--operator-capability")
-    decision_capability.add_argument(
-        "--operator-capability-stdin", action="store_true"
-    )
+    decision_capability.add_argument("--operator-capability-stdin", action="store_true")
     decision_parser.set_defaults(func=resolve_decision)
     scope_parser = commands.add_parser(
         "record-scope", help="record a structured readiness/decomposition assessment"

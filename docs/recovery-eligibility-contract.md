@@ -77,11 +77,16 @@ them. The evaluator reports the invariant list with every verdict.
 
 ## Compatibility mapping
 
-`automatic_recovery_evaluation` now normalizes stopped-attempt observations into
-this contract. Planning exposes the exact verdict and stable reason codes. An
-eligible supervisor-owned attempt is revalidated under the checkpoint lock,
+`automatic_recovery_evaluation` normalizes stopped-attempt observations into
+this contract. `preserved_pr_recovery_assessment` applies the same execution and
+provider evidence while additionally authenticating the repository worktree,
+GitHub PR, branch, head, tree, findings, and review generation. Planning exposes
+the exact verdict and stable reason codes for both paths.
+
+An eligible supervisor-owned attempt is revalidated under the checkpoint lock,
 then requeued while an audit event binds the evidence and preservation digests.
-Open provider reservations always refuse relaunch, and live, unknown, stale, or
-incompletely bound units remain waiting or operator actions. Preserved-PR
-reconciliation continues to use its existing authority until the next #74
-delivery slice adopts the same contract.
+An eligible preserved PR is likewise re-observed under that lock, fenced
+against concurrent provider work, and converted into an existing-PR
+continuation before the supervisor replans. Open provider reservations always
+refuse relaunch, and live, unknown, dirty, stale, or incompletely bound units
+remain waiting or operator actions.

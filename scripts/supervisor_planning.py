@@ -114,6 +114,15 @@ class ControllerAdapter:
     def health_probe(self, role: str) -> dict:
         return self._run("health-check", "--role", role)
 
+    def reconcile_preserved_pr(self, sprint: str, ticket: str) -> dict:
+        return self._run(
+            "reconcile-preserved-pr",
+            "--sprint",
+            sprint,
+            "--ticket",
+            ticket,
+        )
+
 
 def _open_reservations(events: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     open_items: dict[str, dict[str, Any]] = {}
@@ -290,6 +299,20 @@ def planning_cycle(
     if not sprint:
         raise PlanningError("controller synchronization returned no sprint identity")
     plan = adapter.plan(sprint)
+    reconciled_preserved_prs = []
+    for ticket in plan.get("pr_reconciliation") or []:
+        result = adapter.reconcile_preserved_pr(sprint, str(ticket))
+        reconciled_preserved_prs.append(
+            {
+                "ticket": str(ticket),
+                "state": result.get("state"),
+                "recovery_binding_digest": canonical_digest(
+                    result.get("recovery_binding") or {}
+                ),
+            }
+        )
+    if reconciled_preserved_prs:
+        plan = adapter.plan(sprint)
     summary = adapter.summary(sprint)
     budget = sprint_budget(repository, sprint)
     result = classify_cycle(
@@ -302,4 +325,5 @@ def planning_cycle(
     result["synchronized_ticket_count"] = int(synchronized.get("tickets") or 0)
     result["checkpoint"] = str(synchronized.get("checkpoint") or "")
     result["sync_receipt_digest"] = canonical_digest(synchronized)
+    result["reconciled_preserved_prs"] = reconciled_preserved_prs
     return result

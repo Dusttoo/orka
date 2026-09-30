@@ -115,8 +115,9 @@ concerns.
 4. Add durable resource exclusions and fair queue admission. **Complete in
    1.8.8 and 1.8.9.**
 5. Automate evidence-backed worker and preserved-PR recovery. **The eligibility
-   contract is complete in 1.8.10 and proven-dead worker recovery is automatic
-   in 1.8.11; preserved-PR reconciliation remains a later slice.**
+   contract is complete in 1.8.10, proven-dead worker recovery is automatic in
+   1.8.11, and authenticated preserved-PR reconciliation is automatic in
+   1.8.12. Crash-boundary and idempotency proof remains the final slice.**
 6. Add soft/hard breakers and ticket parking.
 7. Introduce a transactional event store with checkpoint import/export.
 8. Add supervisor lease takeover and crash recovery.

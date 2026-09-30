@@ -38,6 +38,7 @@ class FakePlanningAdapter:
         self.plan_value = plan
         self.summary_value = summary
         self.probes: list[str] = []
+        self.reconciled: list[str] = []
 
     def health_probe(self, role: str) -> dict:
         self.probes.append(role)
@@ -57,6 +58,21 @@ class FakePlanningAdapter:
     def summary(self, sprint: str) -> dict:
         assert sprint == "99"
         return self.summary_value
+
+    def reconcile_preserved_pr(self, sprint: str, ticket: str) -> dict:
+        assert sprint == "99"
+        self.reconciled.append(ticket)
+        self.plan_value = {
+            **self.plan_value,
+            "pr_reconciliation": [],
+            "launch": [ticket],
+            "autonomous_work_remaining": True,
+        }
+        return {
+            "ticket": ticket,
+            "state": "needs_repair",
+            "recovery_binding": {"kind": "preserved_pr", "ticket": ticket},
+        }
 
 
 class PlanningLoopTests(unittest.TestCase):
@@ -166,6 +182,37 @@ class PlanningLoopTests(unittest.TestCase):
         finally:
             shutil.rmtree(repository, ignore_errors=True)
 
+    def test_planning_cycle_reconciles_preserved_pr_then_replans(self) -> None:
+        repository = Path(tempfile.mkdtemp(prefix="orka-planning-test-"))
+        try:
+            config = repository / ".orchestration/config.yaml"
+            config.parent.mkdir(parents=True)
+            config.write_text(
+                "schema_version: 1\nllm:\n  budgets:\n    max_usd_per_sprint: 20\n",
+                encoding="utf-8",
+            )
+            adapter = FakePlanningAdapter(
+                {
+                    "sprint": {"id": "99"},
+                    "pr_reconciliation": ["PNP-40"],
+                    "autonomous_work_remaining": True,
+                },
+                {"sprint_complete": False},
+            )
+            result = planning_cycle(
+                adapter,
+                repository,
+                {},
+                current_time=100,
+                sync_interval=60,
+            )
+            self.assertEqual(adapter.reconciled, ["PNP-40"])
+            self.assertEqual(result["plan"]["pr_reconciliation"], [])
+            self.assertEqual(result["plan"]["launch"], ["PNP-40"])
+            self.assertEqual(result["reconciled_preserved_prs"][0]["ticket"], "PNP-40")
+        finally:
+            shutil.rmtree(repository, ignore_errors=True)
+
     def test_status_separates_queue_retry_parking_and_active_lanes(self) -> None:
         state = {
             "repository": "/tmp/repo",
@@ -210,9 +257,7 @@ class PlanningLoopTests(unittest.TestCase):
                 "terminal_count": 2,
             },
         }
-        with patch.object(
-            sprint_supervisor, "process_status", return_value="live"
-        ):
+        with patch.object(sprint_supervisor, "process_status", return_value="live"):
             result = sprint_supervisor.status_response(state)
         self.assertEqual(result["dispatch"]["active_jobs"], 1)
         self.assertEqual(result["dispatch"]["queued"], ["PNP-5", "PNP-6"])
@@ -293,7 +338,9 @@ class TakeoverStateTests(unittest.TestCase):
             value["takeover"] = {"resume_state": "active"}
         return value
 
-    def test_every_nonterminal_supervisor_state_preserves_jobs_on_takeover(self) -> None:
+    def test_every_nonterminal_supervisor_state_preserves_jobs_on_takeover(
+        self,
+    ) -> None:
         _contract, lifecycle, _digest = sprint_supervisor.contract()
         for source in (
             "starting",
@@ -331,7 +378,9 @@ class TakeoverStateTests(unittest.TestCase):
                 self.assertIn("takeover_requested", events)
                 self.assertIn("predecessor_absent", events)
 
-    def test_takeover_rejects_live_unknown_or_changed_predecessor_evidence(self) -> None:
+    def test_takeover_rejects_live_unknown_or_changed_predecessor_evidence(
+        self,
+    ) -> None:
         _contract, lifecycle, _digest = sprint_supervisor.contract()
         arguments = {
             "identity": {
@@ -347,11 +396,14 @@ class TakeoverStateTests(unittest.TestCase):
             "settings": self.settings,
         }
         for status in ("live", "unknown"):
-            with self.subTest(status=status), patch.object(
-                sprint_supervisor, "process_status", return_value=status
+            with (
+                self.subTest(status=status),
+                patch.object(sprint_supervisor, "process_status", return_value=status),
             ):
                 with self.assertRaises(sprint_supervisor.SupervisorError):
-                    sprint_supervisor.takeover_state(self.previous("active"), **arguments)
+                    sprint_supervisor.takeover_state(
+                        self.previous("active"), **arguments
+                    )
         with patch.object(sprint_supervisor, "process_status", return_value="absent"):
             changed = dict(arguments, runtime_digest="changed")
             with self.assertRaises(sprint_supervisor.SupervisorError):
@@ -637,7 +689,13 @@ class SupervisorProcessTests(unittest.TestCase):
         self.assertEqual(replay["lifecycle_state"], "paused")
         after = self.read_state(repository)
         self.assertEqual(
-            len([item for item in after["history"] if item["event"] == "operator_paused"]),
+            len(
+                [
+                    item
+                    for item in after["history"]
+                    if item["event"] == "operator_paused"
+                ]
+            ),
             len(pause_events),
         )
 
