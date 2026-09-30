@@ -350,6 +350,11 @@ ticket:
 # blocked_side identifies the Jira API side occupied by the blocked ticket; the
 # issue on the opposite side is its prerequisite. Adjust for your Jira scheme.
 sprint_id: active
+# The host-owned supervisor sleeps until an operator command, provider/retry
+# deadline, or this deterministic authoritative-sync deadline. It never spends
+# model tokens while waiting. Existing repositories may omit this key; 60
+# seconds is the compatible default.
+supervisor_sync_interval_seconds: 60
 # Canonical credential trust anchor. This must be repository policy, never a
 # caller-selected environment value. Credentials never go here: export them or
 # set JIRA_API_TOKEN in the gitignored, chmod 600 .orchestration/.env of the

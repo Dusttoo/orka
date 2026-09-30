@@ -1,8 +1,9 @@
 # Orka 2: durable supervisor runtime
 
 Status: accepted architectural direction; implementation in independently
-releasable slices. Orka 1.8.3 provides the detached supervisor process and
-repository lease lifecycle, while planning and worker dispatch remain pending.
+releasable slices. Orka 1.8.4 provides the detached supervisor, repository
+lease lifecycle, and deterministic synchronization/planning loop. Worker
+dispatch remains pending.
 
 Orka's current controller has durable checkpoints and mechanical gates, but a
 model-driven captain still performs the outer `plan -> launch -> wait -> finish
@@ -98,7 +99,7 @@ concerns.
 1. Specify lifecycle transitions, invariants, and event semantics in the
    [versioned supervisor contract](supervisor-lifecycle-contract.md).
 2. Add a host-owned supervisor loop around the existing controller, beginning
-   with the [detached lease lifecycle process](sprint-supervisor.md).
+   with the [detached lease and planning process](sprint-supervisor.md).
 3. Add durable resource exclusions and fair queue admission.
 4. Automate evidence-backed worker and preserved-PR recovery.
 5. Add soft/hard breakers and ticket parking.
