@@ -172,8 +172,11 @@ identity are not changed.
 Restart does not invent missing worker or provider receipts. Recovery evidence
 is classified by the
 [`orka.recovery-eligibility/v1`](recovery-eligibility-contract.md) contract;
-later automatic-recovery slices will consume eligible verdicts transactionally.
-Ambiguous launches
-remain fenced for reconciliation, and preserved-PR recovery still requires its
+the supervisor now consumes eligible stopped-attempt verdicts transactionally.
+The controller repeats the observation while holding its checkpoint lock and
+records evidence and preservation digests before clearing only execution-scoped
+fields. A replay sees the already-pending ticket and cannot create another
+attempt, worker, provider request, or reservation. Ambiguous launches remain
+fenced for reconciliation, and preserved-PR recovery still requires its
 existing controller authority. No review, security, budget, or merge gate is
 weakened.

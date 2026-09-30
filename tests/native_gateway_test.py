@@ -330,11 +330,13 @@ class NativeGatewayTests(unittest.TestCase):
             max_model_runs_per_ticket=12, max_reviewer_runs_per_ticket=6, max_lane_relaunches=2,
             concurrency_max=1, auto_decompose_large_tickets=False, done={'done'},
             cooperative_auto_recovery=True)
+        identity = dict(kind='execution_unit', containment='cooperative-session',
+            invocation_id='unit', tombstone_path=args.tombstone)
         ticket = dict(key='T-1', state='running', attempts=1, attempt_token='cap', dependencies=[],
-            branch='preserve', pr='12', history=[], summary='test', reason='',
-            launch_evidence=dict(invocation_id='unit', cooperative_auto_recovery=True),
-            worker_identity=dict(kind='execution_unit', containment='cooperative-session',
-                invocation_id='unit', tombstone_path=args.tombstone))
+            branch='preserve', pr='12', history=[], summary='test', reason='', run_ref='worker',
+            launch_evidence=dict(status='launched', ticket='T-1', attempt=1,
+                attempt_token='cap', invocation_id='unit', identity=identity,
+                cooperative_auto_recovery=True), worker_identity=identity)
         path = controller.state_path(cfg['state_dir'], '1')
         controller.save(path, dict(schema_version=2, sprint=dict(id='1'), dependency_status={}, tickets={'T-1': ticket}))
         return controller, args, cfg, path

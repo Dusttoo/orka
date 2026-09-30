@@ -67,30 +67,47 @@ class ResilienceTests(unittest.TestCase):
         self.state["tickets"][key] = value
         return value
 
-    def test_cooperative_recovery_requires_opt_in_cleanup_and_absent_group(self):
-        receipt = self.cfg["shared_root"] / "terminal.json"
+    def stopped_execution(self, ticket, invocation="launch", containment="test-supervisor"):
+        receipt = self.cfg["shared_root"] / f"{invocation}.terminal.json"
         receipt.write_text(
             json.dumps(
-                dict(
-                    phase="terminal",
-                    invocation_id="launch",
-                    cooperative_cleanup=dict(worker_pgid=43210, gateway_closed=True),
-                )
+                {
+                    "phase": "terminal",
+                    "spawned": True,
+                    "returncode": 1,
+                    "invocation_id": invocation,
+                    "cooperative_cleanup": {
+                        "worker_pgid": 43210,
+                        "gateway_closed": True,
+                    },
+                }
             )
         )
+        ticket["attempts"] = max(1, int(ticket.get("attempts") or 0))
+        identity = {
+            "kind": "execution_unit",
+            "containment": containment,
+            "invocation_id": invocation,
+            "tombstone_path": str(receipt),
+        }
+        ticket["worker_identity"] = identity
+        ticket["launch_evidence"] = {
+            "status": "launched",
+            "ticket": ticket["key"],
+            "attempt": ticket["attempts"],
+            "attempt_token": ticket["attempt_token"],
+            "invocation_id": invocation,
+            "identity": identity,
+            "cooperative_auto_recovery": containment == "cooperative-session",
+        }
+        return receipt
+
+    def test_cooperative_recovery_requires_opt_in_cleanup_and_absent_group(self):
         ticket = self.ticket(
             "PROJ-1",
             "recoverable",
-            worker_identity=dict(
-                kind="execution_unit",
-                containment="cooperative-session",
-                invocation_id="launch",
-                tombstone_path=str(receipt),
-            ),
-            launch_evidence=dict(
-                invocation_id="launch", cooperative_auto_recovery=True
-            ),
         )
+        receipt = self.stopped_execution(ticket, containment="cooperative-session")
         with (
             patch.object(controller, "execution_unit_status", return_value="absent"),
             patch.object(controller.os, "killpg", side_effect=ProcessLookupError),
@@ -270,7 +287,14 @@ class ResilienceTests(unittest.TestCase):
         self.ticket("PROJ-1", "recoverable")
         self.ticket("PROJ-2")
         with patch.object(
-            controller, "automatic_recovery_available", return_value=True
+            controller,
+            "automatic_recovery_evaluation",
+            return_value={
+                "verdict": "eligible",
+                "eligible": True,
+                "reason_codes": [],
+                "reasons": [],
+            },
         ):
             plan = controller.plan_value(self.state, self.cfg)
         self.assertEqual(plan["recovery"], ["PROJ-1"])
@@ -284,7 +308,14 @@ class ResilienceTests(unittest.TestCase):
         self.ticket("PROJ-3", pr="", dependencies=["PROJ-2"])
         self.ticket("PROJ-4", pr="", dependencies=[])
         with patch.object(
-            controller, "automatic_recovery_available", return_value=True
+            controller,
+            "automatic_recovery_evaluation",
+            return_value={
+                "verdict": "eligible",
+                "eligible": True,
+                "reason_codes": [],
+                "reasons": [],
+            },
         ):
             plan = controller.plan_value(self.state, self.cfg)
         self.assertEqual(plan["allocation_candidates"]["recovery"], ["PROJ-1"])
@@ -704,12 +735,8 @@ class ResilienceTests(unittest.TestCase):
                 "invocation_id": "invocation-3",
                 "stop_reason": "max_worker_lifetime_seconds",
             },
-            worker_identity={
-                "kind": "execution_unit",
-                "containment": "test-supervisor",
-                "invocation_id": "invocation-3",
-            },
         )
+        self.stopped_execution(self.state["tickets"]["PROJ-1"], "invocation-3")
         path = controller.state_path(self.cfg["state_dir"], "1")
         controller.save(path, self.state)
         requeue = argparse.Namespace(
@@ -759,12 +786,8 @@ class ResilienceTests(unittest.TestCase):
                 "invocation_id": "invocation-1",
                 "stop_reason": "max_worker_lifetime_seconds",
             },
-            worker_identity={
-                "kind": "execution_unit",
-                "containment": "test-supervisor",
-                "invocation_id": "invocation-2",
-            },
         )
+        self.stopped_execution(self.state["tickets"]["PROJ-1"], "invocation-2")
         path = controller.state_path(self.cfg["state_dir"], "1")
         controller.save(path, self.state)
         args = argparse.Namespace(
@@ -804,7 +827,16 @@ class ResilienceTests(unittest.TestCase):
             worker_ref="",
         )
         with (
-            patch.object(controller, "automatic_recovery_available", return_value=True),
+            patch.object(
+                controller,
+                "automatic_recovery_evaluation",
+                return_value={
+                    "verdict": "eligible",
+                    "eligible": True,
+                    "reason_codes": [],
+                    "reasons": [],
+                },
+            ),
             self.assertRaisesRegex(controller.SprintError, "current launch plan"),
         ):
             controller.reserve(args, self.cfg)
@@ -1216,14 +1248,11 @@ class ResilienceTests(unittest.TestCase):
             controller.finish(changed, self.cfg)
 
     def test_live_recovery_retains_lane_until_unit_is_absent(self):
-        self.ticket(
+        ticket = self.ticket(
             "PROJ-1",
             "recoverable",
-            worker_identity={
-                "kind": "execution_unit",
-                "containment": "test-supervisor",
-            },
         )
+        self.stopped_execution(ticket)
         self.ticket("PROJ-2")
         with patch.object(controller, "execution_unit_status", return_value="live"):
             plan = controller.plan_value(self.state, self.cfg)
@@ -1239,11 +1268,8 @@ class ResilienceTests(unittest.TestCase):
         value = self.ticket(
             "PROJ-1",
             "recoverable",
-            worker_identity={
-                "kind": "execution_unit",
-                "containment": "test-supervisor",
-            },
         )
+        self.stopped_execution(value)
         path = controller.state_path(self.cfg["state_dir"], "1")
         controller.save(path, self.state)
         args = argparse.Namespace(
@@ -1264,6 +1290,66 @@ class ResilienceTests(unittest.TestCase):
         )
         self.assertEqual(resumed["state"], "pending")
         self.assertEqual(resumed["attempt_token"], "")
+        recovery = resumed["history"][-1]
+        self.assertTrue(recovery["automatic"])
+        self.assertEqual(recovery["recovery_verdict"], "eligible")
+        self.assertRegex(recovery["recovery_evidence_digest"], r"^[a-f0-9]{64}$")
+        self.assertRegex(recovery["preservation_digest"], r"^[a-f0-9]{64}$")
+
+    def test_recovery_evaluation_is_repeatable_and_does_not_mutate_ticket(self):
+        ticket = self.ticket("PROJ-1", "recoverable")
+        self.stopped_execution(ticket)
+        original = copy.deepcopy(ticket)
+        with patch.object(controller, "execution_unit_status", return_value="absent"):
+            first = controller.automatic_recovery_evaluation(ticket, self.cfg, spend={})
+            second = controller.automatic_recovery_evaluation(ticket, self.cfg, spend={})
+        self.assertTrue(first["eligible"])
+        self.assertEqual(first, second)
+        self.assertEqual(ticket, original)
+
+    def test_recovery_refuses_death_before_spawn_and_unsettled_provider_work(self):
+        ticket = self.ticket("PROJ-1", "recoverable")
+        receipt = self.stopped_execution(ticket)
+        terminal = json.loads(receipt.read_text())
+        terminal["spawned"] = False
+        receipt.write_text(json.dumps(terminal))
+        with patch.object(controller, "execution_unit_status", return_value="absent"):
+            before_spawn = controller.automatic_recovery_evaluation(
+                ticket, self.cfg, spend={}
+            )
+        self.assertFalse(before_spawn["eligible"])
+        self.assertIn("terminal_receipt_missing", before_spawn["reason_codes"])
+
+        terminal["spawned"] = True
+        receipt.write_text(json.dumps(terminal))
+        with patch.object(controller, "execution_unit_status", return_value="absent"):
+            pending = controller.automatic_recovery_evaluation(
+                ticket, self.cfg, spend={"reserved_usd": 1.25}
+            )
+        self.assertEqual(pending["verdict"], "waiting")
+        self.assertIn("provider_pending", pending["reason_codes"])
+
+        path = controller.state_path(self.cfg["state_dir"], "1")
+        controller.save(path, self.state)
+        args = argparse.Namespace(
+            sprint="1",
+            ticket="PROJ-1",
+            reason="must not duplicate provider work",
+            attempt_token="token",
+            operator_capability="root-token",
+        )
+        with (
+            patch.object(controller, "execution_unit_status", return_value="absent"),
+            patch.object(
+                controller,
+                "usage_snapshots",
+                return_value={"PROJ-1": {"reserved_usd": 1.25}},
+            ),
+            patch.object(controller, "consume_operator_recovery", return_value=True),
+            self.assertRaisesRegex(controller.SprintError, "unsettled provider"),
+        ):
+            controller.requeue(args, self.cfg)
+        self.assertEqual(controller.load(path)["tickets"]["PROJ-1"]["state"], "recoverable")
 
     def test_reserve_also_counts_live_recovery_units(self):
         self.ticket(
@@ -1677,13 +1763,24 @@ class ResilienceTests(unittest.TestCase):
         self.assertTrue(receipt["cooperative_cleanup"]["gateway_closed"])
 
         ticket = controller.load(checkpoint)["tickets"]["PROJ-1"]
-        ticket["worker_identity"] = {
+        ticket["attempts"] = 1
+        identity = {
             "kind": "execution_unit",
             "containment": "cooperative-session",
             "invocation_id": "launch-1",
             "tombstone_path": str(tombstone),
         }
-        ticket["launch_evidence"]["cooperative_auto_recovery"] = True
+        ticket["worker_identity"] = identity
+        ticket["launch_evidence"].update(
+            {
+                "status": "launched",
+                "ticket": "PROJ-1",
+                "attempt": 1,
+                "attempt_token": "token",
+                "identity": identity,
+                "cooperative_auto_recovery": True,
+            }
+        )
         self.cfg["cooperative_auto_recovery"] = True
         with patch.object(controller.os, "killpg", side_effect=ProcessLookupError):
             self.assertTrue(
@@ -1705,16 +1802,23 @@ class ResilienceTests(unittest.TestCase):
             ),
         ):
             with self.subTest(status=status):
-                self.ticket("PROJ-1", status, **{"raw_status": "Backlog", **extra})
+                self.ticket(
+                    "PROJ-1",
+                    status,
+                    **{"raw_status": "Backlog", "worktree": "/tmp/preserved", **extra},
+                )
                 controller.save(
                     controller.state_path(self.cfg["state_dir"], "1"), self.state
                 )
                 fresh = copy.deepcopy(self.state)
                 fresh["tickets"]["PROJ-1"].update(
-                    state="pending", reason="", raw_status="Ready"
+                    state="pending", reason="", raw_status="Ready", worktree=""
                 )
                 self.sync_fixture(fresh)
                 self.assertEqual(self.state["tickets"]["PROJ-1"]["state"], status)
+                self.assertEqual(
+                    self.state["tickets"]["PROJ-1"]["worktree"], "/tmp/preserved"
+                )
 
     def test_authoritative_ready_sync_releases_untouched_legacy_hold(self):
         self.ticket(
