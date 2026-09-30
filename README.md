@@ -354,9 +354,10 @@ The accepted Orka 2 lifecycle semantics are specified separately in the
 the current implementation provides a
 [host-owned supervisor process](docs/sprint-supervisor.md) with an exclusive
 repository lease, detached session, deterministic synchronization/planning,
-durable cooldown wakes, and explicit pause, drain, resume, and stop
-transitions. It publishes controller-authorized work without model turns;
-worker reservation and dispatch remain the next Orka 2 slice.
+durable cooldown wakes, controller-owned worker dispatch, strict terminal-result
+bindings, immediate lane refill, and explicit pause, drain, resume, and stop
+transitions. Desktop and API workers pass through the same versioned lifecycle
+contract; stale or malformed results cannot become successful work.
 
 ## The merge-guard
 

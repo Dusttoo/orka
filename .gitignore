@@ -8,6 +8,8 @@
 # OS / editor cruft
 .DS_Store
 *.swp
+__pycache__/
+*.py[cod]
 
 # Local env / secrets (never committed; the scripts read these from the env)
 .env
