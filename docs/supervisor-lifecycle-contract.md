@@ -4,9 +4,9 @@ Contract: `orka.supervisor-lifecycle` schema version 1
 
 Machine-readable source: [`contracts/supervisor-lifecycle-v1.json`](../contracts/supervisor-lifecycle-v1.json)
 
-This contract defines the deterministic boundary between Orka's future durable
-supervisor and disposable AI workers. It is a specification and validation
-artifact; it does not implement the supervisor loop.
+This contract defines the deterministic boundary between Orka's durable
+supervisor and disposable AI workers. The machine-readable contract remains the
+authority; the supervisor validates each terminal result against it.
 
 ## Invariants
 
@@ -97,6 +97,19 @@ cancellation of the ticket moves any nonterminal job to `cancelled` only after
 the execution unit has a terminal receipt.
 
 ## Worker terminal results
+
+Workers return one `orka.worker-terminal-result/v1` JSON object containing the
+exact ticket, sprint, attempt token, controller invocation ID, outcome, bounded
+summary, branch/worktree/PR identities, and outcome-specific evidence. The
+controller injects the invocation ID into the prompt after allocating the
+execution unit, so an older or replacement worker cannot manufacture a current
+binding. The supervisor waits for the execution tombstone, verifies every
+binding and required contract evidence, authenticates completed PRs against
+GitHub, then applies exactly one controller outcome and job transition.
+
+Identical redelivery is a no-op. A changed or stale delivery is rejected. A
+malformed or missing result maps only that ticket to `recovery_ready`; it cannot
+pause the supervisor or authorize completion.
 
 | Result | Event | Next job state |
 |---|---|---|

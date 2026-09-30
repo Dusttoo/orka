@@ -528,7 +528,7 @@ PY
 json_check "legacy non-ticket accounting labels remain reportable without authority lookup" "$TMP/legacy-label-summary.json" 'data["spend"]["1802"]["spent_usd"] == 0.01 and data["spend"]["SMOKE-TEST"]["spent_usd"] == 0.01'
 
 cat > "$TMP/repo/fast-exit.json" <<'JSON'
-{"project":"PROJ","sprint":{"id":"49","name":"fast exit"},"source_query":"q","subtask_source_query":"children","subtask_keys":[],"tickets":[{"key":"PROJ-90","status":"Ready","dependencies":[],"subtasks":[]}]}
+{"project":"PROJ","sprint":{"id":"49","name":"fast exit"},"source_query":"q","subtask_source_query":"children","subtask_keys":[],"tickets":[{"key":"PROJ-90","status":"Ready","dependencies":[],"subtasks":[]},{"key":"PROJ-91","status":"Ready","dependencies":[],"subtasks":[]}]}
 JSON
 jira_receipt "$TMP/repo/fast-exit.json"
 run_ok "fast-exit inventory syncs" "$CONTROLLER" sync --inventory fast-exit.json
@@ -541,6 +541,16 @@ FAST_EVIDENCE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))
 if [ "$(cat "$TMP/repo/.orchestration/fast.log")" = prompt-from-stdin ]; then ok "launch-local sends prompt file contents to worker stdin"; else fail_case "launch-local sends prompt file contents to worker stdin"; fi
 run_ok "fast worker terminal tombstone remains attachable" "$CONTROLLER" attach --sprint 49 --ticket PROJ-90 --launch-evidence "$FAST_EVIDENCE"
 run_ok "fast worker tombstone permits confirmed recovery" "$CONTROLLER" requeue --sprint 49 --ticket PROJ-90 --reason 'fast worker exited' --attempt-token "$FAST_TOKEN"
+
+printf 'COPY_ORCHESTRATOR_INVOCATION_ID\n' > "$TMP/repo/.orchestration/bound.prompt"
+"$CONTROLLER" reserve --sprint 49 --ticket PROJ-91 --run-ref bound > "$TMP/bound-reserve.json"
+BOUND_TOKEN="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_token"])' "$TMP/bound-reserve.json")"
+BOUND_ATTACH="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attach_capability"])' "$TMP/bound-reserve.json")"
+"$CONTROLLER" launch-local --sprint 49 --ticket PROJ-91 --attach-capability "$BOUND_ATTACH" --output .orchestration/bound.log --stdin-file .orchestration/bound.prompt --bind-invocation-placeholder -- /bin/sh -c 'IFS= read -r prompt; printf "%s\n" "$prompt"' > "$TMP/bound-launch.json"
+BOUND_EVIDENCE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["launch_evidence"])' "$TMP/bound-launch.json")"
+if grep -Eq '^[a-f0-9]{32}$' "$TMP/repo/.orchestration/bound.log" && ! grep -q COPY_ORCHESTRATOR "$TMP/repo/.orchestration/bound.prompt"; then ok "controller binds exact invocation identity into worker input"; else fail_case "controller binds exact invocation identity into worker input"; fi
+run_ok "identity-bound fast worker remains attachable" "$CONTROLLER" attach --sprint 49 --ticket PROJ-91 --launch-evidence "$BOUND_EVIDENCE"
+run_ok "identity-bound worker permits confirmed recovery" "$CONTROLLER" requeue --sprint 49 --ticket PROJ-91 --reason 'identity test exited' --attempt-token "$BOUND_TOKEN"
 
 cat > "$TMP/repo/limit-inventory.json" <<'JSON'
 {"project":"PROJ","sprint":{"id":"48","name":"run limit"},"source_query":"q","subtask_source_query":"children","subtask_keys":[],"tickets":[{"key":"PROJ-70","status":"Ready","dependencies":[],"subtasks":[]},{"key":"PROJ-71","status":"Ready","dependencies":[],"subtasks":[]}]}

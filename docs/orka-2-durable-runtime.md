@@ -1,9 +1,9 @@
 # Orka 2: durable supervisor runtime
 
 Status: accepted architectural direction; implementation in independently
-releasable slices. Orka 1.8.4 provides the detached supervisor, repository
-lease lifecycle, and deterministic synchronization/planning loop. Worker
-dispatch remains pending.
+releasable slices. Orka 1.8.5 provides the detached supervisor, repository
+lease lifecycle, deterministic synchronization/planning loop, controller-owned
+desktop/API worker dispatch, and versioned terminal-result transitions.
 
 Orka's current controller has durable checkpoints and mechanical gates, but a
 model-driven captain still performs the outer `plan -> launch -> wait -> finish
@@ -100,13 +100,14 @@ concerns.
    [versioned supervisor contract](supervisor-lifecycle-contract.md).
 2. Add a host-owned supervisor loop around the existing controller, beginning
    with the [detached lease and planning process](sprint-supervisor.md).
-3. Add durable resource exclusions and fair queue admission.
-4. Automate evidence-backed worker and preserved-PR recovery.
-5. Add soft/hard breakers and ticket parking.
-6. Introduce a transactional event store with checkpoint import/export.
-7. Add supervisor lease takeover and crash recovery.
-8. Expose stable status, pause, resume, and decision CLI commands.
-9. Prove the design with restart, timeout, provider-loss, and malformed-output
+3. Connect controller-owned worker dispatch and terminal-result handling.
+4. Add durable resource exclusions and fair queue admission.
+5. Automate evidence-backed worker and preserved-PR recovery.
+6. Add soft/hard breakers and ticket parking.
+7. Introduce a transactional event store with checkpoint import/export.
+8. Add supervisor lease takeover and crash recovery.
+9. Expose stable status, pause, resume, and decision CLI commands.
+10. Prove the design with restart, timeout, provider-loss, and malformed-output
    chaos tests.
 
 Each step must be independently releasable and keep existing Orka 1.x

@@ -4566,9 +4566,83 @@ def launch_local(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
                 raise SprintError(
                     "provider admission held: " + json.dumps(hold, sort_keys=True)
                 )
-            command = validate_native_command(command, route)
-            command = bind_native_working_directory(command, route, worker_cwd)
+            if route.get("execution") == "desktop":
+                command = validate_native_command(command, route)
+                command = bind_native_working_directory(command, route, worker_cwd)
+            else:
+                expected_agent = Path(__file__).with_name("api_agent.py").resolve()
+                if (
+                    len(command) < 4
+                    or Path(command[0]).resolve() != Path(sys.executable).resolve()
+                    or Path(command[1]).resolve() != expected_agent
+                    or command[2] != "run"
+                ):
+                    raise SprintError(
+                        "API sprint-worker launch requires the plugin-owned api_agent.py run adapter"
+                    )
+                values: dict[str, str] = {}
+                index = 3
+                while index < len(command):
+                    option = command[index]
+                    if not option.startswith("--") or index + 1 >= len(command):
+                        raise SprintError("API sprint-worker command has malformed arguments")
+                    if option in values:
+                        raise SprintError("API sprint-worker command repeats an argument")
+                    values[option] = command[index + 1]
+                    index += 2
+                capability = ticket.get("attempt_capability") or {}
+                required = {
+                    "--config": str(cfg["config"]),
+                    "--role": "sprint-worker",
+                    "--repo": str(worker_cwd),
+                    "--ticket": key,
+                    "--sprint": str(args.sprint),
+                    "--run-id": str(capability.get("run_id") or ""),
+                    "--attempt-capability": str(capability.get("token") or ""),
+                    "--worker-ref": str(capability.get("worker") or ""),
+                }
+                if any(values.get(name) != value for name, value in required.items()):
+                    raise SprintError(
+                        "API sprint-worker command differs from the controller reservation"
+                    )
+                if set(values) != {*required, "--request", "--result"}:
+                    raise SprintError("API sprint-worker command contains unsupported arguments")
+                for name in ("--request", "--result"):
+                    _repository_path(cfg["shared_root"], values[name], label=name[2:])
         invocation_id = uuid.uuid4().hex
+        if getattr(args, "bind_invocation_placeholder", False):
+            if input_path is None:
+                raise SprintError(
+                    "invocation placeholder binding requires --stdin-file"
+                )
+            try:
+                prompt = input_path.read_text(encoding="utf-8")
+            except OSError as exc:
+                raise SprintError(f"cannot read worker input for identity binding: {exc}") from exc
+            placeholder = "COPY_ORCHESTRATOR_INVOCATION_ID"
+            if prompt.count(placeholder) != 1:
+                raise SprintError(
+                    "worker input must contain exactly one invocation placeholder"
+                )
+            temporary = input_path.with_name(
+                f".{input_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+            )
+            descriptor = os.open(
+                temporary,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            try:
+                with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                    handle.write(prompt.replace(placeholder, invocation_id))
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, input_path)
+            finally:
+                temporary.unlink(missing_ok=True)
         runtime_prefix = cfg["state_dir"] / f"execution-{invocation_id}"
         ready_path = runtime_prefix.with_suffix(".ready.json")
         ack_path = runtime_prefix.with_suffix(".ack")
@@ -5604,6 +5678,7 @@ def parser() -> argparse.ArgumentParser:
     launch_parser.add_argument("--attach-capability", required=True)
     launch_parser.add_argument("--output", required=True)
     launch_parser.add_argument("--stdin-file")
+    launch_parser.add_argument("--bind-invocation-placeholder", action="store_true")
     launch_parser.add_argument("command", nargs=argparse.REMAINDER)
     launch_parser.set_defaults(func=launch_local)
     supervisor_parser = commands.add_parser("supervise-local", help=argparse.SUPPRESS)

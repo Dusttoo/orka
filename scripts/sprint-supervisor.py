@@ -2,8 +2,8 @@
 """Run and control Orka's host-owned repository supervisor process.
 
 The supervisor owns the repository lease and a deterministic synchronization /
-planning loop.  It reports controller-authorized work but does not reserve or
-launch workers; dispatch belongs to the next Orka 2 runtime slice.
+planning loop. It reserves, launches, and reconciles controller-authorized
+workers without requiring a recurring AI captain turn.
 """
 
 from __future__ import annotations
@@ -41,6 +41,7 @@ from supervisor_planning import (
     canonical_digest,
     planning_cycle,
 )
+from supervisor_dispatch import DispatchError, StaleResultError, SupervisorDispatcher
 
 
 class SupervisorError(RuntimeError):
@@ -382,6 +383,22 @@ def status_response(state: dict[str, Any]) -> dict[str, Any]:
     result["lease_released_at"] = (state.get("lease") or {}).get("released_at", "")
     result["lease_release_count"] = (state.get("lease") or {}).get("release_count", 0)
     result["planning"] = state.get("planning") or {"enabled": False}
+    dispatch = state.get("dispatch") or {}
+    result["dispatch"] = {
+        "active_jobs": sum(
+            1
+            for job in (dispatch.get("jobs") or {}).values()
+            if job.get("state") in {"running", "reserved", "launch_uncertain"}
+        ),
+        "terminal_jobs": sum(
+            1
+            for job in (dispatch.get("jobs") or {}).values()
+            if job.get("state")
+            not in {"running", "reserved", "launch_uncertain"}
+        ),
+        "launch_count": int(dispatch.get("launch_count") or 0),
+        "terminal_count": int(dispatch.get("terminal_count") or 0),
+    }
     return result
 
 
@@ -404,10 +421,18 @@ def planning_settings(repository: Path) -> dict[str, Any]:
         raise SupervisorError(
             "supervisor_sync_interval_seconds must be from 5 through 3600"
         )
+    raw_concurrency = config.get("concurrency_max", 1)
+    try:
+        concurrency = int(raw_concurrency)
+    except (TypeError, ValueError) as exc:
+        raise SupervisorError("concurrency_max must be a positive integer") from exc
+    if isinstance(raw_concurrency, bool) or str(concurrency) != str(raw_concurrency) or concurrency < 1:
+        raise SupervisorError("concurrency_max must be a positive integer")
     return {
         "enabled": bool(configured),
         "requested_sprint": configured,
         "sync_interval_seconds": interval,
+        "concurrency_max": concurrency,
     }
 
 
@@ -462,15 +487,21 @@ def apply_control(
         lifecycle.transition(
             state, "drain_requested", {"operator_request_id": request_id}
         )
-        lifecycle.transition(
-            state,
-            "drain_completed",
-            {
-                "active_job_count": 0,
-                "queue_snapshot_digest": digest_bytes(b"[]"),
-            },
+        active = sum(
+            1
+            for job in ((state.get("dispatch") or {}).get("jobs") or {}).values()
+            if job.get("state") in {"running", "reserved", "launch_uncertain"}
         )
-        state.setdefault("planning", {})["pause_cause"] = "operator_drain"
+        if active == 0:
+            lifecycle.transition(
+                state,
+                "drain_completed",
+                {
+                    "active_job_count": 0,
+                    "queue_snapshot_digest": digest_bytes(b"[]"),
+                },
+            )
+            state.setdefault("planning", {})["pause_cause"] = "operator_drain"
     elif command == "stop":
         lifecycle.transition(
             state,
@@ -637,10 +668,12 @@ def run_daemon(repository: Path, handshake: Path) -> int:
             config_digest = digest_bytes(config_path.read_bytes())
             runtime_fingerprint = digest_bytes(
                 Path(__file__).read_bytes()
+                + (PLUGIN_ROOT / "scripts/supervisor_dispatch.py").read_bytes()
                 + CONTRACT_PATH.read_bytes()
                 + (PLUGIN_ROOT / "scripts/runtime_state.py").read_bytes()
                 + (PLUGIN_ROOT / ".codex-plugin/plugin.json").read_bytes()
             )
+            settings = planning_settings(repository)
             lifecycle.transition(
                 state,
                 "preflight_succeeded",
@@ -653,7 +686,7 @@ def run_daemon(repository: Path, handshake: Path) -> int:
             state["config_digest"] = config_digest
             state["runtime_fingerprint"] = runtime_fingerprint
             state["contract_digest"] = contract_digest
-            state["planning"] = planning_settings(repository)
+            state["planning"] = settings
             state["planning"].update(
                 {
                     "cycle_count": 0,
@@ -663,6 +696,12 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                     "plan_digest": "",
                 }
             )
+            state["dispatch"] = {
+                "jobs": {},
+                "launch_count": 0,
+                "terminal_count": 0,
+                "last_error": "",
+            }
             persist_state()
         except (OSError, RuntimeStateError, SupervisorError) as exc:
             diagnostic = str(exc)
@@ -701,6 +740,9 @@ def run_daemon(repository: Path, handshake: Path) -> int:
 
         should_stop = False
         integrity_due = time.time()
+        dispatcher = SupervisorDispatcher(
+            repository, paths["directory"], CONTRACT_PATH
+        )
         while not should_stop:
             if signal_number:
                 lifecycle.transition(
@@ -747,6 +789,90 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                 integrity_due = current_time + 1.0
 
             planning = state.get("planning") or {}
+            dispatch = state.get("dispatch") or {}
+            jobs = dispatch.setdefault("jobs", {})
+            terminal_applied = False
+            for run_ref, job in list(jobs.items()):
+                if job.get("state") != "running":
+                    continue
+                try:
+                    result = dispatcher.apply_process_exit(job)
+                    if result and result.get("applied"):
+                        terminal_applied = True
+                        dispatch["terminal_count"] = int(
+                            dispatch.get("terminal_count") or 0
+                        ) + 1
+                        state.setdefault("history", []).append(
+                            {
+                                "at": now(),
+                                "event": "worker_terminal_applied",
+                                "from": state["lifecycle_state"],
+                                "to": state["lifecycle_state"],
+                                "evidence": {
+                                    "ticket": job["ticket"],
+                                    "run_ref": run_ref,
+                                    "result_digest": result["terminal"]["result_digest"],
+                                    "contract_event": result["terminal"]["event"],
+                                },
+                            }
+                        )
+                except StaleResultError as exc:
+                    terminal_applied = True
+                    job["state"] = "terminal_rejected"
+                    job["terminal_rejection"] = {
+                        "at": now(),
+                        "reason": str(exc),
+                    }
+                    dispatch["last_error"] = str(exc)
+                    state.setdefault("history", []).append(
+                        {
+                            "at": now(),
+                            "event": "worker_terminal_rejected_stale",
+                            "from": state["lifecycle_state"],
+                            "to": state["lifecycle_state"],
+                            "evidence": {
+                                "ticket": job["ticket"],
+                                "run_ref": run_ref,
+                                "diagnostic_digest": digest_bytes(str(exc).encode()),
+                            },
+                        }
+                    )
+                except (DispatchError, OSError, json.JSONDecodeError) as exc:
+                    dispatch["last_error"] = str(exc)
+                    state.setdefault("history", []).append(
+                        {
+                            "at": now(),
+                            "event": "worker_terminal_processing_failed",
+                            "from": state["lifecycle_state"],
+                            "to": state["lifecycle_state"],
+                            "evidence": {
+                                "ticket": job["ticket"],
+                                "run_ref": run_ref,
+                                "diagnostic_digest": digest_bytes(str(exc).encode()),
+                            },
+                        }
+                    )
+            if terminal_applied:
+                planning["next_wake_epoch"] = 0.0
+                state["history"] = state["history"][-256:]
+                persist_state()
+            if state.get("lifecycle_state") == "draining":
+                active = sum(
+                    1
+                    for job in jobs.values()
+                    if job.get("state") in {"running", "reserved", "launch_uncertain"}
+                )
+                if active == 0:
+                    lifecycle.transition(
+                        state,
+                        "drain_completed",
+                        {
+                            "active_job_count": 0,
+                            "queue_snapshot_digest": canonical_digest([]),
+                        },
+                    )
+                    planning["pause_cause"] = "operator_drain"
+                    persist_state()
             pause_cause = planning.get("pause_cause")
             system_pause = state.get("lifecycle_state") == "paused" and pause_cause in {
                 "all_routes_unavailable",
@@ -893,8 +1019,56 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                         # the explicit pause, but allow a subsequent operator
                         # resume now that the hard blocker is gone.
                         planning["pause_cause"] = ""
+                    if state["lifecycle_state"] in {"active", "degraded"}:
+                        launched = dispatcher.fill(
+                            str((snapshot.get("sprint") or {}).get("id") or ""),
+                            list((snapshot.get("plan") or {}).get("launch") or []),
+                            jobs,
+                            int(planning.get("concurrency_max") or 1),
+                        )
+                        for failure in dispatcher.last_errors:
+                            dispatch["last_error"] = failure["error"]
+                            state.setdefault("history", []).append(
+                                {
+                                    "at": now(),
+                                    "event": "worker_dispatch_rejected",
+                                    "from": state["lifecycle_state"],
+                                    "to": state["lifecycle_state"],
+                                    "evidence": {
+                                        "ticket": failure["ticket"],
+                                        "diagnostic_digest": digest_bytes(
+                                            failure["error"].encode()
+                                        ),
+                                    },
+                                }
+                            )
+                        if launched:
+                            dispatch["launch_count"] = int(
+                                dispatch.get("launch_count") or 0
+                            ) + len(launched)
+                            for job in launched:
+                                state.setdefault("history", []).append(
+                                    {
+                                        "at": now(),
+                                        "event": "worker_dispatch_recorded",
+                                        "from": state["lifecycle_state"],
+                                        "to": state["lifecycle_state"],
+                                        "evidence": {
+                                            "ticket": job["ticket"],
+                                            "run_ref": job["run_ref"],
+                                            "dispatch_state": job["state"],
+                                            "attempt_token_digest": digest_bytes(
+                                                job["attempt_token"].encode()
+                                            ),
+                                            "execution_invocation": (
+                                                job.get("execution_identity") or {}
+                                            ).get("invocation_id", ""),
+                                        },
+                                    }
+                                )
+                            state["history"] = state["history"][-256:]
                     persist_state()
-                except PlanningError as exc:
+                except (PlanningError, DispatchError) as exc:
                     planning["last_error"] = str(exc)
                     planning["last_sync_at"] = now()
                     planning["next_wake_epoch"] = current_time + float(

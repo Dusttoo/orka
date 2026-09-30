@@ -1,10 +1,11 @@
 # Host-owned sprint supervisor
 
-Orka 1.8.4 extends the detached Orka 2 supervisor with a deterministic outer
+Orka 1.8.5 extends the detached Orka 2 supervisor with a deterministic outer
 planning loop. The host process owns one repository lease, synchronizes through
 the existing authenticated Jira/GitHub/controller/provider adapters, publishes
-controller-authorized work, and sleeps until an operator event or durable
-deadline. It does not reserve or launch workers; dispatch remains issue #85.
+controller-authorized work, fills available lanes through controller-owned
+desktop or API execution units, applies terminal results, and sleeps until an
+operator event or durable deadline.
 
 ## Runtime boundary
 
@@ -23,6 +24,8 @@ The state snapshot records:
 - bounded transition and operator-request history;
 - the latest synchronized plan, evidence digests, hard-budget receipt, and next
   wake deadline.
+- exact job-to-attempt and execution-unit bindings, accepted terminal-result
+  digests, contract events, and resulting job states.
 
 It never writes provider, Jira, GitHub, or application credentials.
 
@@ -90,7 +93,13 @@ provider-health adapter and a failed route remains durable, waitable work.
 
 Blocked, parked, and decision-bound tickets stay ticket-local. If another ticket
 is controller-authorized, it remains in the published plan. This slice reports
-that work but deliberately leaves reservation and launch to issue #85.
+and dispatches that work without another captain turn. A worker must return the
+`orka.worker-terminal-result/v1` envelope bound to the exact sprint, ticket,
+attempt token, and controller invocation. The supervisor verifies completed PRs
+against GitHub, maps accepted results through the versioned lifecycle contract,
+and immediately replans when a lane exits. Duplicate delivery is a journaled
+no-op; stale bindings are rejected; malformed or missing output moves only that
+ticket to recovery-ready.
 
 An unclean process death leaves a nonterminal state. Automatic takeover is
 intentionally refused until issue #77 adds heartbeat, predecessor-absence, and
@@ -103,5 +112,6 @@ continues in lifecycle-only mode. The optional
 `supervisor_sync_interval_seconds` value must be 5 through 3600 seconds.
 Initialization should gitignore `.orchestration/.supervisor/`.
 
-This slice does not launch workers, recover a crashed supervisor, or weaken
-existing review, security, budget, and merge gates.
+This slice does not recover a crashed supervisor, add preserved-PR recovery or
+resource exclusions, or weaken existing review, security, budget, and merge
+gates.
