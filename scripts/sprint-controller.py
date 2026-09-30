@@ -2968,7 +2968,23 @@ def reconcile_preserved_pr(args: argparse.Namespace, cfg: dict[str, Any]) -> Non
                 "preserved PR worktree changed or became active during verification"
             )
         verify_worktree_receipt(worktree, observation["receipt"])
-        recovery_id = "recovery_" + uuid.uuid4().hex
+        recovery_id = "recovery_" + recovery_digest(
+            {
+                "schema": "orka.preserved-pr-recovery/v1",
+                "ticket": key,
+                "attempt": int(ticket.get("attempts") or 0),
+                "invocation_id": str(
+                    (ticket.get("last_terminal") or {}).get("invocation_id") or ""
+                ),
+                "worktree": str(worktree),
+                "branch": observation["receipt"]["branch"],
+                "pr": observation["receipt"]["url"],
+                "head": observation["receipt"]["head"],
+                "tree": observation["receipt"]["tree"],
+                "eligibility": refreshed_evaluation["evidence_digest"],
+                "preservation": refreshed_evaluation["preservation_digest"],
+            }
+        )[:32]
         try:
             UsageLedger(cfg["shared_root"]).fence_recovery(key, recovery_id)
         except Exception as exc:
@@ -3014,6 +3030,11 @@ def reconcile_preserved_pr(args: argparse.Namespace, cfg: dict[str, Any]) -> Non
                 "event": "preserved-pr-reconciled",
                 "binding": ticket["recovery_binding"],
                 "reason_codes": refreshed_evaluation["reason_codes"],
+                "transition_trace": [
+                    "eligibility_observation:eligible",
+                    "recovery_fencing:active",
+                    "controller_mutation:pending",
+                ],
             }
         )
         save(path, state)
@@ -5587,6 +5608,12 @@ def requeue(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
                 "recovery_reason_codes": evaluation["reason_codes"],
                 "recovery_evidence_digest": evaluation.get("evidence_digest", ""),
                 "preservation_digest": preservation_digest,
+                "transition_trace": [
+                    "eligibility_observation:eligible"
+                    if automatic
+                    else "eligibility_observation:operator-authorized",
+                    "controller_mutation:pending",
+                ],
             }
         )
         save(path, state)

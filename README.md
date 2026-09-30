@@ -444,6 +444,14 @@ re-enters the existing continuation pipeline automatically. Dirty or active
 worktrees, moved heads, unknown owners, and unsettled reservations remain
 visible with stable refusal codes and are never relaunched speculatively.
 
+Recovery crash behavior is specified by
+[`orka.recovery-crash-boundaries/v1`](contracts/recovery-crash-boundaries-v1.json).
+Preserved-PR fence identities are content-derived and idempotent, so replay
+after a crash cannot supersede the original fence or duplicate a provider
+reservation. Compact transition traces identify the last committed recovery
+boundary while atomic checkpoints keep each replay on either the old or new
+side of a state transition.
+
 Please report security-sensitive findings privately according to
 [SECURITY.md](SECURITY.md) and follow the [Code of Conduct](CODE_OF_CONDUCT.md).
 

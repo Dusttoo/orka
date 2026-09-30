@@ -840,6 +840,13 @@ class UsageLedger:
                 raise BudgetError(
                     f"ticket {ticket} has an open usage reservation; recovery cannot be fenced"
                 )
+            active = self._active_recovery_fence(events, ticket)
+            if active:
+                if active.get("recovery_id") == recovery_id:
+                    return
+                raise BudgetError(
+                    f"ticket {ticket} already has a different active recovery fence"
+                )
             self._append_locked(
                 {
                     "kind": "recovery_fence",
