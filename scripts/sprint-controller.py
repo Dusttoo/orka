@@ -507,6 +507,7 @@ def load(path: Path) -> dict[str, Any]:
         ticket.setdefault("resolved_scope_decisions", [])
         ticket.setdefault("recovery_binding", {})
         ticket.setdefault("terminal_classification", {})
+        ticket.setdefault("last_finish_receipt", {})
         ticket.setdefault("decomposition_children", [])
         ticket.setdefault("progress", [])
     return value
@@ -1667,6 +1668,7 @@ def sync(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
                         "resolved_scope_decisions",
                         "recovery_binding",
                         "terminal_classification",
+                        "last_finish_receipt",
                         "restart_grant_id",
                         "startup_retry_receipts",
                         "decomposition_children",
@@ -3911,6 +3913,7 @@ def reserve(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         # Terminal evidence belongs to the attempt that produced it. A later
         # crash must never inherit an earlier timeout's continuation credit.
         ticket["last_terminal"] = {}
+        ticket["last_finish_receipt"] = {}
         event = {
             "at": now(),
             "event": "reserved",
@@ -5013,10 +5016,35 @@ def finish(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         if external_receipt or raw_dependencies:
             raise SprintError("external dependency metadata is allowed only for external_blocked")
         dependencies = []
+    finish_payload = {
+        "sprint": str(args.sprint),
+        "ticket": key,
+        "attempt_token": str(args.attempt_token),
+        "outcome": str(args.outcome),
+        "summary": args.summary.strip(),
+        "branch": args.branch.strip(),
+        "pr": args.pr.strip(),
+        "decision_class": decision_class,
+        "decision_question": decision_question,
+        "external_dependencies": dependencies,
+        "external_dependency_receipt": external_receipt,
+    }
+    finish_digest = hashlib.sha256(
+        json.dumps(finish_payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
     with locked(path):
         state = load(path)
         ticket = state["tickets"].get(key)
-        if not ticket or ticket["state"] != "running":
+        if not ticket:
+            raise SprintError(f"ticket {key} is not running")
+        prior_finish = ticket.get("last_finish_receipt") or {}
+        if ticket["state"] != "running" and (
+            prior_finish.get("digest") == finish_digest
+            and prior_finish.get("attempt_token") == args.attempt_token
+        ):
+            emit({"ticket": key, "state": ticket["state"], "duplicate": True})
+            return
+        if ticket["state"] != "running":
             raise SprintError(f"ticket {key} is not running")
         require_attempt(ticket, args.attempt_token)
         if dependencies and any(
@@ -5045,11 +5073,22 @@ def finish(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             }
         else:
             ticket["terminal_classification"] = {}
+        ticket["last_finish_receipt"] = {
+            "digest": finish_digest,
+            "attempt_token": args.attempt_token,
+            "outcome": args.outcome,
+            "recorded_at": now(),
+        }
         ticket["history"].append(
-            {"at": now(), "event": "finished", "outcome": args.outcome}
+            {
+                "at": now(),
+                "event": "finished",
+                "outcome": args.outcome,
+                "finish_digest": finish_digest,
+            }
         )
         save(path, state)
-    emit({"ticket": key, "state": args.outcome})
+    emit({"ticket": key, "state": args.outcome, "duplicate": False})
 
 
 def resolve_decision(args: argparse.Namespace, cfg: dict[str, Any]) -> None:

@@ -9,6 +9,7 @@ workers without requiring a recurring AI captain turn.
 from __future__ import annotations
 
 import argparse
+import copy
 import ctypes
 import fcntl
 import hashlib
@@ -170,6 +171,7 @@ def runtime_paths(repository: Path) -> dict[str, Path]:
     return {
         "directory": directory,
         "state": directory / "state.json",
+        "state_digest": directory / "state.sha256.json",
         "lock": directory / "lease.lock",
         "log": directory / "supervisor.log",
         "socket": socket_path,
@@ -327,6 +329,148 @@ def contract() -> tuple[dict[str, Any], Lifecycle, str]:
     return value, Lifecycle(value), digest_bytes(CONTRACT_PATH.read_bytes())
 
 
+def runtime_fingerprint() -> str:
+    """Bind restart authority to the exact runtime that wrote durable state."""
+
+    return digest_bytes(
+        Path(__file__).read_bytes()
+        + (PLUGIN_ROOT / "scripts/supervisor_dispatch.py").read_bytes()
+        + CONTRACT_PATH.read_bytes()
+        + (PLUGIN_ROOT / "scripts/runtime_state.py").read_bytes()
+        + (PLUGIN_ROOT / ".codex-plugin/plugin.json").read_bytes()
+    )
+
+
+def new_lease(
+    lock_handle: Any, paths: dict[str, Path], generation: int
+) -> dict[str, Any]:
+    held = os.fstat(lock_handle.fileno())
+    return {
+        "id": str(uuid.uuid4()),
+        "generation": generation,
+        "lock_path": str(paths["lock"]),
+        "lock_device": held.st_dev,
+        "lock_inode": held.st_ino,
+        "acquired_at": now(),
+        "released_at": "",
+        "release_count": 0,
+    }
+
+
+def takeover_state(
+    previous: dict[str, Any],
+    *,
+    identity: dict[str, Any],
+    lease: dict[str, Any],
+    lifecycle: Lifecycle,
+    config_digest: str,
+    runtime_digest: str,
+    contract_digest: str,
+    settings: dict[str, Any],
+) -> dict[str, Any]:
+    """Recover one unclean supervisor only from exact, absent predecessor proof."""
+
+    predecessor_status = process_status(previous.get("process"))
+    if predecessor_status != "absent":
+        raise SupervisorError(
+            "prior supervisor absence is not mechanically verified; takeover refused"
+        )
+    if previous.get("config_digest") != config_digest:
+        raise SupervisorError("repository config changed since the unclean supervisor stop")
+    if previous.get("runtime_fingerprint") != runtime_digest:
+        raise SupervisorError("Orka runtime changed since the unclean supervisor stop")
+    if previous.get("contract_digest") != contract_digest:
+        raise SupervisorError("supervisor lifecycle contract changed since the unclean stop")
+
+    old_lease = copy.deepcopy(previous.get("lease") or {})
+    if (
+        old_lease.get("lock_path") != lease.get("lock_path")
+        or old_lease.get("lock_device") != lease.get("lock_device")
+        or old_lease.get("lock_inode") != lease.get("lock_inode")
+    ):
+        raise SupervisorError("repository supervisor lease identity changed after the crash")
+
+    previous_state = str(previous.get("lifecycle_state") or "")
+    resume_state = previous_state
+    if previous_state == "takeover_pending":
+        resume_state = str(
+            ((previous.get("takeover") or {}).get("resume_state") or "active")
+        )
+    if resume_state not in {"starting", "active", "degraded", "paused", "draining"}:
+        raise SupervisorError(f"unsupported takeover resume state: {resume_state}")
+
+    state = copy.deepcopy(previous)
+    absence_receipt = {
+        "status": predecessor_status,
+        "process_fingerprint": (previous.get("process") or {}).get(
+            "start_fingerprint", ""
+        ),
+        "lease_id": old_lease.get("id", ""),
+        "lease_generation": old_lease.get("generation", 0),
+    }
+    absence_receipt["digest"] = digest_bytes(
+        json.dumps(absence_receipt, sort_keys=True, separators=(",", ":")).encode()
+    )
+    state.update(
+        {
+            "process": identity,
+            "lease": lease,
+            "started_at": now(),
+            "updated_at": now(),
+            "stopped_at": "",
+            "control_socket": str(runtime_paths(Path(state["repository"]))["socket"]),
+            "config_digest": config_digest,
+            "runtime_fingerprint": runtime_digest,
+            "contract_digest": contract_digest,
+            "failure": "",
+            "takeover": {
+                "resume_state": resume_state,
+                "predecessor_process": copy.deepcopy(previous.get("process") or {}),
+                "predecessor_lease": old_lease,
+                "absence_receipt": absence_receipt,
+            },
+        }
+    )
+    lifecycle.transition(
+        state,
+        "takeover_requested",
+        {
+            "claimant_identity": identity["start_fingerprint"],
+            "observed_lease": old_lease.get("id") or "unknown-prior-lease",
+        },
+    )
+    lifecycle.transition(
+        state,
+        "predecessor_absent",
+        {
+            "absence_receipt": absence_receipt["digest"],
+            "new_lease_id": lease["id"],
+        },
+    )
+    planning = state.setdefault("planning", {})
+    planning.update(settings)
+    planning["next_wake_epoch"] = 0.0
+    state.setdefault("dispatch", {"jobs": {}, "launch_count": 0, "terminal_count": 0})
+    state.setdefault("requests", [])
+
+    if resume_state == "paused":
+        lifecycle.transition(
+            state,
+            "operator_paused",
+            {
+                "operator_request_id": f"takeover:{lease['id']}:restore-pause",
+                "pause_mode": str(planning.get("pause_cause") or "hold"),
+            },
+        )
+    elif resume_state == "draining":
+        lifecycle.transition(
+            state,
+            "drain_requested",
+            {"operator_request_id": f"takeover:{lease['id']}:restore-drain"},
+        )
+    return state
+
+
 def state_snapshot(path: Path, repository: Path | None = None) -> dict[str, Any] | None:
     if not path.exists():
         return None
@@ -348,6 +492,28 @@ def state_snapshot(path: Path, repository: Path | None = None) -> dict[str, Any]
     if repository is not None and value.get("repository") != str(repository):
         raise SupervisorError("supervisor state belongs to another repository")
     return value
+
+
+def verify_state_digest(
+    state_path: Path, digest_path: Path, *, required: bool
+) -> str:
+    """Authenticate the last fully persisted state before restart."""
+
+    if not digest_path.is_file():
+        if required:
+            raise SupervisorError(
+                "unclean supervisor state has no durable state-digest receipt"
+            )
+        return ""
+    receipt = load_json(digest_path, "supervisor state digest")
+    expected = str(receipt.get("sha256") or "")
+    try:
+        observed = digest_bytes(state_path.read_bytes())
+    except OSError as exc:
+        raise SupervisorError("cannot authenticate durable supervisor state") from exc
+    if not expected or expected != observed:
+        raise SupervisorError("durable supervisor state digest does not match its receipt")
+    return observed
 
 
 def validate_request(value: Any) -> dict[str, str]:
@@ -627,6 +793,10 @@ def run_daemon(repository: Path, handshake: Path) -> int:
             raise SupervisorError("supervisor state is not initialized")
         atomic_write(paths["state"], state)
         expected_state_digest = digest_bytes(paths["state"].read_bytes())
+        atomic_write(
+            paths["state_digest"],
+            {"sha256": expected_state_digest, "recorded_at": now()},
+        )
 
     try:
         try:
@@ -646,112 +816,130 @@ def run_daemon(repository: Path, handshake: Path) -> int:
             and previous_lease.get("released_at")
             and previous_lease.get("release_count") == 1
         )
-        if previous and not previous_clean:
-            write_handshake(
-                handshake,
-                {
-                    "status": "error",
-                    "error": (
-                        "prior supervisor did not stop cleanly; takeover authority is "
-                        "not implemented in this runtime slice"
-                    ),
-                },
+        if previous:
+            verify_state_digest(
+                paths["state"],
+                paths["state_digest"],
+                required=not previous_clean,
             )
-            return 2
-        generation = (
-            int(((previous or {}).get("lease") or {}).get("generation") or 0) + 1
-        )
-        lease_id = str(uuid.uuid4())
+        generation = int(previous_lease.get("generation") or 0) + 1
         os.fchmod(lock_handle.fileno(), 0o600)
         identity = process_identity(os.getpid())
-        prior_history = list((previous or {}).get("history") or [])[-255:]
-        state = {
-            "schema_version": 1,
-            "contract_id": "orka.supervisor-lifecycle",
-            "contract_schema_version": 1,
-            "repository": str(repository),
-            "lifecycle_state": "starting",
-            "last_event": "supervisor_starting",
-            "started_at": now(),
-            "updated_at": now(),
-            "stopped_at": "",
-            "process": identity,
-            "lease": {
-                "id": lease_id,
-                "generation": generation,
-                "lock_path": str(paths["lock"]),
-                "lock_device": os.fstat(lock_handle.fileno()).st_dev,
-                "lock_inode": os.fstat(lock_handle.fileno()).st_ino,
-                "acquired_at": now(),
-                "released_at": "",
-                "release_count": 0,
-            },
-            "control_socket": str(paths["socket"]),
-            "history": prior_history
-            + [
-                {
-                    "at": now(),
-                    "event": "supervisor_starting",
-                    "from": None,
-                    "to": "starting",
-                    "evidence": {"lease_id": lease_id, "generation": generation},
-                }
-            ],
-            "requests": [],
-        }
-        persist_state()
+        lease = new_lease(lock_handle, paths, generation)
+        lease_id = lease["id"]
         try:
             config_path = canonical_config_path(repository)
+        except RuntimeStateError as exc:
+            write_handshake(handshake, {"status": "error", "error": str(exc)})
+            return 2
+        initial_config_digest = (
+            digest_bytes(config_path.read_bytes()) if config_path.is_file() else ""
+        )
+        initial_runtime_digest = runtime_fingerprint()
+        if not previous or previous_clean:
+            prior_history = list((previous or {}).get("history") or [])[-255:]
+            state = {
+                "schema_version": 1,
+                "contract_id": "orka.supervisor-lifecycle",
+                "contract_schema_version": 1,
+                "repository": str(repository),
+                "lifecycle_state": "starting",
+                "last_event": "supervisor_starting",
+                "started_at": now(),
+                "updated_at": now(),
+                "stopped_at": "",
+                "process": identity,
+                "lease": lease,
+                "control_socket": str(paths["socket"]),
+                "history": prior_history
+                + [
+                    {
+                        "at": now(),
+                        "event": "supervisor_starting",
+                        "from": None,
+                        "to": "starting",
+                        "evidence": {
+                            "lease_id": lease_id,
+                            "generation": generation,
+                        },
+                    }
+                ],
+                "requests": [],
+                "config_digest": initial_config_digest,
+                "runtime_fingerprint": initial_runtime_digest,
+                "contract_digest": contract_digest,
+            }
+            persist_state()
+        try:
             if not config_path.is_file():
                 raise SupervisorError(f"repository config is missing: {config_path}")
-            config_digest = digest_bytes(config_path.read_bytes())
-            runtime_fingerprint = digest_bytes(
-                Path(__file__).read_bytes()
-                + (PLUGIN_ROOT / "scripts/supervisor_dispatch.py").read_bytes()
-                + CONTRACT_PATH.read_bytes()
-                + (PLUGIN_ROOT / "scripts/runtime_state.py").read_bytes()
-                + (PLUGIN_ROOT / ".codex-plugin/plugin.json").read_bytes()
-            )
+            config_digest = initial_config_digest
+            runtime_digest = initial_runtime_digest
             settings = planning_settings(repository)
-            lifecycle.transition(
-                state,
-                "preflight_succeeded",
-                {
-                    "config_digest": config_digest,
-                    "runtime_fingerprint": runtime_fingerprint,
-                    "lease_id": lease_id,
-                },
-            )
-            state["config_digest"] = config_digest
-            state["runtime_fingerprint"] = runtime_fingerprint
-            state["contract_digest"] = contract_digest
-            state["planning"] = settings
-            state["planning"].update(
-                {
-                    "cycle_count": 0,
-                    "last_sync_at": "",
+            if previous and not previous_clean:
+                state = takeover_state(
+                    previous,
+                    identity=identity,
+                    lease=lease,
+                    lifecycle=lifecycle,
+                    config_digest=config_digest,
+                    runtime_digest=runtime_digest,
+                    contract_digest=contract_digest,
+                    settings=settings,
+                )
+            else:
+                lifecycle.transition(
+                    state,
+                    "preflight_succeeded",
+                    {
+                        "config_digest": config_digest,
+                        "runtime_fingerprint": runtime_digest,
+                        "lease_id": lease_id,
+                    },
+                )
+                state["config_digest"] = config_digest
+                state["runtime_fingerprint"] = runtime_digest
+                state["contract_digest"] = contract_digest
+                state["planning"] = settings
+                state["planning"].update(
+                    {
+                        "cycle_count": 0,
+                        "last_sync_at": "",
+                        "last_error": "",
+                        "next_wake_epoch": 0.0,
+                        "plan_digest": "",
+                    }
+                )
+                state["dispatch"] = {
+                    "jobs": {},
+                    "launch_count": 0,
+                    "terminal_count": 0,
                     "last_error": "",
-                    "next_wake_epoch": 0.0,
-                    "plan_digest": "",
                 }
-            )
-            state["dispatch"] = {
-                "jobs": {},
-                "launch_count": 0,
-                "terminal_count": 0,
-                "last_error": "",
-            }
             persist_state()
         except (OSError, RuntimeStateError, SupervisorError) as exc:
             diagnostic = str(exc)
-            lifecycle.transition(
-                state,
-                "preflight_failed",
-                {
-                    "failure_class": type(exc).__name__,
-                    "diagnostic_digest": digest_bytes(diagnostic.encode("utf-8")),
-                },
-            )
+            if state is None:
+                write_handshake(handshake, {"status": "error", "error": diagnostic})
+                return 2
+            if state.get("lifecycle_state") == "starting":
+                lifecycle.transition(
+                    state,
+                    "preflight_failed",
+                    {
+                        "failure_class": type(exc).__name__,
+                        "diagnostic_digest": digest_bytes(diagnostic.encode("utf-8")),
+                    },
+                )
+            else:
+                lifecycle.transition(
+                    state,
+                    "durable_state_invalid",
+                    {
+                        "state_digest": expected_state_digest or "unavailable",
+                        "validation_error": type(exc).__name__,
+                    },
+                )
             state["failure"] = diagnostic
             state["stopped_at"] = now()
             persist_state()
