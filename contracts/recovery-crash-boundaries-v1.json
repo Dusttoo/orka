@@ -1,0 +1,59 @@
+{
+  "schema": "orka.recovery-crash-boundaries/v1",
+  "boundaries": [
+    {
+      "id": "eligibility_observation",
+      "durable_state": "source_checkpoint",
+      "next_action": "reobserve",
+      "external_effect": "none"
+    },
+    {
+      "id": "recovery_fencing",
+      "durable_state": "source_checkpoint_with_deterministic_fence",
+      "next_action": "replay_same_recovery",
+      "external_effect": "provider_reservations_blocked"
+    },
+    {
+      "id": "controller_mutation",
+      "durable_state": "source_or_pending_checkpoint",
+      "next_action": "inspect_then_replan",
+      "external_effect": "atomic_checkpoint_replace"
+    },
+    {
+      "id": "worker_reservation",
+      "durable_state": "pending_or_single_running_attempt",
+      "next_action": "plan_or_reconcile_attempt",
+      "external_effect": "single_attempt_capability"
+    },
+    {
+      "id": "worker_launch",
+      "durable_state": "reserved_or_launch_uncertain",
+      "next_action": "reconcile_execution_unit",
+      "external_effect": "never_blind_relaunch"
+    },
+    {
+      "id": "worker_attach",
+      "durable_state": "unused_capability_or_exact_bound_identity",
+      "next_action": "reattach_or_monitor_exact_unit",
+      "external_effect": "single_use_attach_capability"
+    },
+    {
+      "id": "provider_acknowledgement",
+      "durable_state": "open_reservation_or_settled_usage",
+      "next_action": "reconcile_exact_reservation",
+      "external_effect": "never_resubmit_ambiguous_request"
+    },
+    {
+      "id": "pr_observation",
+      "durable_state": "source_checkpoint",
+      "next_action": "reobserve_exact_pr_head",
+      "external_effect": "none"
+    },
+    {
+      "id": "terminal_application",
+      "durable_state": "running_or_single_terminal_transition",
+      "next_action": "replay_terminal_receipt",
+      "external_effect": "duplicate_delivery_is_noop"
+    }
+  ]
+}

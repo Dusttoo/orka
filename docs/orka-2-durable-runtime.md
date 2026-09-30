@@ -1,14 +1,15 @@
 # Orka 2: durable supervisor runtime
 
 Status: accepted architectural direction; implementation in independently
-releasable slices. Orka 1.8.11 provides the detached supervisor, repository
+releasable slices. Orka 1.8.13 provides the detached supervisor, repository
 lease lifecycle, deterministic synchronization/planning loop, controller-owned
 desktop/API worker dispatch, versioned terminal-result transitions, ticket-local
 parking, durable retry wakeups, classified operator-decision resolution, and
-authenticated restart after a mechanically proven supervisor death, and
+authenticated restart after a mechanically proven supervisor death,
 capacity-aware durable resource admission, starvation-bounded fair lane
-allocation, a versioned recovery eligibility contract, and automatic recovery
-of exact mechanically proven-dead worker attempts.
+allocation, a versioned recovery eligibility contract, automatic recovery of
+exact mechanically proven-dead worker attempts and authenticated preserved PRs,
+and recovery-specific crash/replay proofs.
 
 Orka's controller has durable checkpoints and mechanical gates, but a
 model-driven captain still performs the outer `plan -> launch -> wait -> finish
@@ -116,8 +117,8 @@ concerns.
    1.8.8 and 1.8.9.**
 5. Automate evidence-backed worker and preserved-PR recovery. **The eligibility
    contract is complete in 1.8.10, proven-dead worker recovery is automatic in
-   1.8.11, and authenticated preserved-PR reconciliation is automatic in
-   1.8.12. Crash-boundary and idempotency proof remains the final slice.**
+   1.8.11, authenticated preserved-PR reconciliation is automatic in 1.8.12,
+   and the recovery crash-boundary/idempotency matrix is complete in 1.8.13.**
 6. Add soft/hard breakers and ticket parking.
 7. Introduce a transactional event store with checkpoint import/export.
 8. Add supervisor lease takeover and crash recovery.

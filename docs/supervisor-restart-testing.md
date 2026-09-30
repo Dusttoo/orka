@@ -1,6 +1,6 @@
 # Supervisor restart and failure injection
 
-Orka 1.8.7 can resume the host-owned sprint supervisor after an unclean process
+Orka 1.8.13 can resume the host-owned sprint supervisor after an unclean process
 exit without reconstructing work from an AI transcript. Takeover is automatic
 only when the repository lease is free, the exact predecessor process is
 absent, the durable state receipt matches, and the config, runtime, contract,
@@ -70,3 +70,29 @@ The tests cover detached-session survival, clean and unclean restart, every
 nonterminal supervisor and job state, duplicate operator and terminal delivery,
 worker death, mixed outcomes, pause/drain restoration, stale evidence, state
 tampering, lease loss, and exact ticket-local continuation.
+
+## Recovery crash-boundary matrix
+
+The machine-readable
+[`orka.recovery-crash-boundaries/v1`](../contracts/recovery-crash-boundaries-v1.json)
+contract declares the durable state and next action for these exact boundaries:
+
+| Boundary | Durable recovery rule |
+| --- | --- |
+| eligibility observation | no mutation; re-observe |
+| recovery fencing | reuse the content-derived active fence |
+| controller mutation | load either the old or atomically replaced checkpoint |
+| worker reservation | retain either pending or one running attempt |
+| worker launch | reconcile an exact execution unit; never blind-relaunch |
+| worker attach | reuse only an unconsumed capability or monitor the bound unit |
+| provider acknowledgement | reconcile the exact reservation; never resubmit ambiguity |
+| PR observation | re-observe the exact PR head before mutation |
+| terminal application | replay the terminal receipt; duplicate delivery is a no-op |
+
+Run `python3 tests/recovery_crash_boundary_test.py` for the consolidated local
+fault matrix. It injects checkpoint failure before recovery commit, replays a
+preserved-PR fence, replays worker reservation and attach, verifies monotonic
+attempt/history state, and proves an ineligible recovery cannot stop an
+independent queue. Existing API-agent and supervisor-dispatch suites cover
+ambiguous provider acknowledgement and duplicate terminal delivery. No case
+uses live Jira, GitHub, model-provider, or email credentials.
