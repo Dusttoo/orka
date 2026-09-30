@@ -1,7 +1,7 @@
 # Orka 2: durable supervisor runtime
 
 Status: accepted architectural direction; implementation in independently
-releasable slices. Orka 1.8.13 provides the detached supervisor, repository
+releasable slices. Orka 1.8.14 provides the detached supervisor, repository
 lease lifecycle, deterministic synchronization/planning loop, controller-owned
 desktop/API worker dispatch, versioned terminal-result transitions, ticket-local
 parking, durable retry wakeups, classified operator-decision resolution, and
@@ -120,6 +120,9 @@ concerns.
    1.8.11, authenticated preserved-PR reconciliation is automatic in 1.8.12,
    and the recovery crash-boundary/idempotency matrix is complete in 1.8.13.**
 6. Add soft/hard breakers and ticket parking.
+   **The canonical breaker taxonomy and legacy-state mapping are complete in
+   1.8.14. Ticket/route runtime enforcement, sprint pressure/global breakers,
+   and migration/status integration remain separate slices.**
 7. Introduce a transactional event store with checkpoint import/export.
 8. Add supervisor lease takeover and crash recovery.
 9. Expose stable status, pause, resume, and decision CLI commands.

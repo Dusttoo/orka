@@ -452,6 +452,13 @@ reservation. Compact transition traces identify the last committed recovery
 boundary while atomic checkpoints keep each replay on either the old or new
 side of a state transition.
 
+Operational stops are classified by
+[`orka.breaker-classification/v1`](contracts/breaker-classification-v1.json).
+The contract inventories every current budget, run-count, review, timeout,
+provider-health, capacity, and integrity stop by scope and strength. Its
+validator rejects missing or duplicate mappings, ticket/route breakers that
+claim global authority, and any attempt to soften protected safety controls.
+
 Please report security-sensitive findings privately according to
 [SECURITY.md](SECURITY.md) and follow the [Code of Conduct](CODE_OF_CONDUCT.md).
 
