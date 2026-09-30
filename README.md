@@ -437,6 +437,13 @@ verifying the recovery mutation preserved attempt, spend, progress, branch,
 worktree, PR, and review history. Eligibility never grants budget, review,
 repair, or merge authority.
 
+The same contract now drives preserved-PR recovery. A clean, quiescent
+worktree whose branch, PR, head, tree, execution receipt, provider settlement,
+and review-history digests agree is reconciled by the durable supervisor and
+re-enters the existing continuation pipeline automatically. Dirty or active
+worktrees, moved heads, unknown owners, and unsettled reservations remain
+visible with stable refusal codes and are never relaunched speculatively.
+
 Please report security-sensitive findings privately according to
 [SECURITY.md](SECURITY.md) and follow the [Code of Conduct](CODE_OF_CONDUCT.md).
 

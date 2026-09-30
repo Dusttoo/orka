@@ -45,6 +45,9 @@ class ResilienceTests(unittest.TestCase):
             ready={"ready"},
             blocked={"blocked"},
         )
+        config = root / "config.yaml"
+        config.write_text("worktree_base: .worktrees\n", encoding="utf-8")
+        self.cfg["config"] = config
         self.state = dict(
             schema_version=2, sprint={"id": "1"}, dependency_status={}, tickets={}
         )
@@ -67,7 +70,9 @@ class ResilienceTests(unittest.TestCase):
         self.state["tickets"][key] = value
         return value
 
-    def stopped_execution(self, ticket, invocation="launch", containment="test-supervisor"):
+    def stopped_execution(
+        self, ticket, invocation="launch", containment="test-supervisor"
+    ):
         receipt = self.cfg["shared_root"] / f"{invocation}.terminal.json"
         receipt.write_text(
             json.dumps(
@@ -363,14 +368,37 @@ class ResilienceTests(unittest.TestCase):
 
     def test_preserved_pr_reconciliation_remains_autonomous_when_opted_in(self):
         self.cfg["preserved_pr_auto_recovery"] = True
-        self.ticket(
+        ticket = self.ticket(
             "PROJ-1",
             "recoverable",
             attempts=2,
-            worker_identity={"kind": "execution_unit", "pid": "123"},
+            pr="https://example/pr/123",
             verified_commits={"a" * 40: "b" * 40},
         )
-        with patch.object(controller, "execution_unit_status", return_value="absent"):
+        self.stopped_execution(ticket)
+        receipt = {
+            "receipt": {
+                "branch": "feature",
+                "url": "https://example/pr/123",
+                "head": "a" * 40,
+                "tree": "b" * 40,
+            }
+        }
+        with (
+            patch("github_progress.observe", return_value=receipt),
+            patch.object(
+                controller,
+                "branch_worktree",
+                return_value=self.cfg["shared_root"] / ".worktrees/PROJ-1",
+            ),
+            patch.object(controller, "worktree_recovery_status", return_value="clean"),
+            patch.object(
+                controller,
+                "worktree_revision",
+                return_value={"head": "a" * 40, "tree": "b" * 40},
+            ),
+            patch.object(controller, "execution_unit_status", return_value="absent"),
+        ):
             plan = controller.plan_value(self.state, self.cfg)
         self.assertEqual(plan["pr_reconciliation"], ["PROJ-1"])
         self.assertEqual(plan["decision_queue"], [])
@@ -389,20 +417,125 @@ class ResilienceTests(unittest.TestCase):
         self.assertEqual(plan["pr_reconciliation"], [])
         self.assertEqual(plan["pr_reconciliation_requires_authority"], ["PROJ-1"])
         self.assertEqual(plan["decision_queue"][0]["key"], "PROJ-1")
+        self.assertIn(
+            "execution_unknown",
+            plan["pr_reconciliation_evaluations"]["PROJ-1"]["reason_codes"],
+        )
         self.assertFalse(plan["autonomous_work_remaining"])
+
+    def test_preserved_pr_plan_reports_stable_dirty_active_and_provider_reasons(self):
+        self.cfg["preserved_pr_auto_recovery"] = True
+        ticket = self.ticket(
+            "PROJ-1",
+            "recoverable",
+            attempts=2,
+            pr="https://example/pr/123",
+            verified_commits={"a" * 40: "b" * 40},
+        )
+        self.stopped_execution(ticket)
+        receipt = {
+            "receipt": {
+                "branch": "feature",
+                "url": "https://example/pr/123",
+                "head": "a" * 40,
+                "tree": "b" * 40,
+            }
+        }
+        worktree = self.cfg["shared_root"] / ".worktrees/PROJ-1"
+        for worktree_status, expected in (
+            ("dirty", "worktree_dirty"),
+            ("active", "worktree_active"),
+        ):
+            with (
+                self.subTest(worktree_status=worktree_status),
+                patch("github_progress.observe", return_value=receipt),
+                patch.object(controller, "branch_worktree", return_value=worktree),
+                patch.object(
+                    controller,
+                    "worktree_recovery_status",
+                    return_value=worktree_status,
+                ),
+                patch.object(
+                    controller, "execution_unit_status", return_value="absent"
+                ),
+            ):
+                plan = controller.plan_value(self.state, self.cfg)
+                self.assertIn(
+                    expected,
+                    plan["pr_reconciliation_evaluations"]["PROJ-1"]["reason_codes"],
+                )
+
+        with (
+            patch("github_progress.observe", return_value=receipt),
+            patch.object(controller, "branch_worktree", return_value=worktree),
+            patch.object(controller, "worktree_recovery_status", return_value="clean"),
+            patch.object(
+                controller,
+                "worktree_revision",
+                return_value={"head": "a" * 40, "tree": "b" * 40},
+            ),
+            patch.object(controller, "execution_unit_status", return_value="absent"),
+            patch.object(
+                controller,
+                "usage_snapshots",
+                return_value={
+                    "PROJ-1": {"spent_usd": 1, "reserved_usd": 2, "state": "ok"}
+                },
+            ),
+        ):
+            plan = controller.plan_value(self.state, self.cfg)
+        self.assertIn(
+            "provider_pending",
+            plan["pr_reconciliation_evaluations"]["PROJ-1"]["reason_codes"],
+        )
+        self.assertEqual(plan["pr_reconciliation_waiting"], ["PROJ-1"])
+
+    def test_preserved_pr_live_owner_stays_waiting(self):
+        self.cfg["preserved_pr_auto_recovery"] = True
+        ticket = self.ticket(
+            "PROJ-1",
+            "recoverable",
+            attempts=2,
+            pr="https://example/pr/123",
+            verified_commits={"a" * 40: "b" * 40},
+        )
+        self.stopped_execution(ticket)
+        receipt = {
+            "receipt": {
+                "branch": "feature",
+                "url": "https://example/pr/123",
+                "head": "a" * 40,
+                "tree": "b" * 40,
+            }
+        }
+        with (
+            patch("github_progress.observe", return_value=receipt),
+            patch.object(
+                controller,
+                "branch_worktree",
+                return_value=self.cfg["shared_root"] / ".worktrees/PROJ-1",
+            ),
+            patch.object(controller, "worktree_recovery_status", return_value="active"),
+            patch.object(controller, "execution_unit_status", return_value="live"),
+        ):
+            plan = controller.plan_value(self.state, self.cfg)
+        evaluation = plan["pr_reconciliation_evaluations"]["PROJ-1"]
+        self.assertIn("execution_live", evaluation["reason_codes"])
+        self.assertEqual(plan["pr_reconciliation_waiting"], ["PROJ-1"])
 
     def test_reconcile_preserved_pr_creates_bounded_repair_continuation(self):
         self.cfg.update(preserved_pr_auto_recovery=True)
         config = self.cfg["shared_root"] / "config.yaml"
         config.write_text("worktree_base: .worktrees\n")
         self.cfg["config"] = config
-        self.ticket(
+        ticket = self.ticket(
             "PROJ-1",
             "recoverable",
             attempts=2,
-            worker_identity={"kind": "execution_unit", "pid": "123"},
+            pr="https://example/pr/123",
             verified_commits={"a" * 40: "b" * 40},
         )
+        self.stopped_execution(ticket)
         path = controller.state_path(self.cfg["state_dir"], "1")
         controller.save(path, self.state)
         receipt = {
@@ -417,7 +550,7 @@ class ResilienceTests(unittest.TestCase):
         with (
             patch("github_progress.observe", return_value=receipt),
             patch.object(controller, "branch_worktree", return_value=worktree),
-            patch.object(controller, "worktree_is_quiescent", return_value=True),
+            patch.object(controller, "worktree_recovery_status", return_value="clean"),
             patch.object(
                 controller,
                 "worktree_revision",
@@ -432,7 +565,16 @@ class ResilienceTests(unittest.TestCase):
         ticket = controller.load(path)["tickets"]["PROJ-1"]
         self.assertEqual(ticket["state"], "pending")
         self.assertTrue(ticket["next_launch_continuation"])
+        self.assertEqual(ticket["attempts"], 2)
+        self.assertEqual(ticket["branch"], "feature")
+        self.assertEqual(ticket["pr"], "https://example/pr/123")
         self.assertEqual(ticket["recovery_binding"]["head"], "a" * 40)
+        self.assertEqual(
+            ticket["recovery_binding"]["absence_proof"],
+            "recovery-eligibility-contract",
+        )
+        self.assertTrue(ticket["recovery_binding"]["eligibility_evidence_digest"])
+        self.assertTrue(ticket["recovery_binding"]["preservation_digest"])
         self.assertEqual(
             controller.plan_value(controller.load(path), self.cfg)["launch"], ["PROJ-1"]
         )
@@ -442,13 +584,14 @@ class ResilienceTests(unittest.TestCase):
         config = self.cfg["shared_root"] / "config.yaml"
         config.write_text("worktree_base: .worktrees\n")
         self.cfg["config"] = config
-        self.ticket(
+        ticket = self.ticket(
             "PROJ-1",
             "recoverable",
             attempts=2,
-            worker_identity={"kind": "execution_unit", "pid": "123"},
+            pr="https://example/pr/123",
             verified_commits={"a" * 40: "b" * 40},
         )
+        self.stopped_execution(ticket)
         path = controller.state_path(self.cfg["state_dir"], "1")
         controller.save(path, self.state)
         receipt = {
@@ -463,13 +606,13 @@ class ResilienceTests(unittest.TestCase):
         with (
             patch("github_progress.observe", return_value=receipt),
             patch.object(controller, "branch_worktree", return_value=worktree),
-            patch.object(controller, "worktree_is_quiescent", return_value=True),
+            patch.object(controller, "worktree_recovery_status", return_value="clean"),
             patch.object(
                 controller,
                 "worktree_revision",
                 return_value={"head": "c" * 40, "tree": "d" * 40},
             ),
-            self.assertRaisesRegex(controller.SprintError, "differs"),
+            self.assertRaisesRegex(controller.SprintError, "revision_mismatch"),
         ):
             controller.reconcile_preserved_pr(
                 argparse.Namespace(sprint="1", ticket="PROJ-1"), self.cfg
@@ -483,13 +626,14 @@ class ResilienceTests(unittest.TestCase):
         config = self.cfg["shared_root"] / "config.yaml"
         config.write_text("worktree_base: .worktrees\n")
         self.cfg["config"] = config
-        self.ticket(
+        ticket = self.ticket(
             "PROJ-1",
             "recoverable",
             attempts=2,
-            worker_identity={"kind": "execution_unit", "pid": "123"},
+            pr="https://example/pr/123",
             verified_commits={"a" * 40: "b" * 40},
         )
+        self.stopped_execution(ticket)
         path = controller.state_path(self.cfg["state_dir"], "1")
         controller.save(path, self.state)
         receipt = {
@@ -504,7 +648,7 @@ class ResilienceTests(unittest.TestCase):
         with (
             patch("github_progress.observe", return_value=receipt),
             patch.object(controller, "branch_worktree", return_value=worktree),
-            patch.object(controller, "worktree_is_quiescent", return_value=True),
+            patch.object(controller, "worktree_recovery_status", return_value="clean"),
             patch.object(
                 controller,
                 "worktree_revision",
@@ -516,9 +660,7 @@ class ResilienceTests(unittest.TestCase):
                 side_effect=RuntimeError("open usage reservation"),
             ),
             patch.object(controller, "execution_unit_status", return_value="absent"),
-            self.assertRaisesRegex(
-                controller.SprintError, "open usage reservation"
-            ),
+            self.assertRaisesRegex(controller.SprintError, "open usage reservation"),
         ):
             controller.reconcile_preserved_pr(
                 argparse.Namespace(sprint="1", ticket="PROJ-1"), self.cfg
@@ -532,72 +674,132 @@ class ResilienceTests(unittest.TestCase):
         config = self.cfg["shared_root"] / "config.yaml"
         config.write_text("worktree_base: .worktrees\n")
         self.cfg["config"] = config
-        self.ticket(
+        ticket = self.ticket(
             "PROJ-1",
             "recoverable",
             attempts=2,
-            worker_identity={"kind": "execution_unit", "pid": "123"},
+            pr="https://example/pr/123",
             verified_commits={"a" * 40: "b" * 40},
         )
+        self.stopped_execution(ticket)
         path = controller.state_path(self.cfg["state_dir"], "1")
         controller.save(path, self.state)
-        first = {"receipt": {"branch": "feature", "url": "https://example/pr/123", "head": "a" * 40, "tree": "b" * 40}}
+        first = {
+            "receipt": {
+                "branch": "feature",
+                "url": "https://example/pr/123",
+                "head": "a" * 40,
+                "tree": "b" * 40,
+            }
+        }
         moved = {"receipt": {**first["receipt"], "head": "c" * 40, "tree": "d" * 40}}
         worktree = self.cfg["shared_root"] / ".worktrees/PROJ-1"
         with (
             patch("github_progress.observe", side_effect=[first, moved]),
             patch.object(controller, "branch_worktree", return_value=worktree),
-            patch.object(controller, "worktree_is_quiescent", return_value=True),
-            patch.object(controller, "worktree_revision", return_value={"head": "a" * 40, "tree": "b" * 40}),
+            patch.object(controller, "worktree_recovery_status", return_value="clean"),
+            patch.object(
+                controller,
+                "worktree_revision",
+                return_value={"head": "a" * 40, "tree": "b" * 40},
+            ),
             patch.object(controller, "execution_unit_status", return_value="absent"),
-            self.assertRaisesRegex(controller.SprintError, "changed during authentication"),
+            self.assertRaisesRegex(
+                controller.SprintError, "changed during authentication"
+            ),
         ):
-            controller.reconcile_preserved_pr(argparse.Namespace(sprint="1", ticket="PROJ-1"), self.cfg)
-        self.assertEqual(controller.load(path)["tickets"]["PROJ-1"]["state"], "recoverable")
+            controller.reconcile_preserved_pr(
+                argparse.Namespace(sprint="1", ticket="PROJ-1"), self.cfg
+            )
+        self.assertEqual(
+            controller.load(path)["tickets"]["PROJ-1"]["state"], "recoverable"
+        )
 
     def test_reconcile_preserved_pr_requires_execution_unit_proven_absent(self):
         self.cfg.update(preserved_pr_auto_recovery=True)
         config = self.cfg["shared_root"] / "config.yaml"
         config.write_text("worktree_base: .worktrees\n")
         self.cfg["config"] = config
-        self.ticket(
-            "PROJ-1", "recoverable", attempts=2,
-            worker_identity={"kind": "execution_unit", "pid": "123"},
+        ticket = self.ticket(
+            "PROJ-1",
+            "recoverable",
+            attempts=2,
+            pr="https://example/pr/123",
             verified_commits={"a" * 40: "b" * 40},
         )
+        self.stopped_execution(ticket)
         path = controller.state_path(self.cfg["state_dir"], "1")
         controller.save(path, self.state)
-        receipt = {"receipt": {"branch": "feature", "url": "https://example/pr/123", "head": "a" * 40, "tree": "b" * 40}}
+        receipt = {
+            "receipt": {
+                "branch": "feature",
+                "url": "https://example/pr/123",
+                "head": "a" * 40,
+                "tree": "b" * 40,
+            }
+        }
         with (
             patch("github_progress.observe", return_value=receipt),
-            patch.object(controller, "branch_worktree", return_value=self.cfg["shared_root"] / ".worktrees/PROJ-1"),
-            patch.object(controller, "worktree_is_quiescent", return_value=True),
-            patch.object(controller, "worktree_revision", return_value={"head": "a" * 40, "tree": "b" * 40}),
+            patch.object(
+                controller,
+                "branch_worktree",
+                return_value=self.cfg["shared_root"] / ".worktrees/PROJ-1",
+            ),
+            patch.object(controller, "worktree_recovery_status", return_value="clean"),
+            patch.object(
+                controller,
+                "worktree_revision",
+                return_value={"head": "a" * 40, "tree": "b" * 40},
+            ),
             patch.object(controller, "execution_unit_status", return_value="unknown"),
-            self.assertRaisesRegex(controller.SprintError, "not proven absent"),
+            self.assertRaisesRegex(controller.SprintError, "execution_unknown"),
         ):
-            controller.reconcile_preserved_pr(argparse.Namespace(sprint="1", ticket="PROJ-1"), self.cfg)
+            controller.reconcile_preserved_pr(
+                argparse.Namespace(sprint="1", ticket="PROJ-1"), self.cfg
+            )
 
-    def test_reconcile_preserved_pr_rejects_missing_identity_without_operator_attestation(self):
+    def test_reconcile_preserved_pr_rejects_missing_identity_without_operator_attestation(
+        self,
+    ):
         self.cfg.update(preserved_pr_auto_recovery=True)
         config = self.cfg["shared_root"] / "config.yaml"
         config.write_text("worktree_base: .worktrees\n")
         self.cfg["config"] = config
         self.ticket(
-            "PROJ-1", "recoverable", attempts=2, worker_identity="",
+            "PROJ-1",
+            "recoverable",
+            attempts=2,
+            worker_identity="",
             verified_commits={"a" * 40: "b" * 40},
         )
         path = controller.state_path(self.cfg["state_dir"], "1")
         controller.save(path, self.state)
-        receipt = {"receipt": {"branch": "feature", "url": "https://example/pr/123", "head": "a" * 40, "tree": "b" * 40}}
+        receipt = {
+            "receipt": {
+                "branch": "feature",
+                "url": "https://example/pr/123",
+                "head": "a" * 40,
+                "tree": "b" * 40,
+            }
+        }
         with (
             patch("github_progress.observe", return_value=receipt),
-            patch.object(controller, "branch_worktree", return_value=self.cfg["shared_root"] / ".worktrees/PROJ-1"),
-            patch.object(controller, "worktree_is_quiescent", return_value=True),
-            patch.object(controller, "worktree_revision", return_value={"head": "a" * 40, "tree": "b" * 40}),
-            self.assertRaisesRegex(controller.SprintError, "one-shot recovery capability"),
+            patch.object(
+                controller,
+                "branch_worktree",
+                return_value=self.cfg["shared_root"] / ".worktrees/PROJ-1",
+            ),
+            patch.object(controller, "worktree_recovery_status", return_value="clean"),
+            patch.object(
+                controller,
+                "worktree_revision",
+                return_value={"head": "a" * 40, "tree": "b" * 40},
+            ),
+            self.assertRaisesRegex(controller.SprintError, "execution_unknown"),
         ):
-            controller.reconcile_preserved_pr(argparse.Namespace(sprint="1", ticket="PROJ-1"), self.cfg)
+            controller.reconcile_preserved_pr(
+                argparse.Namespace(sprint="1", ticket="PROJ-1"), self.cfg
+            )
 
     def test_legacy_progress_binding_is_not_treated_as_preserved_pr_receipt(self):
         ticket = self.ticket(
@@ -639,8 +841,12 @@ class ResilienceTests(unittest.TestCase):
         ledger = controller.UsageLedger(self.cfg["shared_root"])
         ledger.fence_recovery("PROJ-1", "recovery-test")
         args = argparse.Namespace(
-            sprint="1", ticket="PROJ-1", run_ref="recovery-run", run_id="",
-            role="sprint-worker", worker_ref="",
+            sprint="1",
+            ticket="PROJ-1",
+            run_ref="recovery-run",
+            run_id="",
+            role="sprint-worker",
+            worker_ref="",
         )
         with (
             patch.object(controller, "verify_recovery_binding"),
@@ -661,18 +867,39 @@ class ResilienceTests(unittest.TestCase):
         (worktree / "file.txt").write_text("verified\n")
         subprocess.run(["git", "add", "file.txt"], cwd=worktree, check=True)
         subprocess.run(
-            ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "test"],
+            [
+                "git",
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-qm",
+                "test",
+            ],
             cwd=worktree,
             check=True,
         )
         revision = controller.worktree_revision(worktree)
         self.assertEqual(
             revision["head"],
-            subprocess.run(["git", "rev-parse", "HEAD"], cwd=worktree, check=True, capture_output=True, text=True).stdout.strip(),
+            subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=worktree,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip(),
         )
         self.assertEqual(
             revision["tree"],
-            subprocess.run(["git", "rev-parse", "HEAD^{tree}"], cwd=worktree, check=True, capture_output=True, text=True).stdout.strip(),
+            subprocess.run(
+                ["git", "rev-parse", "HEAD^{tree}"],
+                cwd=worktree,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip(),
         )
 
     def test_signal_process_group_suppresses_permission_only_after_exit(self):
@@ -1101,10 +1328,7 @@ class ResilienceTests(unittest.TestCase):
         )
         self.assertEqual(
             controller.OPERATOR_DECISION_CLASSES,
-            {
-                item["class"]
-                for item in contract["operator_only_decisions"]
-            },
+            {item["class"] for item in contract["operator_only_decisions"]},
         )
 
     def test_external_hold_wakes_only_from_authenticated_dependency_change(self):
@@ -1132,9 +1356,7 @@ class ResilienceTests(unittest.TestCase):
             )
         self.assertEqual(ticket["state"], "pending")
         self.assertEqual(ticket["worker_identity"], "")
-        self.assertEqual(
-            ticket["history"][-1]["event"], "external-dependency-resolved"
-        )
+        self.assertEqual(ticket["history"][-1]["event"], "external-dependency-resolved")
 
     def test_external_hold_stays_parked_when_worker_proof_is_unreadable(self):
         ticket = self.ticket(
@@ -1181,14 +1403,10 @@ class ResilienceTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             controller.finish(external, self.cfg)
         stored = controller.load(path)["tickets"]["PROJ-1"]
-        self.assertEqual(
-            stored["terminal_classification"]["dependencies"], ["EXT-9"]
-        )
+        self.assertEqual(stored["terminal_classification"]["dependencies"], ["EXT-9"])
 
         self.state = controller.load(path)
-        self.state["tickets"]["PROJ-1"].update(
-            state="running", attempt_token="token-2"
-        )
+        self.state["tickets"]["PROJ-1"].update(state="running", attempt_token="token-2")
         controller.save(path, self.state)
         decision = argparse.Namespace(
             sprint="1",
@@ -1302,7 +1520,9 @@ class ResilienceTests(unittest.TestCase):
         original = copy.deepcopy(ticket)
         with patch.object(controller, "execution_unit_status", return_value="absent"):
             first = controller.automatic_recovery_evaluation(ticket, self.cfg, spend={})
-            second = controller.automatic_recovery_evaluation(ticket, self.cfg, spend={})
+            second = controller.automatic_recovery_evaluation(
+                ticket, self.cfg, spend={}
+            )
         self.assertTrue(first["eligible"])
         self.assertEqual(first, second)
         self.assertEqual(ticket, original)
@@ -1349,7 +1569,9 @@ class ResilienceTests(unittest.TestCase):
             self.assertRaisesRegex(controller.SprintError, "unsettled provider"),
         ):
             controller.requeue(args, self.cfg)
-        self.assertEqual(controller.load(path)["tickets"]["PROJ-1"]["state"], "recoverable")
+        self.assertEqual(
+            controller.load(path)["tickets"]["PROJ-1"]["state"], "recoverable"
+        )
 
     def test_reserve_also_counts_live_recovery_units(self):
         self.ticket(
@@ -1542,9 +1764,7 @@ class ResilienceTests(unittest.TestCase):
         self.sync_fixture(fresh)
         stored = self.state["tickets"]["PROJ-1"]
         self.assertEqual(stored["state"], "needs_decomposition")
-        self.assertEqual(
-            stored["history"][-1]["event"], "decomposition-policy-enabled"
-        )
+        self.assertEqual(stored["history"][-1]["event"], "decomposition-policy-enabled")
 
     def test_terminal_recovery_preserves_pr_and_restart_mints_token_on_reserve(self):
         self.ticket(
@@ -1598,7 +1818,9 @@ class ResilienceTests(unittest.TestCase):
         self.assertEqual(restarted["attempt_token"], "")
         self.assertEqual(restarted["attempts"], 1)
         self.assertEqual(restarted["pr"], "https://example.test/pull/40")
-        self.assertIn("PROJ-1", controller.plan_value(controller.load(path), self.cfg)["launch"])
+        self.assertIn(
+            "PROJ-1", controller.plan_value(controller.load(path), self.cfg)["launch"]
+        )
 
         reserve_args = argparse.Namespace(
             sprint="1",
@@ -1650,7 +1872,9 @@ class ResilienceTests(unittest.TestCase):
             contextlib.redirect_stdout(io.StringIO()),
         ):
             controller.recover_terminal(recovery_args, self.cfg)
-        consume.assert_called_once_with(self.cfg["shared_root"], "PROJ-1", 1, "recovery")
+        consume.assert_called_once_with(
+            self.cfg["shared_root"], "PROJ-1", 1, "recovery"
+        )
         recovered = controller.load(path)["tickets"]["PROJ-1"]
         self.assertEqual(recovered["state"], "pending")
         self.assertEqual(recovered["branch"], "feat/proj-1")
@@ -2022,7 +2246,9 @@ class HostBudgetPolicySettingsTests(unittest.TestCase):
             "ORCHESTRATION_TEST_MODE": "1",
             "ORCHESTRATION_TEST_AUTHORITY_HELPER": str(helper),
             "ORCHESTRATION_AUTHORITY_TEST_MODE": "1",
-            "ORCHESTRATION_AUTHORITY_STATE_DIR": str(Path(self.temp.name) / "authority"),
+            "ORCHESTRATION_AUTHORITY_STATE_DIR": str(
+                Path(self.temp.name) / "authority"
+            ),
         }
         patcher = patch.dict("os.environ", env)
         patcher.start()
@@ -2047,14 +2273,30 @@ class HostBudgetPolicySettingsTests(unittest.TestCase):
 
     def test_host_policy_raises_configured_breakers_to_its_caps(self):
         policy = Path(self.temp.name) / "policy.json"
-        policy.write_text(json.dumps({
-            "pause_usd_per_ticket": "300", "max_model_runs_per_ticket": 30,
-            "max_reviewer_runs_per_ticket": 25, "max_usd_without_progress": "50",
-        }))
+        policy.write_text(
+            json.dumps(
+                {
+                    "pause_usd_per_ticket": "300",
+                    "max_model_runs_per_ticket": 30,
+                    "max_reviewer_runs_per_ticket": 25,
+                    "max_usd_without_progress": "50",
+                }
+            )
+        )
         subprocess.run(
-            [str(self.helper), "set-budget-policy", "--repository", str(self.repo),
-             "--policy", str(policy), "--reason", "large sprints"],
-            check=True, capture_output=True, text=True,
+            [
+                str(self.helper),
+                "set-budget-policy",
+                "--repository",
+                str(self.repo),
+                "--policy",
+                str(policy),
+                "--reason",
+                "large sprints",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
         )
         self.api_agent.clear_host_budget_policy_cache()
         cfg = self.settings()
