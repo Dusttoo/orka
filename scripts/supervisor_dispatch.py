@@ -33,6 +33,16 @@ from supervisor_contract import (
     validate as validate_contract,
 )
 from supervisor_planning import canonical_digest, parse_json_output
+from supervisor_admission import (
+    AdmissionError,
+    CLAIM_SCHEMA,
+    automatic_claims,
+    claim_set_digest,
+    conflicts,
+    migrate_legacy_active_jobs,
+    normalize_claims,
+    release_claims,
+)
 
 
 class DispatchError(RuntimeError):
@@ -599,6 +609,7 @@ class SupervisorDispatcher:
             raise DispatchError("retry delay must be from 5 through 3600 seconds")
         self.retry_delay_seconds = float(retry_delay_seconds)
         self.last_errors: list[dict[str, str]] = []
+        self.last_skips: list[dict[str, Any]] = []
         try:
             self.contract = load_contract(contract_path)
             validate_contract(self.contract, CONTROLLER)
@@ -680,9 +691,58 @@ class SupervisorDispatcher:
             "request": root.with_suffix(".request.json"),
         }
 
-    def launch(self, sprint: str, ticket: str) -> dict[str, Any]:
+    def _route_identity(self) -> str:
+        config = getattr(self.adapter, "config", None)
+        if not isinstance(config, Path) or not config.is_file():
+            return "desktop-default"
+        try:
+            route = llm_route_from_config(config, "sprint-worker")
+        except Exception as exc:
+            raise DispatchError(f"cannot resolve sprint-worker resource route: {exc}") from exc
+        identity = {
+            key: route.get(key)
+            for key in ("execution", "provider", "model", "desktop_client")
+            if route.get(key)
+        }
+        return canonical_digest(identity)[:32]
+
+    def resource_claims(
+        self,
+        ticket: str,
+        *,
+        capacity: int,
+        heavy_capacity: int,
+        additional: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        try:
+            return automatic_claims(
+                self.repository,
+                ticket,
+                concurrency=capacity,
+                heavy_capacity=heavy_capacity,
+                route_identity=self._route_identity(),
+                additional=additional,
+            )
+        except AdmissionError as exc:
+            raise DispatchError(str(exc)) from exc
+
+    def launch(
+        self,
+        sprint: str,
+        ticket: str,
+        resource_claims: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         if not KEY.fullmatch(ticket):
             raise DispatchError("controller plan returned an invalid ticket key")
+        if resource_claims is None:
+            resource_claims = self.resource_claims(
+                ticket, capacity=1, heavy_capacity=1
+            )
+        try:
+            resource_claims = normalize_claims(resource_claims)
+            resource_claim_digest = claim_set_digest(resource_claims)
+        except AdmissionError as exc:
+            raise DispatchError(str(exc)) from exc
         run_ref = f"supervisor-{ticket}-{uuid.uuid4().hex}"
         reservation = self.adapter.reserve(sprint, ticket, run_ref)
         attempt_token = str(reservation.get("attempt_token") or "")
@@ -703,6 +763,16 @@ class SupervisorDispatcher:
             "state": "reserved",
             "launched_at": time.time(),
             "terminal": {},
+            "resource_claims": resource_claims,
+            "resource_claim_schema": CLAIM_SCHEMA,
+            "resource_claim_digest": resource_claim_digest,
+            "resource_release": {},
+            "history": [
+                {
+                    "event": "resource_claims_acquired",
+                    "claim_digest": resource_claim_digest,
+                }
+            ],
         }
         try:
             launch = self.adapter.launch(
@@ -809,6 +879,12 @@ class SupervisorDispatcher:
             terminal["timer_id"] = f"retry:{job['run_ref']}"
         job["terminal"] = terminal
         job["state"] = target
+        try:
+            terminal["resource_release"] = release_claims(
+                job, observed_at=terminal["applied_at"]
+            )
+        except AdmissionError as exc:
+            raise DispatchError(str(exc)) from exc
         return {"applied": True, "duplicate": False, "terminal": terminal}
 
     def wake_due_retries(
@@ -958,12 +1034,40 @@ class SupervisorDispatcher:
         }
         job["terminal"] = applied
         job["state"] = target
+        try:
+            applied["resource_release"] = release_claims(
+                job, observed_at=applied["applied_at"]
+            )
+        except AdmissionError as exc:
+            raise DispatchError(str(exc)) from exc
         return {"applied": True, "duplicate": False, "terminal": applied}
 
     def fill(
-        self, sprint: str, tickets: list[str], jobs: dict[str, Any], capacity: int
+        self,
+        sprint: str,
+        tickets: list[str],
+        jobs: dict[str, Any],
+        capacity: int,
+        *,
+        heavy_capacity: int | None = None,
+        claims_by_ticket: dict[str, list[dict[str, Any]]] | None = None,
     ) -> list[dict[str, Any]]:
         self.last_errors = []
+        self.last_skips = []
+        heavy_capacity = capacity if heavy_capacity is None else heavy_capacity
+        claims_by_ticket = claims_by_ticket or {}
+        try:
+            migrate_legacy_active_jobs(
+                jobs,
+                lambda ticket: self.resource_claims(
+                    ticket,
+                    capacity=capacity,
+                    heavy_capacity=heavy_capacity,
+                    additional=claims_by_ticket.get(ticket),
+                ),
+            )
+        except (AdmissionError, DispatchError) as exc:
+            raise DispatchError(f"durable resource state is invalid: {exc}") from exc
         active = sum(
             1
             for job in jobs.values()
@@ -980,8 +1084,24 @@ class SupervisorDispatcher:
             ):
                 continue
             try:
-                job = self.launch(sprint, ticket)
-            except DispatchError as exc:
+                claims = self.resource_claims(
+                    ticket,
+                    capacity=capacity,
+                    heavy_capacity=heavy_capacity,
+                    additional=claims_by_ticket.get(ticket),
+                )
+                blocked = conflicts(claims, jobs)
+                if blocked:
+                    self.last_skips.append(
+                        {
+                            "ticket": ticket,
+                            "claim_digest": claim_set_digest(claims),
+                            "conflicts": blocked,
+                        }
+                    )
+                    continue
+                job = self.launch(sprint, ticket, claims)
+            except (AdmissionError, DispatchError) as exc:
                 self.last_errors.append({"ticket": ticket, "error": str(exc)})
                 continue
             jobs[job["run_ref"]] = job

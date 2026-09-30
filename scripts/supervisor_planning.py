@@ -245,6 +245,7 @@ def classify_cycle(
         "sprint_complete": bool(summary.get("sprint_complete")),
         "all_routes_unavailable": all_routes_unavailable,
         "budget": budget,
+        "resource_claims": dict(plan.get("resource_claims") or {}),
         "next_wake_epoch": next_wake,
         "wait_reason": (
             "durable-deadline"

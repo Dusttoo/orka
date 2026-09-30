@@ -2862,6 +2862,70 @@ def health_check(args, cfg):
     emit(probe(cfg["shared_root"], cfg["config"], args.role, args.after_repair))
 
 
+RESOURCE_LABEL_PREFIXES = {
+    kind: f"orka-resource-{kind}-"
+    for kind in ("migration", "provider_route", "visual_qa")
+}
+
+
+def ticket_resource_claims(ticket: dict[str, Any]) -> list[dict[str, Any]]:
+    """Derive only tightening claims from authenticated controller evidence."""
+
+    claims: list[dict[str, Any]] = []
+    for label in ticket.get("labels") or []:
+        normalized = str(label).strip()
+        matched = False
+        for kind, prefix in RESOURCE_LABEL_PREFIXES.items():
+            if not normalized.startswith(prefix):
+                continue
+            matched = True
+            key = normalized[len(prefix) :]
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,191}", key):
+                raise SprintError(
+                    f"ticket {ticket['key']} has an invalid {kind} resource label"
+                )
+            claims.append(
+                {
+                    "kind": kind,
+                    "key": key,
+                    "units": 1,
+                    "capacity": 1,
+                    "source": "jira-label",
+                }
+            )
+        if normalized.startswith("orka-resource-") and not matched:
+            raise SprintError(
+                f"ticket {ticket['key']} has an unsupported resource label"
+            )
+    if ticket.get("pr"):
+        claims.append(
+            {
+                "kind": "pr",
+                "key": hashlib.sha256(str(ticket["pr"]).encode()).hexdigest()[:32],
+                "units": 1,
+                "capacity": 1,
+                "source": "controller",
+            }
+        )
+    recovery = ticket.get("recovery_binding") or {}
+    if recovery.get("worktree"):
+        claims.append(
+            {
+                "kind": "worktree",
+                "key": hashlib.sha256(
+                    str(recovery["worktree"]).encode()
+                ).hexdigest()[:32],
+                "units": 1,
+                "capacity": 1,
+                "source": "controller",
+            }
+        )
+    identities = [(item["kind"], item["key"]) for item in claims]
+    if len(identities) != len(set(identities)):
+        raise SprintError(f"ticket {ticket['key']} has duplicate resource claims")
+    return sorted(claims, key=lambda item: (item["kind"], item["key"]))
+
+
 def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
     runtime_hold = runtime_admission(cfg)
     scope_hold = runtime_admission(cfg, "ticket-scoper")
@@ -3101,6 +3165,11 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
     if scope_candidates:
         needed_roles.add("ticket-scoper")
     health_probes = [item for item in health_probes if item["role"] in needed_roles]
+    resource_claims = {
+        ticket["key"]: claims
+        for ticket in ordered
+        if (claims := ticket_resource_claims(ticket))
+    }
     return {
         "sprint": state["sprint"],
         "concurrency_max": cfg["concurrency_max"],
@@ -3150,6 +3219,7 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
         ),
         "over_capacity": max(0, occupied - cfg["concurrency_max"]),
         "spend": spend,
+        "resource_claims": resource_claims,
     }
 
 

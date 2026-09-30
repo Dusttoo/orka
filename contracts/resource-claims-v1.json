@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "contract_id": "orka.resource-claims",
+  "claim_schema": "orka.resource-claims/v1",
+  "resource_kinds": [
+    "heavy_process",
+    "migration",
+    "pr",
+    "provider_route",
+    "repository",
+    "ticket",
+    "visual_qa",
+    "worktree"
+  ],
+  "claim_fields": ["kind", "key", "units", "capacity", "source"],
+  "held_job_states": ["launch_uncertain", "reserved", "running"],
+  "rules": {
+    "exclusive_representation": {"units": 1, "capacity": 1},
+    "capacity_test": "held_units + requested_units <= capacity",
+    "same_cycle_assignments_hold_claims_immediately": true,
+    "skipped_candidates_remain_ordered_and_unconsumed": true,
+    "launch_uncertain_retains_claims": true,
+    "terminal_release_is_idempotent": true,
+    "restart_reconstructs_from_durable_jobs": true,
+    "malformed_or_inconsistent_claims_fail_closed": true
+  },
+  "automatic_claims": [
+    "repository",
+    "ticket",
+    "provider_route",
+    "heavy_process"
+  ],
+  "controller_evidence_claims": [
+    "migration",
+    "pr",
+    "provider_route",
+    "visual_qa",
+    "worktree"
+  ]
+}

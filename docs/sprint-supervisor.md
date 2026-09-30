@@ -1,6 +1,6 @@
 # Host-owned sprint supervisor
 
-Orka 1.8.7 extends the detached Orka 2 supervisor with a deterministic outer
+Orka 1.8.8 extends the detached Orka 2 supervisor with a deterministic outer
 planning loop. The host process owns one repository lease, synchronizes through
 the existing authenticated Jira/GitHub/controller/provider adapters, publishes
 controller-authorized work, fills available lanes through controller-owned
@@ -27,6 +27,8 @@ The state snapshot records:
   wake deadline.
 - exact job-to-attempt and execution-unit bindings, accepted terminal-result
   digests, contract events, and resulting job states.
+- normalized resource claims, claim-set digests, conflict receipts, and
+  exact-once release receipts.
 
 It never writes provider, Jira, GitHub, or application credentials.
 
@@ -113,6 +115,15 @@ deadline arrives, the supervisor requeues only that exact stopped attempt and
 immediately replans. Controller-authorized repair and recovery continuations are
 returned to the launch queue without holding unrelated capacity.
 
+Before reservation, the supervisor evaluates the ordered controller plan
+against resources held by `reserved`, `running`, and `launch_uncertain` jobs.
+Conflicting candidates remain in controller order and consume no reservation or
+attempt. Jobs admitted earlier in the same fill cycle immediately hold their
+claims. `concurrency_max` remains the outer lane ceiling while
+`max_heavy_processes` is enforced independently through the default
+`heavy_process:host` claim. See
+[Durable resource admission](resource-admission.md).
+
 An `external_blocked` result must identify Jira dependency keys already present
 in the authenticated ticket relation graph. Fresh Jira synchronization wakes the
 ticket only after every named dependency is complete and the prior execution is
@@ -146,7 +157,11 @@ continues in lifecycle-only mode. The optional
 must each be 5 through 3600 seconds.
 Initialization should gitignore `.orchestration/.supervisor/`.
 
+Active jobs written by an earlier 1.x supervisor receive only the deterministic
+automatic claim set on first 1.8.8 admission pass; their attempts and execution
+identity are not changed.
+
 Restart does not invent missing worker or provider receipts. Ambiguous launches
 remain fenced for reconciliation, and preserved-PR recovery still requires its
-existing controller authority. Resource exclusions remain a later slice. No
-review, security, budget, or merge gate is weakened.
+existing controller authority. No review, security, budget, or merge gate is
+weakened.

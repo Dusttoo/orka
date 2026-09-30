@@ -1,11 +1,12 @@
 # Orka 2: durable supervisor runtime
 
 Status: accepted architectural direction; implementation in independently
-releasable slices. Orka 1.8.7 provides the detached supervisor, repository
+releasable slices. Orka 1.8.8 provides the detached supervisor, repository
 lease lifecycle, deterministic synchronization/planning loop, controller-owned
 desktop/API worker dispatch, versioned terminal-result transitions, ticket-local
 parking, durable retry wakeups, classified operator-decision resolution, and
-authenticated restart after a mechanically proven supervisor death.
+authenticated restart after a mechanically proven supervisor death, and
+capacity-aware durable resource admission.
 
 Orka's current controller has durable checkpoints and mechanical gates, but a
 model-driven captain still performs the outer `plan -> launch -> wait -> finish
@@ -72,6 +73,8 @@ controller state.
 Skipped work remains queued. Jobs declare resource exclusions such as
 repository, ticket, PR, worktree, migration sequence, provider route, visual QA,
 or heavy-process capacity. A blocked exclusion delays only conflicting jobs.
+The implemented v1 claim contract is documented in
+[Durable resource admission](resource-admission.md).
 
 ### Bounded autonomy
 
