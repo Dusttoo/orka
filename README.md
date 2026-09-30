@@ -412,6 +412,12 @@ merge-policy changes begin with an architecture proposal. The accepted Orka 2
 direction is described in
 [docs/orka-2-durable-runtime.md](docs/orka-2-durable-runtime.md).
 
+The durable supervisor uses typed, capacity-aware resource claims so a
+migration, PR, worktree, provider route, visual-QA slot, or heavy process can
+delay only conflicting work. See
+[Durable resource admission](docs/resource-admission.md) for the claim contract
+and the optional Jira-label convention.
+
 Please report security-sensitive findings privately according to
 [SECURITY.md](SECURITY.md) and follow the [Code of Conduct](CODE_OF_CONDUCT.md).
 

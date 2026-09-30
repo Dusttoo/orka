@@ -164,6 +164,60 @@ class DispatchTests(unittest.TestCase):
         refill = self.dispatcher.fill("99", ["PNP-3"], jobs, 2)
         self.assertEqual([job["ticket"] for job in refill], ["PNP-3"])
 
+    def test_conflicting_candidate_is_skipped_without_reservation_or_reordering(self) -> None:
+        exclusive = {
+            "kind": "migration",
+            "key": "primary",
+            "units": 1,
+            "capacity": 1,
+            "source": "controller",
+        }
+        jobs: dict[str, dict] = {}
+        first = self.dispatcher.fill(
+            "99",
+            ["PROJ-1"],
+            jobs,
+            3,
+            heavy_capacity=3,
+            claims_by_ticket={"PROJ-1": [exclusive]},
+        )
+        self.assertEqual([job["ticket"] for job in first], ["PROJ-1"])
+        before_reservations = self.adapter.count
+        second = self.dispatcher.fill(
+            "99",
+            ["PROJ-2", "PROJ-3"],
+            jobs,
+            3,
+            heavy_capacity=3,
+            claims_by_ticket={"PROJ-2": [exclusive]},
+        )
+        self.assertEqual([job["ticket"] for job in second], ["PROJ-3"])
+        self.assertEqual(self.adapter.count, before_reservations + 1)
+        self.assertEqual(self.dispatcher.last_skips[0]["ticket"], "PROJ-2")
+
+        self.write_result(first[0], self.envelope(first[0]))
+        self.dispatcher.apply_terminal(first[0])
+        retry = self.dispatcher.fill(
+            "99",
+            ["PROJ-2"],
+            jobs,
+            3,
+            heavy_capacity=3,
+            claims_by_ticket={"PROJ-2": [exclusive]},
+        )
+        self.assertEqual([job["ticket"] for job in retry], ["PROJ-2"])
+
+    def test_max_heavy_processes_is_independent_of_lane_capacity(self) -> None:
+        jobs: dict[str, dict] = {}
+        launched = self.dispatcher.fill(
+            "99", ["PROJ-1", "PROJ-2", "PROJ-3"], jobs, 3, heavy_capacity=1
+        )
+        self.assertEqual([job["ticket"] for job in launched], ["PROJ-1"])
+        self.assertEqual(
+            [item["ticket"] for item in self.dispatcher.last_skips],
+            ["PROJ-2", "PROJ-3"],
+        )
+
     def test_ticket_local_dispatch_rejection_does_not_stop_independent_work(
         self,
     ) -> None:

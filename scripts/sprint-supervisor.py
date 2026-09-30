@@ -43,6 +43,7 @@ from supervisor_planning import (
     planning_cycle,
 )
 from supervisor_dispatch import DispatchError, StaleResultError, SupervisorDispatcher
+from supervisor_admission import AdmissionError, validate_persisted_jobs
 
 
 class SupervisorError(RuntimeError):
@@ -335,7 +336,9 @@ def runtime_fingerprint() -> str:
     return digest_bytes(
         Path(__file__).read_bytes()
         + (PLUGIN_ROOT / "scripts/supervisor_dispatch.py").read_bytes()
+        + (PLUGIN_ROOT / "scripts/supervisor_admission.py").read_bytes()
         + CONTRACT_PATH.read_bytes()
+        + (PLUGIN_ROOT / "contracts/resource-claims-v1.json").read_bytes()
         + (PLUGIN_ROOT / "scripts/runtime_state.py").read_bytes()
         + (PLUGIN_ROOT / ".codex-plugin/plugin.json").read_bytes()
     )
@@ -398,6 +401,10 @@ def takeover_state(
         )
     if resume_state not in {"starting", "active", "degraded", "paused", "draining"}:
         raise SupervisorError(f"unsupported takeover resume state: {resume_state}")
+    try:
+        validate_persisted_jobs((previous.get("dispatch") or {}).get("jobs", {}))
+    except AdmissionError as exc:
+        raise SupervisorError(f"durable resource state is invalid: {exc}") from exc
 
     state = copy.deepcopy(previous)
     absence_receipt = {
@@ -623,6 +630,17 @@ def planning_settings(repository: Path) -> dict[str, Any]:
         raise SupervisorError("concurrency_max must be a positive integer") from exc
     if isinstance(raw_concurrency, bool) or str(concurrency) != str(raw_concurrency) or concurrency < 1:
         raise SupervisorError("concurrency_max must be a positive integer")
+    raw_heavy = config.get("max_heavy_processes", concurrency)
+    try:
+        heavy_capacity = int(raw_heavy)
+    except (TypeError, ValueError) as exc:
+        raise SupervisorError("max_heavy_processes must be a positive integer") from exc
+    if (
+        isinstance(raw_heavy, bool)
+        or str(heavy_capacity) != str(raw_heavy)
+        or heavy_capacity < 1
+    ):
+        raise SupervisorError("max_heavy_processes must be a positive integer")
     raw_retry_delay = config.get("supervisor_ticket_retry_seconds", 30)
     try:
         retry_delay = float(raw_retry_delay)
@@ -637,6 +655,7 @@ def planning_settings(repository: Path) -> dict[str, Any]:
         "requested_sprint": configured,
         "sync_interval_seconds": interval,
         "concurrency_max": concurrency,
+        "max_heavy_processes": heavy_capacity,
         "ticket_retry_seconds": retry_delay,
     }
 
@@ -1320,6 +1339,22 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                                 list(action_plan.get("launch") or []),
                                 jobs,
                                 int(planning.get("concurrency_max") or 1),
+                                heavy_capacity=int(
+                                    planning.get("max_heavy_processes") or 1
+                                ),
+                                claims_by_ticket=dict(
+                                    planning.get("resource_claims") or {}
+                                ),
+                            )
+                        for skipped in dispatcher.last_skips:
+                            state.setdefault("history", []).append(
+                                {
+                                    "at": now(),
+                                    "event": "worker_dispatch_skipped_resource",
+                                    "from": state["lifecycle_state"],
+                                    "to": state["lifecycle_state"],
+                                    "evidence": skipped,
+                                }
                             )
                         for failure in dispatcher.last_errors:
                             dispatch["last_error"] = failure["error"]
@@ -1358,6 +1393,9 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                                             "execution_invocation": (
                                                 job.get("execution_identity") or {}
                                             ).get("invocation_id", ""),
+                                            "resource_claim_digest": job.get(
+                                                "resource_claim_digest", ""
+                                            ),
                                         },
                                     }
                                 )

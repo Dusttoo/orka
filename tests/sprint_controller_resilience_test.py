@@ -1809,6 +1809,63 @@ class ResilienceTests(unittest.TestCase):
         self.assertIn("PROJ-1", [item["key"] for item in plan["waiting"]])
 
 
+class ResourceClaimEvidenceTests(unittest.TestCase):
+    def ticket(self, **changes):
+        value = {
+            "key": "PROJ-1",
+            "labels": [],
+            "pr": "",
+            "recovery_binding": {},
+        }
+        value.update(changes)
+        return value
+
+    def test_jira_resource_labels_become_exclusive_controller_claims(self):
+        claims = controller.ticket_resource_claims(
+            self.ticket(
+                labels=[
+                    "orka-resource-migration-primary",
+                    "orka-resource-visual_qa-chromium",
+                ]
+            )
+        )
+        self.assertEqual(
+            [(item["kind"], item["key"]) for item in claims],
+            [("migration", "primary"), ("visual_qa", "chromium")],
+        )
+        self.assertTrue(all(item["capacity"] == 1 for item in claims))
+
+    def test_pr_and_worktree_claims_use_non_path_digests(self):
+        claims = controller.ticket_resource_claims(
+            self.ticket(
+                pr="https://github.test/org/repo/pull/9",
+                recovery_binding={"worktree": "/private/repository/worktree"},
+            )
+        )
+        self.assertEqual([item["kind"] for item in claims], ["pr", "worktree"])
+        self.assertTrue(all(len(item["key"]) == 32 for item in claims))
+        self.assertNotIn("private", json.dumps(claims))
+
+    def test_invalid_or_duplicate_resource_labels_fail_closed(self):
+        with self.assertRaises(controller.SprintError):
+            controller.ticket_resource_claims(
+                self.ticket(labels=["orka-resource-migration-bad key"])
+            )
+        with self.assertRaises(controller.SprintError):
+            controller.ticket_resource_claims(
+                self.ticket(labels=["orka-resource-unknown-primary"])
+            )
+        with self.assertRaises(controller.SprintError):
+            controller.ticket_resource_claims(
+                self.ticket(
+                    labels=[
+                        "orka-resource-migration-primary",
+                        "orka-resource-migration-primary",
+                    ]
+                )
+            )
+
+
 class HostBudgetPolicySettingsTests(unittest.TestCase):
     """Controller breakers honor a root-owned policy, never the worktree alone."""
 

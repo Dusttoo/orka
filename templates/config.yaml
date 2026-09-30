@@ -441,6 +441,12 @@ pr_drain_first: true
 # Host-local heavy commands (builds, full test suites, browser suites) use this
 # smaller admission limit even when more model lanes are active.
 max_heavy_processes: 2
+# Optional exclusive claims can be attached through authenticated Jira labels:
+#   orka-resource-migration-<key>
+#   orka-resource-provider_route-<key>
+#   orka-resource-visual_qa-<key>
+# These labels only tighten admission. Orka also claims repository, ticket,
+# selected provider route, and heavy-process capacity mechanically.
 
 # --- Worktrees ------------------------------------------------------------ both
 worktree_base: .claude/worktrees   # where isolated agent worktrees are created
