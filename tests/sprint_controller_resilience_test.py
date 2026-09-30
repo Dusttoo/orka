@@ -277,6 +277,32 @@ class ResilienceTests(unittest.TestCase):
         self.assertEqual(plan["launch"], [])
         self.assertTrue(plan["work_in_progress"]["fresh_launch_paused"])
 
+    def test_multi_lane_plan_exposes_fair_candidates_during_recovery(self):
+        self.cfg["concurrency_max"] = 3
+        self.ticket("PROJ-1", "recoverable")
+        self.ticket("PROJ-2", pr="", dependencies=[])
+        self.ticket("PROJ-3", pr="", dependencies=["PROJ-2"])
+        self.ticket("PROJ-4", pr="", dependencies=[])
+        with patch.object(
+            controller, "automatic_recovery_available", return_value=True
+        ):
+            plan = controller.plan_value(self.state, self.cfg)
+        self.assertEqual(plan["allocation_candidates"]["recovery"], ["PROJ-1"])
+        self.assertEqual(
+            plan["allocation_candidates"]["dependency_unlocking"], ["PROJ-2"]
+        )
+        self.assertEqual(plan["allocation_candidates"]["fresh"], ["PROJ-4"])
+        self.assertFalse(plan["work_in_progress"]["fresh_launch_paused"])
+
+    def test_wip_limit_removes_fresh_fair_candidates(self):
+        self.cfg["concurrency_max"] = 3
+        self.cfg["max_unmerged_prs"] = 1
+        self.ticket("PROJ-1", "needs_repair", pr="https://example/pr/1")
+        self.ticket("PROJ-2", pr="")
+        plan = controller.plan_value(self.state, self.cfg)
+        self.assertEqual(plan["allocation_candidates"]["fresh"], [])
+        self.assertEqual(plan["allocation_candidates"]["dependency_unlocking"], [])
+
     def test_unfinished_pr_limit_pauses_fresh_launch(self):
         self.cfg["max_unmerged_prs"] = 1
         self.ticket(

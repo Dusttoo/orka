@@ -418,6 +418,14 @@ delay only conflicting work. See
 [Durable resource admission](docs/resource-admission.md) for the claim contract
 and the optional Jira-label convention.
 
+Multi-lane supervisors allocate work through durable queue classes rather than
+globally pausing for the oldest repair. Repair and recovery retain greater
+weight, one lane is reserved for dependency-unlocking work when eligible, and a
+persisted cursor prevents continuation or fresh work from starving. A one-lane
+repository keeps strict finish-first behavior. The selected class and reason
+are visible in supervisor status; all WIP, dependency, resource, route, budget,
+and heavy-process fences still apply.
+
 Please report security-sensitive findings privately according to
 [SECURITY.md](SECURITY.md) and follow the [Code of Conduct](CODE_OF_CONDUCT.md).
 

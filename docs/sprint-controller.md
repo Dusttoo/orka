@@ -467,9 +467,12 @@ implemented. No progress event grants a review or merge approval.
 A time-limited attempt that recorded a new verified milestone may be requeued as
 a continuation. Continuations have their own `max_worker_continuations` counter
 and do not spend the ordinary crash/relaunch allowance. A timeout with no new
-verified milestone remains an ordinary charged attempt. Planning is finish-first:
-actionable repair and recovery work pauses fresh launches, and `max_unmerged_prs`
-(default `concurrency_max`) bounds unfinished PR work in progress.
+verified milestone remains an ordinary charged attempt. One-lane planning is
+strictly finish-first. Multi-lane planning publishes repair, recovery,
+continuation, dependency-unlocking, and fresh candidates to the durable
+supervisor's weighted allocator instead of globally pausing independent work.
+`max_unmerged_prs` (default `concurrency_max`) still bounds unfinished PR work
+in progress.
 
 
 `record-progress --milestone review_finding_closed --evidence

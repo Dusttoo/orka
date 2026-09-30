@@ -246,6 +246,10 @@ def classify_cycle(
         "all_routes_unavailable": all_routes_unavailable,
         "budget": budget,
         "resource_claims": dict(plan.get("resource_claims") or {}),
+        "allocation_candidates": {
+            key: list(value or [])
+            for key, value in (plan.get("allocation_candidates") or {}).items()
+        },
         "next_wake_epoch": next_wake,
         "wait_reason": (
             "durable-deadline"
