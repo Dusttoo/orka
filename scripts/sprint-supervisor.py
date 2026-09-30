@@ -44,6 +44,7 @@ from supervisor_planning import (
 )
 from supervisor_dispatch import DispatchError, StaleResultError, SupervisorDispatcher
 from supervisor_admission import AdmissionError, validate_persisted_jobs
+from supervisor_allocation import AllocationError, allocate_lanes
 
 
 class SupervisorError(RuntimeError):
@@ -600,6 +601,10 @@ def status_response(state: dict[str, Any]) -> dict[str, Any]:
             str(item.get("key") or "")
             for item in planning.get("waiting") or []
         ),
+        "lane_allocation": planning.get("lane_allocation") or {
+            "selections": [],
+            "next_cursor": int(planning.get("allocation_cursor") or 0),
+        },
     }
     return result
 
@@ -927,6 +932,8 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                         "last_error": "",
                         "next_wake_epoch": 0.0,
                         "plan_digest": "",
+                        "allocation_cursor": 0,
+                        "lane_allocation": {"selections": [], "next_cursor": 0},
                     }
                 )
                 state["dispatch"] = {
@@ -1309,43 +1316,92 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                             for ticket in action_plan.get("recovery", [])
                             if ticket not in local_retry_holds
                         ]
-                        continuation_actions = bool(
-                            action_plan.get("repair") or action_plan.get("recovery")
+                        capacity = int(planning.get("concurrency_max") or 1)
+                        active = sum(
+                            1
+                            for job in jobs.values()
+                            if job.get("state") in ACTIVE_JOB_STATES
                         )
-                        if continuation_actions:
-                            dispatcher.last_errors = []
-                            prepared = dispatcher.prepare_continuations(
-                                sprint_id, action_plan, jobs
+                        candidates = dict(
+                            planning.get("allocation_candidates") or {}
+                        )
+                        if not candidates:
+                            candidates = {
+                                "repair": list(action_plan.get("repair") or []),
+                                "recovery": list(action_plan.get("recovery") or []),
+                                "continuation": list(action_plan.get("launch") or []),
+                                "dependency_unlocking": [],
+                                "fresh": [],
+                            }
+                        candidates["recovery"] = [
+                            ticket
+                            for ticket in candidates.get("recovery", [])
+                            if ticket not in local_retry_holds
+                        ]
+                        allocation = allocate_lanes(
+                            candidates,
+                            available=max(0, capacity - active),
+                            concurrency=capacity,
+                            cursor=int(planning.get("allocation_cursor") or 0),
+                        )
+                        planning["allocation_cursor"] = allocation["next_cursor"]
+                        planning["lane_allocation"] = allocation
+                        selected_actions = {
+                            "repair": [],
+                            "recovery": [],
+                        }
+                        launch_tickets = []
+                        for selection in allocation["selections"]:
+                            state.setdefault("history", []).append(
+                                {
+                                    "at": now(),
+                                    "event": "lane_allocated",
+                                    "from": state["lifecycle_state"],
+                                    "to": state["lifecycle_state"],
+                                    "evidence": selection,
+                                }
                             )
-                            launched = []
-                            if prepared:
-                                planning["next_wake_epoch"] = 0.0
-                                for job in prepared:
-                                    state.setdefault("history", []).append(
-                                        {
-                                            "at": now(),
-                                            "event": "ticket_continuation_queued",
-                                            "from": state["lifecycle_state"],
-                                            "to": state["lifecycle_state"],
-                                            "evidence": {
-                                                "ticket": job["ticket"],
-                                                "run_ref": job["run_ref"],
-                                            },
-                                        }
-                                    )
-                        else:
-                            launched = dispatcher.fill(
-                                sprint_id,
-                                list(action_plan.get("launch") or []),
-                                jobs,
-                                int(planning.get("concurrency_max") or 1),
-                                heavy_capacity=int(
-                                    planning.get("max_heavy_processes") or 1
-                                ),
-                                claims_by_ticket=dict(
-                                    planning.get("resource_claims") or {}
-                                ),
-                            )
+                            if selection["action"] == "launch":
+                                launch_tickets.append(selection["ticket"])
+                            else:
+                                selected_actions[selection["action"]].append(
+                                    selection["ticket"]
+                                )
+                        dispatcher.last_errors = []
+                        prepared = dispatcher.prepare_continuations(
+                            sprint_id, selected_actions, jobs
+                        )
+                        continuation_errors = list(dispatcher.last_errors)
+                        if prepared:
+                            planning["next_wake_epoch"] = 0.0
+                            for job in prepared:
+                                state.setdefault("history", []).append(
+                                    {
+                                        "at": now(),
+                                        "event": "ticket_continuation_queued",
+                                        "from": state["lifecycle_state"],
+                                        "to": state["lifecycle_state"],
+                                        "evidence": {
+                                            "ticket": job["ticket"],
+                                            "run_ref": job["run_ref"],
+                                        },
+                                    }
+                                )
+                        launched = dispatcher.fill(
+                            sprint_id,
+                            launch_tickets,
+                            jobs,
+                            capacity,
+                            heavy_capacity=int(
+                                planning.get("max_heavy_processes") or 1
+                            ),
+                            claims_by_ticket=dict(
+                                planning.get("resource_claims") or {}
+                            ),
+                        )
+                        dispatcher.last_errors = (
+                            continuation_errors + dispatcher.last_errors
+                        )
                         for skipped in dispatcher.last_skips:
                             state.setdefault("history", []).append(
                                 {
@@ -1401,7 +1457,7 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                                 )
                             state["history"] = state["history"][-256:]
                     persist_state()
-                except (PlanningError, DispatchError) as exc:
+                except (PlanningError, DispatchError, AllocationError) as exc:
                     planning["last_error"] = str(exc)
                     planning["last_sync_at"] = now()
                     planning["next_wake_epoch"] = current_time + float(

@@ -176,6 +176,19 @@ class PlanningLoopTests(unittest.TestCase):
             "last_event": "controller_plan_updated",
             "planning": {
                 "enabled": True,
+                "allocation_cursor": 4,
+                "lane_allocation": {
+                    "next_cursor": 5,
+                    "selections": [
+                        {
+                            "slot": 1,
+                            "ticket": "PNP-5",
+                            "class": "fresh",
+                            "action": "launch",
+                            "reason": "weighted-fair-share:fresh",
+                        }
+                    ],
+                },
                 "plan": {
                     "launch": ["PNP-5"],
                     "scope": [],
@@ -206,6 +219,10 @@ class PlanningLoopTests(unittest.TestCase):
         self.assertEqual(result["dispatch"]["retrying"], ["PNP-2"])
         self.assertEqual(result["dispatch"]["parked"], ["PNP-3"])
         self.assertEqual(result["dispatch"]["blocked"], ["PNP-4"])
+        self.assertEqual(
+            result["dispatch"]["lane_allocation"]["selections"][0]["reason"],
+            "weighted-fair-share:fresh",
+        )
 
 
 class TakeoverStateTests(unittest.TestCase):

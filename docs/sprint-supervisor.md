@@ -1,6 +1,6 @@
 # Host-owned sprint supervisor
 
-Orka 1.8.8 extends the detached Orka 2 supervisor with a deterministic outer
+Orka 1.8.9 extends the detached Orka 2 supervisor with a deterministic outer
 planning loop. The host process owns one repository lease, synchronizes through
 the existing authenticated Jira/GitHub/controller/provider adapters, publishes
 controller-authorized work, fills available lanes through controller-owned
@@ -114,6 +114,14 @@ sets. A no-progress timeout enters a durable retry wait for
 deadline arrives, the supervisor requeues only that exact stopped attempt and
 immediately replans. Controller-authorized repair and recovery continuations are
 returned to the launch queue without holding unrelated capacity.
+
+Admission is queue-class aware. A single-lane repository remains strictly
+finish-first. With two or more lanes, eligible dependency-unlocking work gets
+one reserved slot and the remaining slots rotate through weighted repair,
+recovery, continuation, and fresh queues. Repair and recovery therefore remain
+preferred without becoming a global pause. The cursor and each selection's
+class, slot, action, and reason are durable and visible in `status`, so repeated
+planning cannot starve a continuously eligible queue.
 
 Before reservation, the supervisor evaluates the ordered controller plan
 against resources held by `reserved`, `running`, and `launch_uncertain` jobs.

@@ -3136,6 +3136,28 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
     fresh_ready = [
         key for key in ready if key not in continuation_ready and key not in pr_ready
     ]
+    dependency_keys = {
+        dependency
+        for ticket in ordered
+        if ticket["state"] not in {"completed", "decomposed"}
+        for dependency in ticket.get("dependencies", [])
+        if dependency in state["tickets"]
+    }
+    dependency_unlocking_ready = [
+        key for key in fresh_ready if key in dependency_keys
+    ]
+    ordinary_fresh_ready = [
+        key for key in fresh_ready if key not in dependency_keys
+    ]
+    allocation_candidates = {
+        "repair": [] if runtime_hold else list(repair),
+        "recovery": [] if runtime_hold else list(recovery),
+        "continuation": [] if runtime_hold else continuation_ready + pr_ready,
+        "dependency_unlocking": (
+            [] if runtime_hold or wip_limited else dependency_unlocking_ready
+        ),
+        "fresh": [] if runtime_hold or wip_limited else ordinary_fresh_ready,
+    }
     if finish_first:
         launch = []
     else:
@@ -3179,18 +3201,23 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
             "count": len(active_unfinished_prs),
             "total_visible": len(unfinished_prs),
             "limit": int(cfg.get("max_unmerged_prs", cfg["concurrency_max"])),
-            "fresh_launch_paused": finish_first or wip_limited,
+            "fresh_launch_paused": (
+                (finish_first and cfg["concurrency_max"] == 1) or wip_limited
+            ),
             "reason": (
                 "finish existing repair or recovery work first"
-                if finish_first
+                if finish_first and cfg["concurrency_max"] == 1
                 else "unfinished PR limit reached"
                 if wip_limited
+                else "fair multi-lane allocation remains available"
+                if finish_first
                 else ""
             ),
         },
         "running": running,
         "needs_reconcile": sorted(running + recovery_waiting),
         "launch": [] if runtime_hold else launch,
+        "allocation_candidates": allocation_candidates,
         "provider_holds": [hold for hold in (runtime_hold, scope_hold) if hold],
         "health_probes": health_probes,
         "scope": scope,
@@ -3936,7 +3963,19 @@ def reserve(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         ):
             raise SprintError(f"ticket {key} is blocked: {reason}")
         current_plan = plan_value(state, cfg)
-        if key not in current_plan["launch"]:
+        allocation_launchable = {
+            ticket_key
+            for queue_class in ("continuation", "dependency_unlocking", "fresh")
+            for ticket_key in (
+                (current_plan.get("allocation_candidates") or {}).get(
+                    queue_class, []
+                )
+            )
+        }
+        allowed = key in current_plan["launch"] or (
+            cfg["concurrency_max"] > 1 and key in allocation_launchable
+        )
+        if not allowed:
             raise SprintError(
                 f"ticket {key} is not in the controller's current launch plan; "
                 "finish repair, recovery, continuation, or WIP work first"
