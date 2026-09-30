@@ -222,6 +222,7 @@ Legacy key blocks:
 | `security_required_when` | diff path/content triggers that make the security gate mandatory |
 | `security_required_source_branches` / `security_required_target_branches` | source/target branch patterns that force security review even when the diff has no configured keyword |
 | `sprint_id` / `sprint_*` | configured Jira sprint, dependency/status mapping, and checkpoint location |
+| `supervisor_sync_interval_seconds` / `supervisor_ticket_retry_seconds` | bounded authoritative-sync and ticket-local retry wake intervals for the detached supervisor |
 | `sprint_decomposition` | optional pre-code complexity assessment, bounded Jira child creation, and an approved multi-step path to a launchable Jira status |
 | `sprint_decomposition.required_slice_contracts` | repository-selected contract fields every generated slice must carry before Jira creation |
 | `sprint_decisions` | approved reusable decision registry supplied to future ticket-scoping passes |
@@ -355,9 +356,10 @@ the current implementation provides a
 [host-owned supervisor process](docs/sprint-supervisor.md) with an exclusive
 repository lease, detached session, deterministic synchronization/planning,
 durable cooldown wakes, controller-owned worker dispatch, strict terminal-result
-bindings, immediate lane refill, and explicit pause, drain, resume, and stop
-transitions. Desktop and API workers pass through the same versioned lifecycle
-contract; stale or malformed results cannot become successful work.
+bindings, ticket-local parking and decision resolution, authenticated external
+dependency wakeups, immediate lane refill, and explicit pause, drain, resume,
+and stop transitions. Desktop and API workers pass through the same versioned
+lifecycle contract; stale or malformed results cannot become successful work.
 
 ## The merge-guard
 

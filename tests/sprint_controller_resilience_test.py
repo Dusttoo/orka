@@ -995,6 +995,164 @@ class ResilienceTests(unittest.TestCase):
                 self.assertFalse(plan["autonomous_work_remaining"])
                 self.assertEqual(len(plan["decision_queue"]), 1)
 
+    def test_operator_decision_resolution_is_ticket_local_and_idempotent(self):
+        self.ticket(
+            "PROJ-1",
+            "operator_decision",
+            terminal_classification={
+                "kind": "operator_decision",
+                "decision_class": "product_or_security_policy",
+                "decision_question": "Which policy applies?",
+            },
+        )
+        self.ticket("PROJ-2", "pending", reason="independent")
+        path = controller.state_path(self.cfg["state_dir"], "1")
+        path.parent.mkdir(parents=True)
+        controller.save(path, self.state)
+        untouched = copy.deepcopy(controller.load(path)["tickets"]["PROJ-2"])
+        args = argparse.Namespace(
+            sprint="1",
+            ticket="PROJ-1",
+            decision_class="product_or_security_policy",
+            decision_receipt="operator-approved-policy-v1",
+            reason="approved policy is recorded",
+        )
+        with (
+            patch.object(controller, "require_worker_stopped", return_value=None),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            controller.resolve_decision(args, self.cfg)
+            controller.resolve_decision(args, self.cfg)
+        state = controller.load(path)
+        self.assertEqual(state["tickets"]["PROJ-1"]["state"], "pending")
+        self.assertEqual(state["tickets"]["PROJ-2"], untouched)
+        self.assertEqual(
+            len(
+                [
+                    item
+                    for item in state["tickets"]["PROJ-1"]["history"]
+                    if item.get("event") == "decision-resolved"
+                ]
+            ),
+            1,
+        )
+
+    def test_operator_decision_classes_match_the_lifecycle_contract(self):
+        contract = json.loads(
+            (ROOT / "contracts/supervisor-lifecycle-v1.json").read_text()
+        )
+        self.assertEqual(
+            controller.OPERATOR_DECISION_CLASSES,
+            {
+                item["class"]
+                for item in contract["operator_only_decisions"]
+            },
+        )
+
+    def test_external_hold_wakes_only_from_authenticated_dependency_change(self):
+        self.state["dependency_status"] = {"EXT-9": "In Progress"}
+        ticket = self.ticket(
+            "PROJ-1",
+            "external_blocked",
+            dependencies=["EXT-9"],
+            worker_identity={"kind": "execution_unit", "invocation_id": "worker"},
+            terminal_classification={
+                "kind": "external_dependency",
+                "dependencies": ["EXT-9"],
+                "receipt": "jira relation receipt",
+            },
+        )
+        with patch.object(controller, "execution_unit_status", return_value="absent"):
+            self.assertEqual(
+                controller.reconcile_authenticated_external_holds(self.state, self.cfg),
+                [],
+            )
+            self.state["dependency_status"]["EXT-9"] = "Done"
+            self.assertEqual(
+                controller.reconcile_authenticated_external_holds(self.state, self.cfg),
+                ["PROJ-1"],
+            )
+        self.assertEqual(ticket["state"], "pending")
+        self.assertEqual(ticket["worker_identity"], "")
+        self.assertEqual(
+            ticket["history"][-1]["event"], "external-dependency-resolved"
+        )
+
+    def test_external_hold_stays_parked_when_worker_proof_is_unreadable(self):
+        ticket = self.ticket(
+            "PROJ-1",
+            "external_blocked",
+            dependencies=["EXT-9"],
+            worker_identity={"kind": "execution_unit", "invocation_id": "worker"},
+            terminal_classification={
+                "kind": "external_dependency",
+                "dependencies": ["EXT-9"],
+                "receipt": "jira relation receipt",
+            },
+        )
+        self.state["dependency_status"] = {"EXT-9": "Done"}
+        with patch.object(
+            controller,
+            "execution_unit_status",
+            side_effect=controller.SprintError("unreadable tombstone"),
+        ):
+            self.assertEqual(
+                controller.reconcile_authenticated_external_holds(self.state, self.cfg),
+                [],
+            )
+        self.assertEqual(ticket["state"], "external_blocked")
+
+    def test_finish_binds_external_and_operator_classification(self):
+        path = controller.state_path(self.cfg["state_dir"], "1")
+        path.parent.mkdir(parents=True)
+        self.ticket("PROJ-1", "running", dependencies=["EXT-9"])
+        controller.save(path, self.state)
+        external = argparse.Namespace(
+            sprint="1",
+            ticket="PROJ-1",
+            outcome="external_blocked",
+            summary="waiting on external dependency",
+            branch="feature",
+            pr="123",
+            attempt_token="token",
+            decision_class="",
+            decision_question="",
+            external_dependency=["EXT-9"],
+            external_dependency_receipt="jira relation receipt",
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            controller.finish(external, self.cfg)
+        stored = controller.load(path)["tickets"]["PROJ-1"]
+        self.assertEqual(
+            stored["terminal_classification"]["dependencies"], ["EXT-9"]
+        )
+
+        self.state = controller.load(path)
+        self.state["tickets"]["PROJ-1"].update(
+            state="running", attempt_token="token-2"
+        )
+        controller.save(path, self.state)
+        decision = argparse.Namespace(
+            sprint="1",
+            ticket="PROJ-1",
+            outcome="operator_decision",
+            summary="policy decision required",
+            branch="feature",
+            pr="123",
+            attempt_token="token-2",
+            decision_class="product_or_security_policy",
+            decision_question="Which policy applies?",
+            external_dependency=[],
+            external_dependency_receipt="",
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            controller.finish(decision, self.cfg)
+        stored = controller.load(path)["tickets"]["PROJ-1"]
+        self.assertEqual(
+            stored["terminal_classification"]["decision_class"],
+            "product_or_security_policy",
+        )
+
     def test_live_recovery_retains_lane_until_unit_is_absent(self):
         self.ticket(
             "PROJ-1",

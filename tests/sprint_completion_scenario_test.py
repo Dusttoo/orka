@@ -91,9 +91,13 @@ llm:
         return controller.load(self.path)['tickets'][key]['attempt_token']
 
     def finish(self, key, token, outcome='completed', pr='1'):
+        decision_class = 'increase_hard_ceiling' if outcome == 'operator_decision' else ''
+        decision_question = 'Raise the ticket budget ceiling?' if decision_class else ''
         with contextlib.redirect_stdout(io.StringIO()):
             controller.finish(argparse.Namespace(sprint='1',ticket=key,attempt_token=token,
-                outcome=outcome,summary='fixture result',pr=pr,branch='codex/'+key), self.cfg)
+                outcome=outcome,summary='fixture result',pr=pr,branch='1-fixture',
+                decision_class=decision_class,decision_question=decision_question,
+                external_dependency=[],external_dependency_receipt=''), self.cfg)
 
     def test_sprint_continues_through_design_invalid_review_repair_ci_and_dependency(self):
         scope = self.root / 'scope.json'
@@ -156,7 +160,7 @@ llm:
         )
         controller.save(self.path,state)
         args = argparse.Namespace(sprint='1',ticket='PROJ-1',attempt_token=token,milestone='implementation_commit',evidence=repaired)
-        pr = dict(number=1,state='open',base=dict(repo=dict(id=7)),head=dict(sha=repaired,ref='codex/PROJ-1'))
+        pr = dict(number=1,state='open',base=dict(repo=dict(id=7)),head=dict(sha=repaired,ref='1-fixture'))
         def github(root, host, endpoint, **kwargs):
             if endpoint == 'repos/example/project': return dict(id=7,full_name='example/project')
             if endpoint.endswith('/pulls/1'): return pr

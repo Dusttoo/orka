@@ -241,7 +241,11 @@ def result_prompt(
         "Do not infer success: completed requires an authenticated merged-PR receipt. "
         "Evidence must contain every lifecycle-contract field for the selected outcome "
         "(for example merge_receipt for completed, or pr_identity and "
-        "review_ledger_digest for needs_repair). "
+        "review_ledger_digest for needs_repair). An external_blocked result must "
+        "supply external_dependency_receipt as an object with the exact authenticated "
+        "Jira dependency keys in dependencies and a bounded receipt string. An "
+        "operator_decision result must supply one contract decision_class and a "
+        "bounded decision_question. "
         f"Schema template: {json.dumps(example, sort_keys=True)}"
     )
 
@@ -303,7 +307,7 @@ class ControllerDispatchAdapter:
         outcome: str | None = None,
         summary: str | None = None,
     ) -> dict[str, Any]:
-        return self._run(
+        arguments = [
             "finish",
             "--sprint",
             sprint,
@@ -319,6 +323,39 @@ class ControllerDispatchAdapter:
             result.get("pr", ""),
             "--attempt-token",
             result["attempt_token"],
+        ]
+        if result["outcome"] == "operator_decision":
+            arguments.extend(
+                [
+                    "--decision-class",
+                    str(result["evidence"]["decision_class"]),
+                    "--decision-question",
+                    str(result["evidence"]["decision_question"]),
+                ]
+            )
+        elif result["outcome"] == "external_blocked":
+            receipt = result["evidence"]["external_dependency_receipt"]
+            for dependency in receipt["dependencies"]:
+                arguments.extend(["--external-dependency", dependency])
+            arguments.extend(
+                [
+                    "--external-dependency-receipt",
+                    str(receipt["receipt"]),
+                ]
+            )
+        return self._run(*arguments)
+
+    def requeue(self, sprint: str, job: dict[str, Any], reason: str) -> dict[str, Any]:
+        return self._run(
+            "requeue",
+            "--sprint",
+            sprint,
+            "--ticket",
+            job["ticket"],
+            "--reason",
+            reason,
+            "--attempt-token",
+            job["attempt_token"],
         )
 
     def verify_completion(self, result: dict[str, Any]) -> dict[str, Any]:
@@ -550,12 +587,17 @@ class SupervisorDispatcher:
         runtime_directory: Path,
         contract_path: Path,
         adapter: ControllerDispatchAdapter | None = None,
+        *,
+        retry_delay_seconds: float = 30.0,
     ) -> None:
         self.repository = repository.resolve()
         self.runtime_directory = runtime_directory.resolve()
         self.adapter = adapter or ControllerDispatchAdapter(
             repository, runtime_directory
         )
+        if retry_delay_seconds < 5 or retry_delay_seconds > 3600:
+            raise DispatchError("retry delay must be from 5 through 3600 seconds")
+        self.retry_delay_seconds = float(retry_delay_seconds)
         self.last_errors: list[dict[str, str]] = []
         try:
             self.contract = load_contract(contract_path)
@@ -585,6 +627,37 @@ class SupervisorDispatcher:
         supplied.setdefault("attempt_token", result.get("attempt_token"))
         supplied.setdefault("pr_identity", result.get("pr"))
         supplied.setdefault("result_digest", result_digest)
+        if event == "worker_external_blocked":
+            receipt = supplied.get("external_dependency_receipt")
+            if not isinstance(receipt, dict) or set(receipt) != {
+                "dependencies",
+                "receipt",
+            }:
+                raise DispatchError(
+                    "external dependency receipt must contain dependencies and receipt"
+                )
+            dependencies = receipt.get("dependencies")
+            if (
+                not isinstance(dependencies, list)
+                or not dependencies
+                or any(not isinstance(item, str) or not KEY.fullmatch(item) for item in dependencies)
+                or len(set(dependencies)) != len(dependencies)
+                or not isinstance(receipt.get("receipt"), str)
+                or not receipt["receipt"].strip()
+                or len(receipt["receipt"]) > 4000
+            ):
+                raise DispatchError("external dependency receipt is invalid")
+        if event == "worker_operator_decision":
+            allowed = {
+                item.get("class")
+                for item in self.contract.get("operator_only_decisions", [])
+                if isinstance(item, dict)
+            }
+            if supplied.get("decision_class") not in allowed:
+                raise DispatchError("operator decision class is not allowed")
+            question = supplied.get("decision_question")
+            if not isinstance(question, str) or not question.strip() or len(question) > 2000:
+                raise DispatchError("operator decision question is invalid")
         definition = (self.contract.get("events") or {}).get(event) or {}
         required = list(definition.get("required_evidence") or [])
         missing = [
@@ -731,9 +804,98 @@ class SupervisorDispatcher:
             "validation_error": validation_error,
             "applied_at": time.time(),
         }
+        if target == "retry_wait":
+            terminal["retry_at"] = terminal["applied_at"] + self.retry_delay_seconds
+            terminal["timer_id"] = f"retry:{job['run_ref']}"
         job["terminal"] = terminal
         job["state"] = target
         return {"applied": True, "duplicate": False, "terminal": terminal}
+
+    def wake_due_retries(
+        self, jobs: dict[str, Any], *, current_time: float | None = None
+    ) -> list[dict[str, Any]]:
+        """Requeue due ticket-local cooldowns after stopped-worker proof."""
+
+        current_time = time.time() if current_time is None else current_time
+        awakened: list[dict[str, Any]] = []
+        for job in jobs.values():
+            if job.get("state") != "retry_wait":
+                continue
+            terminal = job.get("terminal") or {}
+            retry_at = terminal.get("retry_at")
+            if not isinstance(retry_at, (int, float)) or retry_at > current_time:
+                continue
+            try:
+                self.adapter.requeue(
+                    job["sprint"], job, "supervisor cooldown elapsed"
+                )
+            except DispatchError as exc:
+                self.last_errors.append({"ticket": job["ticket"], "error": str(exc)})
+                # Avoid a tight supervisor loop when the stopped-worker proof
+                # or controller transition is temporarily unavailable.
+                terminal["retry_at"] = current_time + self.retry_delay_seconds
+                continue
+            job["state"] = "queued"
+            job.setdefault("history", []).append(
+                {
+                    "event": "cooldown_elapsed",
+                    "timer_id": terminal.get("timer_id"),
+                    "observed_at": current_time,
+                }
+            )
+            awakened.append(job)
+        return awakened
+
+    def prepare_continuations(
+        self,
+        sprint: str,
+        plan: dict[str, list[str]],
+        jobs: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Return controller-authorized repair/recovery work to the launch queue."""
+
+        prepared: list[dict[str, Any]] = []
+        expected_states = {"repair": "repair_ready", "recovery": "recovery_ready"}
+        for action, expected_state in expected_states.items():
+            for ticket in plan.get(action) or []:
+                candidates = sorted(
+                    (
+                        job
+                        for job in jobs.values()
+                        if job.get("ticket") == ticket
+                        and job.get("state") == expected_state
+                    ),
+                    key=lambda item: float(item.get("launched_at") or 0),
+                    reverse=True,
+                )
+                if not candidates:
+                    self.last_errors.append(
+                        {
+                            "ticket": ticket,
+                            "error": (
+                                f"{action} requires the supervisor-owned prior execution; "
+                                "restart recovery belongs to the idempotency slice"
+                            ),
+                        }
+                    )
+                    continue
+                job = candidates[0]
+                try:
+                    self.adapter.requeue(
+                        sprint, job, f"supervisor admitted {action} continuation"
+                    )
+                except DispatchError as exc:
+                    self.last_errors.append({"ticket": ticket, "error": str(exc)})
+                    continue
+                job["state"] = "queued"
+                job.setdefault("history", []).append(
+                    {
+                        "event": f"{action}_continuation_queued",
+                        "observed_at": time.time(),
+                    }
+                )
+                prepared.append(job)
+        return prepared
 
     def execution_terminal(self, job: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
         identity = job.get("execution_identity") or {}

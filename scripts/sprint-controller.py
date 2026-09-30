@@ -105,6 +105,14 @@ POST_IMPLEMENTATION_REVIEWER_ROLES = {"code-reviewer", "security-reviewer"}
 DEFAULT_DONE = ["done", "closed", "resolved"]
 DEFAULT_BLOCKED = ["blocked"]
 DEFAULT_READY = ["ready", "to do", "open", "selected for development"]
+OPERATOR_DECISION_CLASSES = {
+    "product_or_security_policy",
+    "accept_failed_gate",
+    "destructive_external_action",
+    "increase_hard_ceiling",
+    "ambiguous_external_side_effect",
+    "trust_boundary_change",
+}
 
 
 class SprintError(RuntimeError):
@@ -498,6 +506,7 @@ def load(path: Path) -> dict[str, Any]:
         ticket.setdefault("scope_assessment", {})
         ticket.setdefault("resolved_scope_decisions", [])
         ticket.setdefault("recovery_binding", {})
+        ticket.setdefault("terminal_classification", {})
         ticket.setdefault("decomposition_children", [])
         ticket.setdefault("progress", [])
     return value
@@ -1120,6 +1129,95 @@ def blockers(
     return sorted(set(reasons))
 
 
+def _clear_finished_execution(ticket: dict[str, Any]) -> None:
+    """Release one stopped execution fence without discarding useful work."""
+
+    ticket["run_ref"] = ""
+    ticket["attempt_token"] = ""
+    ticket["attempt_capability"] = {}
+    ticket["worker_identity"] = ""
+    ticket["attach_capability"] = ""
+    ticket["attached_at"] = ""
+    ticket["launch_evidence"] = {}
+
+
+def reconcile_authenticated_external_holds(
+    state: dict[str, Any], cfg: dict[str, Any]
+) -> list[str]:
+    """Wake only holds whose exact Jira dependencies are freshly complete."""
+
+    resolved: list[str] = []
+    for key, ticket in sorted(state["tickets"].items()):
+        if ticket.get("state") != "external_blocked":
+            continue
+        classification = ticket.get("terminal_classification") or {}
+        dependencies = classification.get("dependencies")
+        if classification.get("kind") != "external_dependency" or not isinstance(
+            dependencies, list
+        ) or not dependencies:
+            continue
+        if any(
+            dependency not in ticket.get("dependencies", [])
+            for dependency in dependencies
+        ):
+            continue
+        all_complete = True
+        for dependency in dependencies:
+            internal = state["tickets"].get(dependency)
+            if internal is not None:
+                complete = dependency_complete(state, dependency, cfg)
+            else:
+                raw_status = state.get("dependency_status", {}).get(dependency)
+                complete = bool(
+                    isinstance(raw_status, str)
+                    and raw_status.casefold() in cfg["done"]
+                )
+            if not complete:
+                all_complete = False
+                break
+        if not all_complete:
+            continue
+        identity = ticket.get("worker_identity")
+        if not isinstance(identity, dict) or identity.get("kind") != "execution_unit":
+            continue
+        try:
+            stopped = execution_unit_status(identity) == "absent"
+        except (OSError, SprintError):
+            stopped = False
+        if not stopped:
+            continue
+        receipt = {
+            "dependencies": sorted(dependencies),
+            "statuses": {
+                dependency: (
+                    state["tickets"][dependency].get("state")
+                    if dependency in state["tickets"]
+                    else state.get("dependency_status", {}).get(dependency)
+                )
+                for dependency in sorted(dependencies)
+            },
+        }
+        receipt["digest"] = hashlib.sha256(
+            json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        previous_reason = ticket.get("reason", "")
+        ticket["state"] = "pending"
+        ticket["reason"] = "authenticated external dependencies are complete"
+        ticket["next_launch_continuation"] = bool(ticket.get("pr") or ticket.get("branch"))
+        _clear_finished_execution(ticket)
+        classification["resolved_receipt"] = receipt
+        ticket.setdefault("history", []).append(
+            {
+                "at": now(),
+                "event": "external-dependency-resolved",
+                "previous_reason": previous_reason,
+                "receipt": receipt,
+            }
+        )
+        resolved.append(key)
+    return resolved
+
+
 def authorized_restart_grant(repository, ticket, token=""):
     try:
         return host_restart_grant(repository, ticket, token)
@@ -1568,6 +1666,7 @@ def sync(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
                         "scope_assessment",
                         "resolved_scope_decisions",
                         "recovery_binding",
+                        "terminal_classification",
                         "restart_grant_id",
                         "startup_retry_receipts",
                         "decomposition_children",
@@ -1685,6 +1784,7 @@ def sync(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             current["subtask_source_query"] = incoming["subtask_source_query"]
             current["subtask_keys"] = incoming["subtask_keys"]
             current["dependency_status"] = incoming["dependency_status"]
+            reconcile_authenticated_external_holds(current, cfg)
             state = current
         else:
             state = incoming
@@ -4890,21 +4990,133 @@ def finish(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         raise SprintError("finish summary must not be empty")
     if args.outcome == "completed" and (not args.pr.strip() or not args.branch.strip()):
         raise SprintError("completed outcome requires both PR and branch identity")
+    decision_class = str(getattr(args, "decision_class", "") or "").strip()
+    decision_question = str(getattr(args, "decision_question", "") or "").strip()
+    external_receipt = str(
+        getattr(args, "external_dependency_receipt", "") or ""
+    ).strip()
+    raw_dependencies = list(getattr(args, "external_dependency", []) or [])
+    if args.outcome == "operator_decision":
+        if decision_class not in OPERATOR_DECISION_CLASSES:
+            raise SprintError("operator decision requires a contract decision class")
+        if not decision_question or len(decision_question) > 2000:
+            raise SprintError("operator decision requires a bounded decision question")
+    elif decision_class or decision_question:
+        raise SprintError("decision metadata is allowed only for operator_decision")
+    if args.outcome == "external_blocked":
+        if not external_receipt or len(external_receipt) > 4000:
+            raise SprintError("external blocker requires a bounded dependency receipt")
+        dependencies = sorted({normalize_key(value) for value in raw_dependencies})
+        if not dependencies:
+            raise SprintError("external blocker requires at least one Jira dependency")
+    else:
+        if external_receipt or raw_dependencies:
+            raise SprintError("external dependency metadata is allowed only for external_blocked")
+        dependencies = []
     with locked(path):
         state = load(path)
         ticket = state["tickets"].get(key)
         if not ticket or ticket["state"] != "running":
             raise SprintError(f"ticket {key} is not running")
         require_attempt(ticket, args.attempt_token)
+        if dependencies and any(
+            dependency not in ticket.get("dependencies", [])
+            for dependency in dependencies
+        ):
+            raise SprintError(
+                "external blocker dependencies must be authenticated ticket relationships"
+            )
         ticket["state"] = args.outcome
         ticket["reason"] = args.summary.strip()
         ticket["branch"] = args.branch.strip()
         ticket["pr"] = args.pr.strip()
+        if args.outcome == "operator_decision":
+            ticket["terminal_classification"] = {
+                "kind": "operator_decision",
+                "decision_class": decision_class,
+                "decision_question": decision_question,
+            }
+        elif args.outcome == "external_blocked":
+            ticket["terminal_classification"] = {
+                "kind": "external_dependency",
+                "dependencies": dependencies,
+                "receipt": external_receipt,
+                "receipt_digest": hashlib.sha256(external_receipt.encode()).hexdigest(),
+            }
+        else:
+            ticket["terminal_classification"] = {}
         ticket["history"].append(
             {"at": now(), "event": "finished", "outcome": args.outcome}
         )
         save(path, state)
     emit({"ticket": key, "state": args.outcome})
+
+
+def resolve_decision(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
+    """Apply one operator receipt to one classified parked decision."""
+
+    path = state_path(cfg["state_dir"], str(args.sprint))
+    key = normalize_key(args.ticket)
+    decision_class = str(args.decision_class or "").strip()
+    receipt = str(args.decision_receipt or "").strip()
+    reason = str(args.reason or "").strip()
+    if decision_class not in OPERATOR_DECISION_CLASSES:
+        raise SprintError("decision class is not permitted by the lifecycle contract")
+    if not receipt or len(receipt) > 4000:
+        raise SprintError("decision receipt must contain 1 through 4000 characters")
+    if not reason or len(reason) > 2000:
+        raise SprintError("decision reason must contain 1 through 2000 characters")
+    receipt_digest = hashlib.sha256(receipt.encode()).hexdigest()
+    with locked(path):
+        state = load(path)
+        ticket = state["tickets"].get(key)
+        if not ticket:
+            raise SprintError(f"ticket {key} is not in the sprint checkpoint")
+        prior = next(
+            (
+                event
+                for event in reversed(ticket.get("history", []))
+                if event.get("event") == "decision-resolved"
+                and event.get("receipt_digest") == receipt_digest
+            ),
+            None,
+        )
+        if prior:
+            emit({"ticket": key, "state": ticket["state"], "duplicate": True})
+            return
+        if ticket.get("state") != "operator_decision":
+            raise SprintError(
+                f"ticket {key} cannot resolve a decision from state {ticket.get('state')}"
+            )
+        classification = ticket.get("terminal_classification") or {}
+        if classification.get("kind") != "operator_decision":
+            raise SprintError(
+                "legacy or scoping decisions must use repository decision policy"
+            )
+        if classification.get("decision_class") != decision_class:
+            raise SprintError("decision receipt class does not match the parked decision")
+        require_worker_stopped(ticket, operator_capability(args), cfg)
+        previous_reason = ticket.get("reason", "")
+        ticket["state"] = "pending"
+        ticket["reason"] = reason
+        ticket["next_launch_continuation"] = bool(ticket.get("pr") or ticket.get("branch"))
+        _clear_finished_execution(ticket)
+        classification["resolved"] = {
+            "receipt_digest": receipt_digest,
+            "reason": reason,
+        }
+        ticket.setdefault("history", []).append(
+            {
+                "at": now(),
+                "event": "decision-resolved",
+                "decision_class": decision_class,
+                "receipt_digest": receipt_digest,
+                "previous_reason": previous_reason,
+                "reason": reason,
+            }
+        )
+        save(path, state)
+    emit({"ticket": key, "state": "pending", "duplicate": False})
 
 
 def requeue(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
@@ -5703,7 +5915,28 @@ def parser() -> argparse.ArgumentParser:
     finish_parser.add_argument("--branch", default="")
     finish_parser.add_argument("--pr", default="")
     finish_parser.add_argument("--attempt-token", required=True)
+    finish_parser.add_argument("--decision-class", default="")
+    finish_parser.add_argument("--decision-question", default="")
+    finish_parser.add_argument("--external-dependency", action="append", default=[])
+    finish_parser.add_argument("--external-dependency-receipt", default="")
     finish_parser.set_defaults(func=finish)
+    decision_parser = commands.add_parser(
+        "resolve-decision",
+        help="apply one operator receipt to one classified parked ticket",
+    )
+    decision_parser.add_argument("--sprint", required=True)
+    decision_parser.add_argument("--ticket", required=True)
+    decision_parser.add_argument(
+        "--decision-class", choices=sorted(OPERATOR_DECISION_CLASSES), required=True
+    )
+    decision_parser.add_argument("--decision-receipt", required=True)
+    decision_parser.add_argument("--reason", required=True)
+    decision_capability = decision_parser.add_mutually_exclusive_group()
+    decision_capability.add_argument("--operator-capability")
+    decision_capability.add_argument(
+        "--operator-capability-stdin", action="store_true"
+    )
+    decision_parser.set_defaults(func=resolve_decision)
     scope_parser = commands.add_parser(
         "record-scope", help="record a structured readiness/decomposition assessment"
     )
