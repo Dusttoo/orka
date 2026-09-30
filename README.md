@@ -430,8 +430,12 @@ Recovery decisions use the versioned
 [`orka.recovery-eligibility/v1`](docs/recovery-eligibility-contract.md)
 contract. Host observers normalize execution, provider, worktree, revision, and
 history evidence into a side-effect-free evaluator that returns `eligible`,
-`waiting`, or `operator_action` with stable reason codes. Eligibility alone
-never grants budget, review, repair, or merge authority.
+`waiting`, or `operator_action` with stable reason codes. The durable supervisor
+automatically requeues an exact stopped attempt only after repeating that
+evaluation under the controller lock, proving provider settlement, and
+verifying the recovery mutation preserved attempt, spend, progress, branch,
+worktree, PR, and review history. Eligibility never grants budget, review,
+repair, or merge authority.
 
 Please report security-sensitive findings privately according to
 [SECURITY.md](SECURITY.md) and follow the [Code of Conduct](CODE_OF_CONDUCT.md).

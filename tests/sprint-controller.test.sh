@@ -300,13 +300,17 @@ kill "$PID2" 2>/dev/null || true
 wait_unit_absent 42 PROJ-2 && ok "killed worker's execution unit becomes absent within the bound" || fail_case "killed worker's execution unit becomes absent within the bound"
 run_ok "confirmed process absence permits automatic requeue" "$CONTROLLER" requeue --sprint 42 --ticket PROJ-2 --reason 'worker exited' --attempt-token "$TOKEN2"
 python3 - "$CONTROLLER_MODULE" "$TMP/repo" <<'PY' && ok "unknown unit inspection, descendant liveness, and identity reuse fail closed" || fail_case "unknown unit inspection, descendant liveness, and identity reuse fail closed"
-import importlib.util,sys
+import importlib.util,json,sys
 from pathlib import Path
 sys.path.insert(0, str(Path(sys.argv[1]).parent))
 spec=importlib.util.spec_from_file_location("sprint_controller", sys.argv[1])
 module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
-cfg={"shared_root": Path(sys.argv[2])}
-ticket={"worker_identity":{"kind":"execution_unit","pid":123,"containment":"cgroup-v2-systemd-scope"}}
+root=Path(sys.argv[2])
+cfg={"shared_root": root}
+receipt=root/".orchestration"/"contract-terminal.json"
+receipt.write_text(json.dumps({"phase":"terminal","spawned":True,"returncode":1,"invocation_id":"contract"}))
+identity={"kind":"execution_unit","pid":123,"containment":"cgroup-v2-systemd-scope","invocation_id":"contract","tombstone_path":str(receipt)}
+ticket={"key":"PROJ-2","attempts":1,"attempt_token":"attempt","run_ref":"worker","worker_identity":identity,"launch_evidence":{"status":"launched","ticket":"PROJ-2","attempt":1,"attempt_token":"attempt","invocation_id":"contract","identity":identity}}
 for status in ("unknown", "live"):
     module.execution_unit_status=lambda _identity, status=status: status
     try: module.require_worker_stopped(ticket, "", cfg)

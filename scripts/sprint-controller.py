@@ -60,6 +60,12 @@ from provider_health import (
     validate_native_command,
 )
 from context_pipeline import ContextError, llm_route_from_config
+from recovery_eligibility import (
+    SCHEMA as RECOVERY_SCHEMA,
+    RecoveryEvidenceError,
+    canonical_digest as recovery_digest,
+    evaluate_recovery,
+)
 
 from operator_authority import (
     AuthorityError,
@@ -503,6 +509,7 @@ def load(path: Path) -> dict[str, Any]:
         ticket.setdefault("attach_capability", "")
         ticket.setdefault("attached_at", "")
         ticket.setdefault("launch_evidence", {})
+        ticket.setdefault("worktree", "")
         ticket.setdefault("scope_assessment", {})
         ticket.setdefault("resolved_scope_decisions", [])
         ticket.setdefault("recovery_binding", {})
@@ -862,6 +869,7 @@ def normalized_inventory(raw: dict[str, Any], cfg: dict[str, Any]) -> dict[str, 
             "reason": reason,
             "run_ref": "",
             "branch": "",
+            "worktree": "",
             "pr": "",
             "attempts": 0,
             "continuations": 0,
@@ -1650,6 +1658,7 @@ def sync(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
                         "reason",
                         "run_ref",
                         "branch",
+                        "worktree",
                         "pr",
                         "attempts",
                         "charged_attempts",
@@ -2996,6 +3005,7 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
         if ticket["state"] == "pending" and admission_reasons[ticket["key"]]
     ]
     decomposition, repair, recovery = [], [], []
+    recovery_evaluations: dict[str, dict[str, Any]] = {}
     preserved_candidates = sorted(
         ticket["key"]
         for ticket in ordered
@@ -3089,8 +3099,29 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
             elif unit_status == "live":
                 if not reasons:
                     continue
-            elif not automatic_recovery_available(ticket, cfg, unit_status):
-                reasons.append("recovery requires external execution-unit authority")
+            else:
+                try:
+                    evaluation = automatic_recovery_evaluation(
+                        ticket,
+                        cfg,
+                        status=unit_status,
+                        spend=spend.get(key, {}),
+                    )
+                except (OSError, SprintError, RecoveryEvidenceError, AuthorityError) as exc:
+                    evaluation = {
+                        "verdict": "operator_action",
+                        "eligible": False,
+                        "reason_codes": ["observation_failed"],
+                        "reasons": [str(exc)],
+                    }
+                recovery_evaluations[key] = evaluation
+                if not evaluation["eligible"]:
+                    reasons.extend(
+                        f"recovery {evaluation['verdict']} ({code}): {reason}"
+                        for code, reason in zip(
+                            evaluation["reason_codes"], evaluation["reasons"]
+                        )
+                    )
         if reasons:
             decisions.append(
                 {"key": key, "state": status, "reasons": sorted(set(reasons))}
@@ -3227,6 +3258,7 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
         "pr_reconciliation": pr_reconciliation,
         "pr_reconciliation_requires_authority": pr_reconciliation_requires_authority,
         "recovery_waiting": recovery_waiting,
+        "recovery_evaluations": recovery_evaluations,
         "retry_waiting": retry_waiting,
         "legacy_reconciliation": legacy_reconciliation(state),
         "decision_queue": decisions,
@@ -5075,6 +5107,7 @@ def attach(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
                 "tombstone_path": evidence.get("tombstone_path", ""),
             }
         )
+        evidence["identity"] = identity
         unit_status = execution_unit_status(identity)
         if unit_status == "unknown":
             raise SprintError("controller cannot verify the launched execution unit")
@@ -5278,8 +5311,35 @@ def requeue(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         if not ticket or ticket["state"] == "completed" or ticket["state"] == "pending":
             current = ticket["state"] if ticket else "missing"
             raise SprintError(f"ticket {key} cannot be requeued from state {current}")
-        require_worker_stopped(ticket, args.operator_capability, cfg)
         require_attempt(ticket, args.attempt_token)
+        spend = usage_snapshots(cfg).get(key, {})
+        try:
+            evaluation = automatic_recovery_evaluation(ticket, cfg, spend=spend)
+        except (OSError, SprintError, RecoveryEvidenceError, AuthorityError) as exc:
+            evaluation = {
+                "verdict": "operator_action",
+                "eligible": False,
+                "reason_codes": ["observation_failed"],
+                "reasons": [str(exc)],
+            }
+        automatic = bool(evaluation["eligible"])
+        unsettled = set(evaluation.get("reason_codes") or []) & {
+            "provider_pending",
+            "provider_ambiguous",
+        }
+        if unsettled:
+            raise SprintError(
+                "automatic recovery refuses unsettled provider work: "
+                + ", ".join(sorted(unsettled))
+            )
+        if not automatic:
+            require_worker_stopped(ticket, args.operator_capability, cfg)
+        if not ticket.get("worktree"):
+            ticket["worktree"] = str(
+                (ticket.get("launch_evidence") or {}).get("worker_cwd") or ""
+            )
+        before = recovery_preservation_snapshot(ticket, spend, cfg)
+        preservation_digest = recovery_digest(before)
         ticket["state"] = "pending"
         ticket["reason"] = args.reason.strip()
         ticket["run_ref"] = ""
@@ -5317,12 +5377,22 @@ def requeue(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         ticket["attach_capability"] = ""
         ticket["attached_at"] = ""
         ticket["launch_evidence"] = {}
+        after = recovery_preservation_snapshot(ticket, spend, cfg)
+        if before != after:
+            raise SprintError(
+                "automatic recovery would violate the recovery preservation contract"
+            )
         ticket["history"].append(
             {
                 "at": now(),
                 "event": "requeued",
                 "reason": args.reason.strip(),
                 "continuation_eligible": ticket["next_launch_continuation"],
+                "automatic": automatic,
+                "recovery_verdict": evaluation["verdict"],
+                "recovery_reason_codes": evaluation["reason_codes"],
+                "recovery_evidence_digest": evaluation.get("evidence_digest", ""),
+                "preservation_digest": preservation_digest,
             }
         )
         save(path, state)
@@ -5639,50 +5709,183 @@ def recover_legacy(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
 
 
 def automatic_recovery_available(ticket, cfg, status=None):
-    """Honor strict containment or an explicitly configured cooperative contract."""
-    identity = ticket.get("worker_identity")
-    if not isinstance(identity, dict) or identity.get("kind") != "execution_unit":
-        return False
-    if (status or execution_unit_status(identity)) != "absent":
-        return False
-    if identity.get("containment") in {"cgroup-v2-systemd-scope", "test-supervisor"}:
-        return True
-    launch = ticket.get("launch_evidence") or {}
-    if (
-        identity.get("containment") != "cooperative-session"
-        or not cfg.get("cooperative_auto_recovery")
-        or not launch.get("cooperative_auto_recovery")
-        or launch.get("invocation_id") != identity.get("invocation_id")
-    ):
-        return False
+    """Return whether the current observation satisfies the recovery contract."""
     try:
-        receipt = read_json(
-            Path(identity["tombstone_path"]), label="cooperative cleanup receipt"
-        )
-        cleanup = receipt.get("cooperative_cleanup", {})
-        pgid = cleanup.get("worker_pgid")
-        if (
-            receipt.get("phase") != "terminal"
-            or (
-                receipt.get("error")
-                and (
-                    not isinstance(receipt.get("returncode"), int)
-                    or isinstance(receipt.get("returncode"), bool)
-                )
-            )
-            or receipt.get("invocation_id") != identity["invocation_id"]
-            or cleanup.get("gateway_closed") is not True
-            or not isinstance(pgid, int)
-            or isinstance(pgid, bool)
-            or pgid <= 1
-        ):
-            return False
-        os.killpg(pgid, 0)
-    except ProcessLookupError:
-        return True
-    except (KeyError, OSError, SprintError):
+        return automatic_recovery_evaluation(ticket, cfg, status=status)["eligible"]
+    except (OSError, SprintError, RecoveryEvidenceError, AuthorityError):
         return False
-    return False
+
+
+def _recovery_terminal_receipt(
+    identity: dict[str, Any],
+) -> tuple[dict[str, Any] | None, bool]:
+    """Read and authenticate the exact execution-unit terminal receipt."""
+
+    invocation_id = str(identity.get("invocation_id") or "")
+    tombstone_path = Path(str(identity.get("tombstone_path") or ""))
+    if not invocation_id or not tombstone_path.is_file():
+        return None, False
+    try:
+        receipt = read_json(tombstone_path, label="recovery terminal receipt")
+    except (OSError, SprintError):
+        return None, False
+    valid_return = isinstance(receipt.get("returncode"), int) and not isinstance(
+        receipt.get("returncode"), bool
+    )
+    authenticated = bool(
+        receipt.get("phase") == "terminal"
+        and receipt.get("spawned") is True
+        and receipt.get("invocation_id") == invocation_id
+        and valid_return
+    )
+    return receipt, authenticated
+
+
+def _review_preservation_snapshot(cfg: dict[str, Any], key: str) -> dict[str, Any]:
+    """Digest ticket-owned review findings and generation history."""
+
+    findings: dict[str, str] = {}
+    generations: dict[str, str] = {}
+    directory = cfg["shared_root"] / ".orchestration/.review-ledger"
+    if not directory.is_dir():
+        return {"findings": findings, "generations": generations}
+    for path in sorted(directory.glob("*.json")):
+        try:
+            value = read_json(path, label="review preservation ledger")
+        except (OSError, SprintError):
+            continue
+        subject = value.get("work_subject") or {}
+        if str(subject.get("id") or "").strip().upper() != key:
+            continue
+        relative = str(path.relative_to(cfg["shared_root"]))
+        findings[relative] = recovery_digest(value.get("components") or {})
+        generations[relative] = recovery_digest(
+            {
+                "review_generations": value.get("review_generations") or [],
+                "repair_attempts": value.get("repair_attempts") or [],
+                "escalations": value.get("escalations") or [],
+            }
+        )
+    return {"findings": findings, "generations": generations}
+
+
+def recovery_preservation_snapshot(
+    ticket: dict[str, Any], spend: dict[str, Any], cfg: dict[str, Any]
+) -> dict[str, Any]:
+    """Capture every state class that an automatic requeue must preserve."""
+
+    launch = ticket.get("launch_evidence") or {}
+    review = _review_preservation_snapshot(cfg, str(ticket.get("key") or ""))
+    return {
+        "attempts": int(ticket.get("attempts") or 0),
+        "spend": spend,
+        "progress": ticket.get("progress") or [],
+        "branch": str(ticket.get("branch") or ""),
+        "worktree": str(ticket.get("worktree") or launch.get("worker_cwd") or ""),
+        "pr": str(ticket.get("pr") or ""),
+        "review_findings": review["findings"],
+        "review_generation": review["generations"],
+    }
+
+
+def automatic_recovery_evaluation(
+    ticket: dict[str, Any],
+    cfg: dict[str, Any],
+    *,
+    status: str | None = None,
+    spend: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Observe one stopped attempt and evaluate it without mutating state."""
+
+    identity = ticket.get("worker_identity")
+    identity = identity if isinstance(identity, dict) else {}
+    launch = ticket.get("launch_evidence")
+    launch = launch if isinstance(launch, dict) else {}
+    invocation_id = str(identity.get("invocation_id") or "")
+    containment = str(identity.get("containment") or "")
+    profile = (
+        "isolated"
+        if containment in {"cgroup-v2-systemd-scope", "test-supervisor"}
+        else "cooperative"
+    )
+    observed_status = (
+        status
+        if status in {"live", "absent", "unknown"}
+        else execution_unit_status(identity)
+        if identity.get("kind") == "execution_unit"
+        else "unknown"
+    )
+    receipt, terminal_receipt = _recovery_terminal_receipt(identity)
+    identity_bound = bool(
+        identity.get("kind") == "execution_unit"
+        and invocation_id
+        and launch.get("invocation_id") == invocation_id
+        and launch.get("identity") == identity
+        and launch.get("status") == "launched"
+        and launch.get("ticket") == ticket.get("key")
+        and int(ticket.get("attempts") or 0) > 0
+        and int(launch.get("attempt") or 0) == int(ticket.get("attempts") or 0)
+        and launch.get("attempt_token") == ticket.get("attempt_token")
+        and ticket.get("attempt_token")
+        and ticket.get("run_ref")
+    )
+    descendants = "unknown"
+    cleanup_complete = False
+    cooperative_authorized = bool(
+        containment == "cooperative-session"
+        and cfg.get("cooperative_auto_recovery")
+        and launch.get("cooperative_auto_recovery")
+    )
+    if observed_status == "live":
+        descendants = "live"
+    elif observed_status == "absent" and terminal_receipt:
+        if profile == "isolated":
+            descendants = "absent"
+        else:
+            cleanup = (receipt or {}).get("cooperative_cleanup") or {}
+            pgid = cleanup.get("worker_pgid")
+            if (
+                cleanup.get("gateway_closed") is True
+                and isinstance(pgid, int)
+                and not isinstance(pgid, bool)
+                and pgid > 1
+            ):
+                try:
+                    os.killpg(pgid, 0)
+                except ProcessLookupError:
+                    cleanup_complete = True
+                    descendants = "absent"
+                except OSError:
+                    descendants = "unknown"
+                else:
+                    descendants = "live"
+
+    spend = spend if spend is not None else usage_snapshots(cfg).get(ticket.get("key"), {})
+    provider_state = "pending" if float(spend.get("reserved_usd") or 0) > 0 else "settled"
+    preservation = recovery_preservation_snapshot(ticket, spend, cfg)
+    evidence = {
+        "schema": RECOVERY_SCHEMA,
+        "profile": profile,
+        "execution": {
+            "status": observed_status,
+            "identity_bound": identity_bound,
+            "terminal_receipt": terminal_receipt,
+            "descendants": descendants,
+            "cooperative_authorized": cooperative_authorized,
+            "cleanup_complete": cleanup_complete,
+        },
+        "provider": {"state": provider_state},
+        "work": {
+            "kind": "attempt",
+            "binding_complete": identity_bound,
+            "worktree": "not_applicable",
+            "revision_match": True,
+        },
+        "history": {"preserved_fields": list(preservation)},
+    }
+    result = evaluate_recovery(evidence)
+    result["preservation_digest"] = recovery_digest(preservation)
+    return result
 
 
 def require_worker_stopped(

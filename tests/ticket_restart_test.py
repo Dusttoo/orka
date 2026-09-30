@@ -74,6 +74,7 @@ class RestartTests(unittest.TestCase):
         self.ticket.update(
             state="running",
             attempts=3,
+            run_ref="worker",
             attached_at="",
             attach_capability="attach",
             launch_evidence={
@@ -105,6 +106,8 @@ class RestartTests(unittest.TestCase):
 
         tombstone.write_text(json.dumps({
             "phase": "terminal",
+            "spawned": True,
+            "returncode": 1,
             "invocation_id": "invocation",
             "cooperative_cleanup": {"worker_pgid": 43210, "gateway_closed": True},
         }))
