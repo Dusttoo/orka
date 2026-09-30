@@ -246,6 +246,12 @@ remains an operator decision; Orka does not fabricate execution authority.
 
 ## Recovery invariant
 
+The shared evidence vocabulary, trust profiles, stable reason codes, and
+history-preservation requirements are defined by the
+[`orka.recovery-eligibility/v1`](recovery-eligibility-contract.md) contract.
+Eligibility evaluation is side-effect free; controller mutation must revalidate
+the observed evidence under its checkpoint lock.
+
 The controller never admits a new ticket while the running count is at or above
 `concurrency_max`. If configuration is lowered below an existing running count,
 it reports `over_capacity` and waits instead of killing or launching work. A

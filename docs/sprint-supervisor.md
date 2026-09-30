@@ -169,7 +169,11 @@ Active jobs written by an earlier 1.x supervisor receive only the deterministic
 automatic claim set on first 1.8.8 admission pass; their attempts and execution
 identity are not changed.
 
-Restart does not invent missing worker or provider receipts. Ambiguous launches
+Restart does not invent missing worker or provider receipts. Recovery evidence
+is classified by the
+[`orka.recovery-eligibility/v1`](recovery-eligibility-contract.md) contract;
+later automatic-recovery slices will consume eligible verdicts transactionally.
+Ambiguous launches
 remain fenced for reconciliation, and preserved-PR recovery still requires its
 existing controller authority. No review, security, budget, or merge gate is
 weakened.

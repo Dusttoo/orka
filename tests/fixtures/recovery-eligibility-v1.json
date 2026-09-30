@@ -1,0 +1,93 @@
+[
+  {
+    "name": "isolated execution is eligible",
+    "expected_verdict": "eligible",
+    "expected_reasons": [],
+    "evidence": {
+      "schema": "orka.recovery-eligibility/v1",
+      "profile": "isolated",
+      "execution": {"status": "absent", "identity_bound": true, "terminal_receipt": true, "descendants": "absent", "cooperative_authorized": false, "cleanup_complete": false},
+      "provider": {"state": "settled"},
+      "work": {"kind": "attempt", "binding_complete": true, "worktree": "not_applicable", "revision_match": true},
+      "history": {"preserved_fields": ["attempts", "spend", "progress", "branch", "worktree", "pr", "review_findings", "review_generation"]}
+    }
+  },
+  {
+    "name": "live execution waits",
+    "expected_verdict": "waiting",
+    "expected_reasons": ["execution_live"],
+    "evidence": {
+      "schema": "orka.recovery-eligibility/v1",
+      "profile": "isolated",
+      "execution": {"status": "live", "identity_bound": true, "terminal_receipt": true, "descendants": "absent", "cooperative_authorized": false, "cleanup_complete": false},
+      "provider": {"state": "settled"},
+      "work": {"kind": "attempt", "binding_complete": true, "worktree": "not_applicable", "revision_match": true},
+      "history": {"preserved_fields": ["attempts", "spend", "progress", "branch", "worktree", "pr", "review_findings", "review_generation"]}
+    }
+  },
+  {
+    "name": "unknown execution needs operator",
+    "expected_verdict": "operator_action",
+    "expected_reasons": ["execution_unknown", "descendants_unknown"],
+    "evidence": {
+      "schema": "orka.recovery-eligibility/v1",
+      "profile": "isolated",
+      "execution": {"status": "unknown", "identity_bound": true, "terminal_receipt": true, "descendants": "unknown", "cooperative_authorized": false, "cleanup_complete": false},
+      "provider": {"state": "settled"},
+      "work": {"kind": "attempt", "binding_complete": true, "worktree": "not_applicable", "revision_match": true},
+      "history": {"preserved_fields": ["attempts", "spend", "progress", "branch", "worktree", "pr", "review_findings", "review_generation"]}
+    }
+  },
+  {
+    "name": "pending provider work waits",
+    "expected_verdict": "waiting",
+    "expected_reasons": ["provider_pending"],
+    "evidence": {
+      "schema": "orka.recovery-eligibility/v1",
+      "profile": "isolated",
+      "execution": {"status": "absent", "identity_bound": true, "terminal_receipt": true, "descendants": "absent", "cooperative_authorized": false, "cleanup_complete": false},
+      "provider": {"state": "pending"},
+      "work": {"kind": "attempt", "binding_complete": true, "worktree": "not_applicable", "revision_match": true},
+      "history": {"preserved_fields": ["attempts", "spend", "progress", "branch", "worktree", "pr", "review_findings", "review_generation"]}
+    }
+  },
+  {
+    "name": "cooperative cleanup must be explicit",
+    "expected_verdict": "operator_action",
+    "expected_reasons": ["cooperative_not_authorized", "cooperative_cleanup_incomplete"],
+    "evidence": {
+      "schema": "orka.recovery-eligibility/v1",
+      "profile": "cooperative",
+      "execution": {"status": "absent", "identity_bound": true, "terminal_receipt": true, "descendants": "absent", "cooperative_authorized": false, "cleanup_complete": false},
+      "provider": {"state": "settled"},
+      "work": {"kind": "attempt", "binding_complete": true, "worktree": "not_applicable", "revision_match": true},
+      "history": {"preserved_fields": ["attempts", "spend", "progress", "branch", "worktree", "pr", "review_findings", "review_generation"]}
+    }
+  },
+  {
+    "name": "dirty stale preserved PR needs operator",
+    "expected_verdict": "operator_action",
+    "expected_reasons": ["worktree_dirty", "revision_mismatch"],
+    "evidence": {
+      "schema": "orka.recovery-eligibility/v1",
+      "profile": "isolated",
+      "execution": {"status": "absent", "identity_bound": true, "terminal_receipt": true, "descendants": "absent", "cooperative_authorized": false, "cleanup_complete": false},
+      "provider": {"state": "settled"},
+      "work": {"kind": "preserved_pr", "binding_complete": true, "worktree": "dirty", "revision_match": false},
+      "history": {"preserved_fields": ["attempts", "spend", "progress", "branch", "worktree", "pr", "review_findings", "review_generation"]}
+    }
+  },
+  {
+    "name": "missing history is never eligible",
+    "expected_verdict": "operator_action",
+    "expected_reasons": ["history_incomplete"],
+    "evidence": {
+      "schema": "orka.recovery-eligibility/v1",
+      "profile": "isolated",
+      "execution": {"status": "absent", "identity_bound": true, "terminal_receipt": true, "descendants": "absent", "cooperative_authorized": false, "cleanup_complete": false},
+      "provider": {"state": "settled"},
+      "work": {"kind": "preserved_pr", "binding_complete": true, "worktree": "clean", "revision_match": true},
+      "history": {"preserved_fields": ["attempts", "spend", "branch", "worktree", "pr"]}
+    }
+  }
+]

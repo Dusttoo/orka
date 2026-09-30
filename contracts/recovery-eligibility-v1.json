@@ -1,0 +1,76 @@
+{
+  "schema": "orka.recovery-eligibility/v1",
+  "description": "Side-effect-free eligibility contract for dead-worker and preserved-PR recovery.",
+  "profiles": {
+    "isolated": {
+      "description": "A host-isolated execution unit whose complete process boundary can be inspected.",
+      "requires": [
+        "execution.status=absent",
+        "execution.identity_bound=true",
+        "execution.terminal_receipt=true",
+        "execution.descendants=absent"
+      ]
+    },
+    "cooperative": {
+      "description": "A cooperative session whose no-escape assumption was explicitly accepted at launch and recovery.",
+      "requires": [
+        "execution.status=absent",
+        "execution.identity_bound=true",
+        "execution.terminal_receipt=true",
+        "execution.descendants=absent",
+        "execution.cooperative_authorized=true",
+        "execution.cleanup_complete=true"
+      ]
+    }
+  },
+  "work_kinds": {
+    "attempt": "A stopped execution attempt with no preserved PR requirement.",
+    "preserved_pr": "An authenticated existing PR whose clean, quiescent worktree and revisions remain exact."
+  },
+  "common_requirements": [
+    "provider.state=settled",
+    "work.binding_complete=true",
+    "work.revision_match=true",
+    "history contains every preservation invariant"
+  ],
+  "verdicts": {
+    "eligible": "All required evidence is exact, settled, and safe for a later transactional recovery mutation.",
+    "waiting": "Evidence is authoritative but a live or pending condition has not completed.",
+    "operator_action": "Evidence is missing, ambiguous, mismatched, dirty, or outside the declared trust profile."
+  },
+  "reason_codes": {
+    "execution_live": "waiting",
+    "execution_unknown": "operator_action",
+    "execution_identity_mismatch": "operator_action",
+    "terminal_receipt_missing": "operator_action",
+    "descendants_live": "waiting",
+    "descendants_unknown": "operator_action",
+    "cooperative_not_authorized": "operator_action",
+    "cooperative_cleanup_incomplete": "operator_action",
+    "provider_pending": "waiting",
+    "provider_ambiguous": "operator_action",
+    "binding_incomplete": "operator_action",
+    "worktree_active": "waiting",
+    "worktree_dirty": "operator_action",
+    "worktree_unknown": "operator_action",
+    "worktree_missing": "operator_action",
+    "revision_mismatch": "operator_action",
+    "history_incomplete": "operator_action"
+  },
+  "preservation_invariants": [
+    "attempts",
+    "spend",
+    "progress",
+    "branch",
+    "worktree",
+    "pr",
+    "review_findings",
+    "review_generation"
+  ],
+  "mutation_policy": {
+    "evaluation_is_side_effect_free": true,
+    "eligibility_does_not_grant_budget_or_gate_authority": true,
+    "ambiguous_external_side_effects_require_operator_action": true,
+    "later_mutation_must_revalidate_under_controller_lock": true
+  }
+}
