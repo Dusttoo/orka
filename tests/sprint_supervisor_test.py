@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 import sys
 
@@ -23,6 +24,12 @@ from supervisor_planning import (  # noqa: E402
     due_health_roles,
     planning_cycle,
 )
+
+SUPERVISOR_SPEC = __import__("importlib.util").util.spec_from_file_location(
+    "sprint_supervisor", SUPERVISOR
+)
+sprint_supervisor = __import__("importlib.util").util.module_from_spec(SUPERVISOR_SPEC)
+SUPERVISOR_SPEC.loader.exec_module(sprint_supervisor)
 
 
 class FakePlanningAdapter:
@@ -157,6 +164,47 @@ class PlanningLoopTests(unittest.TestCase):
             )
         finally:
             shutil.rmtree(repository, ignore_errors=True)
+
+    def test_status_separates_queue_retry_parking_and_active_lanes(self) -> None:
+        state = {
+            "repository": "/tmp/repo",
+            "lifecycle_state": "active",
+            "lease": {"id": "lease", "generation": 1},
+            "process": {},
+            "updated_at": "now",
+            "last_event": "controller_plan_updated",
+            "planning": {
+                "enabled": True,
+                "plan": {
+                    "launch": ["PNP-5"],
+                    "scope": [],
+                    "decomposition": ["PNP-6"],
+                    "repair": [],
+                    "recovery": [],
+                },
+                "retry_waiting": [{"key": "PNP-2", "retry_at": 200}],
+                "decision_queue": [{"key": "PNP-3", "state": "operator_decision"}],
+                "waiting": [{"key": "PNP-4", "reasons": ["dependency"]}],
+            },
+            "dispatch": {
+                "jobs": {
+                    "run-1": {"ticket": "PNP-1", "state": "running"},
+                    "run-2": {"ticket": "PNP-2", "state": "retry_wait"},
+                    "run-3": {"ticket": "PNP-3", "state": "parked_decision"},
+                },
+                "launch_count": 3,
+                "terminal_count": 2,
+            },
+        }
+        with patch.object(
+            sprint_supervisor, "process_status", return_value="live"
+        ):
+            result = sprint_supervisor.status_response(state)
+        self.assertEqual(result["dispatch"]["active_jobs"], 1)
+        self.assertEqual(result["dispatch"]["queued"], ["PNP-5", "PNP-6"])
+        self.assertEqual(result["dispatch"]["retrying"], ["PNP-2"])
+        self.assertEqual(result["dispatch"]["parked"], ["PNP-3"])
+        self.assertEqual(result["dispatch"]["blocked"], ["PNP-4"])
 
 
 class SupervisorProcessTests(unittest.TestCase):

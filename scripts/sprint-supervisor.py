@@ -63,6 +63,7 @@ SUPERVISOR_STATES = {
     "takeover_pending",
     "stopped",
 }
+ACTIVE_JOB_STATES = {"running", "reserved", "launch_uncertain"}
 
 
 def now() -> str:
@@ -384,20 +385,48 @@ def status_response(state: dict[str, Any]) -> dict[str, Any]:
     result["lease_release_count"] = (state.get("lease") or {}).get("release_count", 0)
     result["planning"] = state.get("planning") or {"enabled": False}
     dispatch = state.get("dispatch") or {}
+    jobs = dispatch.get("jobs") or {}
+    job_states: dict[str, list[str]] = {}
+    for job in jobs.values():
+        job_states.setdefault(str(job.get("state") or "unknown"), []).append(
+            str(job.get("ticket") or "")
+        )
+    for tickets in job_states.values():
+        tickets.sort()
+    planning = state.get("planning") or {"enabled": False}
     result["dispatch"] = {
         "active_jobs": sum(
             1
-            for job in (dispatch.get("jobs") or {}).values()
-            if job.get("state") in {"running", "reserved", "launch_uncertain"}
+            for job in jobs.values()
+            if job.get("state") in ACTIVE_JOB_STATES
         ),
         "terminal_jobs": sum(
             1
-            for job in (dispatch.get("jobs") or {}).values()
-            if job.get("state")
-            not in {"running", "reserved", "launch_uncertain"}
+            for job in jobs.values()
+            if job.get("state") not in ACTIVE_JOB_STATES
         ),
         "launch_count": int(dispatch.get("launch_count") or 0),
         "terminal_count": int(dispatch.get("terminal_count") or 0),
+        "job_states": job_states,
+        "queued": sorted(
+            {
+                ticket
+                for action in ("launch", "scope", "decomposition", "repair", "recovery")
+                for ticket in ((planning.get("plan") or {}).get(action) or [])
+            }
+        ),
+        "retrying": sorted(
+            str(item.get("key") or "")
+            for item in planning.get("retry_waiting") or []
+        ),
+        "parked": sorted(
+            str(item.get("key") or "")
+            for item in planning.get("decision_queue") or []
+        ),
+        "blocked": sorted(
+            str(item.get("key") or "")
+            for item in planning.get("waiting") or []
+        ),
     }
     return result
 
@@ -428,11 +457,21 @@ def planning_settings(repository: Path) -> dict[str, Any]:
         raise SupervisorError("concurrency_max must be a positive integer") from exc
     if isinstance(raw_concurrency, bool) or str(concurrency) != str(raw_concurrency) or concurrency < 1:
         raise SupervisorError("concurrency_max must be a positive integer")
+    raw_retry_delay = config.get("supervisor_ticket_retry_seconds", 30)
+    try:
+        retry_delay = float(raw_retry_delay)
+    except (TypeError, ValueError) as exc:
+        raise SupervisorError("supervisor_ticket_retry_seconds must be numeric") from exc
+    if retry_delay < 5 or retry_delay > 3600:
+        raise SupervisorError(
+            "supervisor_ticket_retry_seconds must be from 5 through 3600"
+        )
     return {
         "enabled": bool(configured),
         "requested_sprint": configured,
         "sync_interval_seconds": interval,
         "concurrency_max": concurrency,
+        "ticket_retry_seconds": retry_delay,
     }
 
 
@@ -490,7 +529,7 @@ def apply_control(
         active = sum(
             1
             for job in ((state.get("dispatch") or {}).get("jobs") or {}).values()
-            if job.get("state") in {"running", "reserved", "launch_uncertain"}
+            if job.get("state") in ACTIVE_JOB_STATES
         )
         if active == 0:
             lifecycle.transition(
@@ -741,7 +780,12 @@ def run_daemon(repository: Path, handshake: Path) -> int:
         should_stop = False
         integrity_due = time.time()
         dispatcher = SupervisorDispatcher(
-            repository, paths["directory"], CONTRACT_PATH
+            repository,
+            paths["directory"],
+            CONTRACT_PATH,
+            retry_delay_seconds=float(
+                (state.get("planning") or {}).get("ticket_retry_seconds") or 30
+            ),
         )
         while not should_stop:
             if signal_number:
@@ -791,6 +835,27 @@ def run_daemon(repository: Path, handshake: Path) -> int:
             planning = state.get("planning") or {}
             dispatch = state.get("dispatch") or {}
             jobs = dispatch.setdefault("jobs", {})
+            awakened = dispatcher.wake_due_retries(jobs, current_time=current_time)
+            if awakened:
+                planning["next_wake_epoch"] = 0.0
+                for job in awakened:
+                    state.setdefault("history", []).append(
+                        {
+                            "at": now(),
+                            "event": "ticket_retry_woken",
+                            "from": state["lifecycle_state"],
+                            "to": state["lifecycle_state"],
+                            "evidence": {
+                                "ticket": job["ticket"],
+                                "run_ref": job["run_ref"],
+                                "timer_id": (job.get("terminal") or {}).get(
+                                    "timer_id"
+                                ),
+                            },
+                        }
+                    )
+                state["history"] = state["history"][-256:]
+                persist_state()
             terminal_applied = False
             for run_ref, job in list(jobs.items()):
                 if job.get("state") != "running":
@@ -860,7 +925,7 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                 active = sum(
                     1
                     for job in jobs.values()
-                    if job.get("state") in {"running", "reserved", "launch_uncertain"}
+                    if job.get("state") in ACTIVE_JOB_STATES
                 )
                 if active == 0:
                     lifecycle.transition(
@@ -1020,12 +1085,54 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                         # resume now that the hard blocker is gone.
                         planning["pause_cause"] = ""
                     if state["lifecycle_state"] in {"active", "degraded"}:
-                        launched = dispatcher.fill(
-                            str((snapshot.get("sprint") or {}).get("id") or ""),
-                            list((snapshot.get("plan") or {}).get("launch") or []),
-                            jobs,
-                            int(planning.get("concurrency_max") or 1),
+                        sprint_id = str(
+                            (snapshot.get("sprint") or {}).get("id") or ""
                         )
+                        action_plan = {
+                            name: list(values or [])
+                            for name, values in (snapshot.get("plan") or {}).items()
+                        }
+                        local_retry_holds = {
+                            str(job.get("ticket") or "")
+                            for job in jobs.values()
+                            if job.get("state") == "retry_wait"
+                        }
+                        action_plan["recovery"] = [
+                            ticket
+                            for ticket in action_plan.get("recovery", [])
+                            if ticket not in local_retry_holds
+                        ]
+                        continuation_actions = bool(
+                            action_plan.get("repair") or action_plan.get("recovery")
+                        )
+                        if continuation_actions:
+                            dispatcher.last_errors = []
+                            prepared = dispatcher.prepare_continuations(
+                                sprint_id, action_plan, jobs
+                            )
+                            launched = []
+                            if prepared:
+                                planning["next_wake_epoch"] = 0.0
+                                for job in prepared:
+                                    state.setdefault("history", []).append(
+                                        {
+                                            "at": now(),
+                                            "event": "ticket_continuation_queued",
+                                            "from": state["lifecycle_state"],
+                                            "to": state["lifecycle_state"],
+                                            "evidence": {
+                                                "ticket": job["ticket"],
+                                                "run_ref": job["run_ref"],
+                                            },
+                                        }
+                                    )
+                        else:
+                            launched = dispatcher.fill(
+                                sprint_id,
+                                list(action_plan.get("launch") or []),
+                                jobs,
+                                int(planning.get("concurrency_max") or 1),
+                            )
                         for failure in dispatcher.last_errors:
                             dispatch["last_error"] = failure["error"]
                             state.setdefault("history", []).append(
@@ -1091,6 +1198,12 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                     persist_state()
 
             deadlines = [integrity_due]
+            deadlines.extend(
+                float((job.get("terminal") or {}).get("retry_at"))
+                for job in jobs.values()
+                if job.get("state") == "retry_wait"
+                and isinstance((job.get("terminal") or {}).get("retry_at"), (int, float))
+            )
             if planning.get("enabled") and (
                 state.get("lifecycle_state") in {"active", "degraded"} or system_pause
             ):
@@ -1288,6 +1401,69 @@ def control(args: argparse.Namespace) -> None:
     emit(result)
 
 
+def resolve_decision_command(args: argparse.Namespace) -> None:
+    """Resolve one contract-classified ticket without disturbing other lanes."""
+
+    repository = resolve_repository(args.repo)
+    settings = planning_settings(repository)
+    sprint = str(args.sprint or settings.get("requested_sprint") or "").strip()
+    if not sprint:
+        raise SupervisorError("resolve-decision requires a configured or explicit sprint")
+    contract_value, _lifecycle, _digest = contract()
+    allowed = {
+        item.get("class")
+        for item in contract_value.get("operator_only_decisions", [])
+        if isinstance(item, dict)
+    }
+    if args.decision_class not in allowed:
+        raise SupervisorError("decision class is not permitted by the lifecycle contract")
+    operator_token = ""
+    if args.operator_capability_stdin:
+        operator_token = sys.stdin.readline().strip()
+        if not operator_token:
+            raise SupervisorError("operator capability stdin was empty")
+    elif args.operator_capability:
+        operator_token = args.operator_capability
+    controller = Path(__file__).with_name("sprint-controller.py")
+    command = [
+        sys.executable,
+        str(controller),
+        "resolve-decision",
+        "--sprint",
+        sprint,
+        "--ticket",
+        args.ticket,
+        "--decision-class",
+        args.decision_class,
+        "--decision-receipt",
+        args.decision_receipt,
+        "--reason",
+        args.reason,
+    ]
+    if operator_token:
+        command.append("--operator-capability-stdin")
+    try:
+        result = subprocess.run(
+            command,
+            cwd=repository,
+            capture_output=True,
+            text=True,
+            input=f"{operator_token}\n" if operator_token else None,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise SupervisorError(f"cannot resolve ticket decision: {exc}") from exc
+    if result.returncode != 0:
+        raise SupervisorError(
+            (result.stderr or result.stdout or "decision resolution failed").strip()
+        )
+    try:
+        response = json.loads(result.stdout.splitlines()[-1])
+    except (IndexError, json.JSONDecodeError) as exc:
+        raise SupervisorError("controller returned malformed decision output") from exc
+    emit(response)
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     commands = result.add_subparsers(dest="command", required=True)
@@ -1310,6 +1486,23 @@ def parser() -> argparse.ArgumentParser:
         command.add_argument("--reason")
         command.add_argument("--timeout", type=bounded_timeout, default=5.0)
         command.set_defaults(func=control)
+
+    decision = commands.add_parser(
+        "resolve-decision",
+        help="resolve one contract-classified parked ticket",
+    )
+    decision.add_argument("--repo")
+    decision.add_argument("--sprint")
+    decision.add_argument("--ticket", required=True)
+    decision.add_argument("--decision-class", required=True)
+    decision.add_argument("--decision-receipt", required=True)
+    decision.add_argument("--reason", required=True)
+    decision_capability = decision.add_mutually_exclusive_group()
+    decision_capability.add_argument("--operator-capability")
+    decision_capability.add_argument(
+        "--operator-capability-stdin", action="store_true"
+    )
+    decision.set_defaults(func=resolve_decision_command)
 
     internal = commands.add_parser("_run", help=argparse.SUPPRESS)
     internal.add_argument("--repo", required=True)

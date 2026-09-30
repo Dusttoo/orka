@@ -355,6 +355,9 @@ sprint_id: active
 # model tokens while waiting. Existing repositories may omit this key; 60
 # seconds is the compatible default.
 supervisor_sync_interval_seconds: 60
+# Ticket-local no-progress timeouts wait durably before the supervisor retries
+# that ticket. Parked work consumes no lane while unrelated work continues.
+supervisor_ticket_retry_seconds: 30
 # Canonical credential trust anchor. This must be repository policy, never a
 # caller-selected environment value. Credentials never go here: export them or
 # set JIRA_API_TOKEN in the gitignored, chmod 600 .orchestration/.env of the

@@ -1,6 +1,6 @@
 # Host-owned sprint supervisor
 
-Orka 1.8.5 extends the detached Orka 2 supervisor with a deterministic outer
+Orka 1.8.6 extends the detached Orka 2 supervisor with a deterministic outer
 planning loop. The host process owns one repository lease, synchronizes through
 the existing authenticated Jira/GitHub/controller/provider adapters, publishes
 controller-authorized work, fills available lanes through controller-owned
@@ -39,6 +39,11 @@ python3 "$ORKA_ROOT/scripts/sprint-supervisor.py" status
 python3 "$ORKA_ROOT/scripts/sprint-supervisor.py" pause --request-id maintenance-1
 python3 "$ORKA_ROOT/scripts/sprint-supervisor.py" resume --request-id maintenance-2
 python3 "$ORKA_ROOT/scripts/sprint-supervisor.py" drain --request-id maintenance-3
+python3 "$ORKA_ROOT/scripts/sprint-supervisor.py" resolve-decision \
+  --ticket PROJ-123 \
+  --decision-class product_or_security_policy \
+  --decision-receipt "decision-record-id" \
+  --reason "approved repository policy"
 python3 "$ORKA_ROOT/scripts/sprint-supervisor.py" stop \
   --request-id maintenance-4 --reason "operator maintenance"
 ```
@@ -78,9 +83,8 @@ provider-health adapter and a failed route remains durable, waitable work.
 - `pause` records `active -> paused` and suspends planning.
 - `resume` records `paused -> active` and immediately replans. It cannot bypass
   a hard sprint budget or an all-routes-unavailable pause.
-- `drain` records `active -> draining -> paused`. This slice owns no jobs, so
-  the active job count is mechanically zero; dispatch will later delay
-  `drain_completed` until its authenticated running set is empty.
+- `drain` records `active -> draining -> paused` and delays `drain_completed`
+  until its authenticated running set is empty.
 - `stop` records the global `operator_stopped` transition, returns a response,
   closes the control socket, and releases the lease exactly once.
 - replacing or unlinking the named lease inode records `lease_lost` and stops
@@ -101,6 +105,25 @@ and immediately replans when a lane exits. Duplicate delivery is a journaled
 no-op; stale bindings are rejected; malformed or missing output moves only that
 ticket to recovery-ready.
 
+`status` separates active, queued, retrying, parked, blocked, and terminal job
+sets. A no-progress timeout enters a durable retry wait for
+`supervisor_ticket_retry_seconds` (default 30) and consumes no lane. Once its
+deadline arrives, the supervisor requeues only that exact stopped attempt and
+immediately replans. Controller-authorized repair and recovery continuations are
+returned to the launch queue without holding unrelated capacity.
+
+An `external_blocked` result must identify Jira dependency keys already present
+in the authenticated ticket relation graph. Fresh Jira synchronization wakes the
+ticket only after every named dependency is complete and the prior execution is
+proven absent. Other external holds remain parked. `resolve-decision` accepts
+only the six decision classes in the lifecycle contract, requires a bounded
+operator receipt, preserves the ticket's branch, PR, priority, dependencies,
+history, and ledger bindings, and changes no other ticket. Scoping decisions
+continue to use the repository-owned `sprint_decisions` registry.
+If the prior worker cannot be proven absent from its authenticated tombstone,
+pipe a root-issued recovery capability through `--operator-capability-stdin`;
+the capability is never placed in the process argument list.
+
 An unclean process death leaves a nonterminal state. Automatic takeover is
 intentionally refused until issue #77 adds heartbeat, predecessor-absence, and
 split-brain proofs. This is safer than silently inventing a clean stop.
@@ -109,7 +132,8 @@ split-brain proofs. This is safer than silently inventing a clean stop.
 
 Existing Orka 1.x configuration remains valid. A repository without `sprint_id`
 continues in lifecycle-only mode. The optional
-`supervisor_sync_interval_seconds` value must be 5 through 3600 seconds.
+`supervisor_sync_interval_seconds` and `supervisor_ticket_retry_seconds` values
+must each be 5 through 3600 seconds.
 Initialization should gitignore `.orchestration/.supervisor/`.
 
 This slice does not recover a crashed supervisor, add preserved-PR recovery or

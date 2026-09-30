@@ -94,6 +94,8 @@ check "template requires explicit model pricing" \
   rg -q '^[[:space:]]+pricing:' "$ROOT/templates/config.yaml"
 check "template configures an active Jira sprint by default" \
   grep -Eq '^sprint_id:[[:space:]]*active([[:space:]]|$)' "$ROOT/templates/config.yaml"
+check "template bounds ticket-local supervisor retries" \
+  grep -Eq '^supervisor_ticket_retry_seconds:[[:space:]]*30([[:space:]]|$)' "$ROOT/templates/config.yaml"
 check "template keeps sprint checkpoints under orchestration runtime state" \
   grep -Eq '^sprint_checkpoint_dir:[[:space:]]*\.orchestration/\.sprint-state([[:space:]]|$)' "$ROOT/templates/config.yaml"
 check "template defaults captain updates to event-driven" \

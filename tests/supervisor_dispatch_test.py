@@ -27,6 +27,7 @@ class FakeAdapter:
         self.origin = origin
         self.count = 0
         self.finished: list[dict] = []
+        self.requeued: list[dict] = []
 
     def reserve(self, sprint: str, ticket: str, run_ref: str) -> dict:
         self.count += 1
@@ -60,6 +61,11 @@ class FakeAdapter:
         }
         self.finished.append(applied)
         return {"ticket": ticket, "state": applied["outcome"]}
+
+    def requeue(self, sprint: str, job: dict, reason: str) -> dict:
+        value = {"ticket": job["ticket"], "sprint": sprint, "reason": reason}
+        self.requeued.append(value)
+        return {"ticket": job["ticket"], "state": "pending"}
 
     def verify_completion(self, result: dict) -> dict:
         return {
@@ -217,7 +223,12 @@ class DispatchTests(unittest.TestCase):
             ),
             "external_blocked": (
                 "worker_external_blocked",
-                {"external_dependency_receipt": "dependency"},
+                {
+                    "external_dependency_receipt": {
+                        "dependencies": ["EXT-9"],
+                        "receipt": "jira-relation-receipt",
+                    }
+                },
             ),
             "operator_decision": (
                 "worker_operator_decision",
@@ -244,6 +255,118 @@ class DispatchTests(unittest.TestCase):
                 self.write_result(job, self.envelope(job, outcome, evidence=evidence))
                 applied = dispatcher.apply_terminal(job)
                 self.assertEqual(applied["terminal"]["event"], event)
+
+    def test_retry_wait_releases_lane_and_wakes_only_after_deadline(self) -> None:
+        jobs: dict[str, dict] = {}
+        first = self.dispatcher.fill("99", ["PNP-1"], jobs, 1)[0]
+        self.write_result(
+            first,
+            self.envelope(
+                first,
+                "timeout_without_progress",
+                evidence={"terminal_receipt": "terminal", "spend_receipt": "spend"},
+            ),
+        )
+        self.write_tombstone(first)
+        applied = self.dispatcher.apply_process_exit(first)
+        self.assertEqual(applied["terminal"]["target_state"], "retry_wait")
+        deadline = applied["terminal"]["retry_at"]
+        # The parked retry consumes no lane, so independent work starts now.
+        second = self.dispatcher.fill("99", ["PNP-2"], jobs, 1)
+        self.assertEqual([job["ticket"] for job in second], ["PNP-2"])
+        self.assertEqual(
+            self.dispatcher.wake_due_retries(jobs, current_time=deadline - 0.01), []
+        )
+        awakened = self.dispatcher.wake_due_retries(jobs, current_time=deadline)
+        self.assertEqual([job["ticket"] for job in awakened], ["PNP-1"])
+        self.assertEqual(self.adapter.requeued[-1]["ticket"], "PNP-1")
+
+    def test_failed_retry_wakeup_is_rescheduled_without_consuming_a_lane(self) -> None:
+        jobs: dict[str, dict] = {}
+        first = self.dispatcher.fill("99", ["PNP-1"], jobs, 1)[0]
+        self.write_result(
+            first,
+            self.envelope(
+                first,
+                "timeout_without_progress",
+                evidence={"terminal_receipt": "terminal", "spend_receipt": "spend"},
+            ),
+        )
+        self.write_tombstone(first)
+        applied = self.dispatcher.apply_process_exit(first)
+        deadline = applied["terminal"]["retry_at"]
+
+        def reject_requeue(_sprint, _job, _reason):
+            raise DispatchError("worker absence proof unavailable")
+
+        self.adapter.requeue = reject_requeue
+        self.assertEqual(
+            self.dispatcher.wake_due_retries(jobs, current_time=deadline), []
+        )
+        self.assertEqual(first["state"], "retry_wait")
+        self.assertEqual(
+            first["terminal"]["retry_at"],
+            deadline + self.dispatcher.retry_delay_seconds,
+        )
+        second = self.dispatcher.fill("99", ["PNP-2"], jobs, 1)
+        self.assertEqual([job["ticket"] for job in second], ["PNP-2"])
+
+    def test_external_and_decision_classification_fail_closed(self) -> None:
+        external = self.dispatcher.launch("99", "PNP-1")
+        self.write_result(
+            external,
+            self.envelope(
+                external,
+                "external_blocked",
+                evidence={"external_dependency_receipt": "unstructured"},
+            ),
+        )
+        applied = self.dispatcher.apply_terminal(external)
+        self.assertEqual(applied["terminal"]["event"], "worker_result_invalid")
+
+        decision = self.dispatcher.launch("99", "PNP-2")
+        self.write_result(
+            decision,
+            self.envelope(
+                decision,
+                "operator_decision",
+                evidence={
+                    "decision_class": "ordinary_tool_failure",
+                    "decision_question": "Retry it?",
+                },
+            ),
+        )
+        applied = self.dispatcher.apply_terminal(decision)
+        self.assertEqual(applied["terminal"]["event"], "worker_result_invalid")
+
+    def test_repair_and_recovery_are_requeued_without_blocking_each_other(self) -> None:
+        jobs: dict[str, dict] = {}
+        repair = self.dispatcher.fill("99", ["PNP-1"], jobs, 2)[0]
+        recovery = self.dispatcher.fill("99", ["PNP-2"], jobs, 2)[0]
+        for job, outcome, evidence in (
+            (
+                repair,
+                "needs_repair",
+                {"pr_identity": "45", "review_ledger_digest": "ledger"},
+            ),
+            (
+                recovery,
+                "recoverable",
+                {
+                    "terminal_receipt": "terminal",
+                    "preserved_work_identity": "worktree",
+                },
+            ),
+        ):
+            self.write_result(job, self.envelope(job, outcome, evidence=evidence))
+            self.write_tombstone(job)
+            self.dispatcher.apply_process_exit(job)
+        prepared = self.dispatcher.prepare_continuations(
+            "99", {"repair": ["PNP-1"], "recovery": ["PNP-2"]}, jobs
+        )
+        self.assertEqual([job["ticket"] for job in prepared], ["PNP-1", "PNP-2"])
+        self.assertEqual([item["ticket"] for item in self.adapter.requeued], ["PNP-1", "PNP-2"])
+        self.assertTrue(all(job["state"] == "queued" for job in prepared))
 
 
 if __name__ == "__main__":
