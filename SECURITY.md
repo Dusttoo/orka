@@ -2,9 +2,11 @@
 
 ## Supported versions
 
-Security fixes target the latest released version of Orka. Older plugin cache
-versions are immutable snapshots and should be upgraded after a fix is
-released.
+Security fixes target the current supported plugin version recorded in the
+paired manifests on `main`. Older plugin cache versions are immutable
+snapshots and should be upgraded after a fix is available. GitHub Releases are
+tagged snapshots and may trail a newly merged plugin version until its release
+is published.
 
 ## Reporting a vulnerability
 
@@ -29,4 +31,3 @@ timing with the reporter.
 
 Ordinary reliability bugs that do not expose a security boundary can use the
 public bug-report form.
-

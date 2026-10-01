@@ -26,6 +26,24 @@ small config file, and the actual engineering rules live in the target repo's
 own `CLAUDE.md` / `AGENTS.md`. The plugin itself carries no project knowledge,
 so the same harness ports across codebases.
 
+## Which version to install
+
+For a new installation, use the [Claude Code or Codex plugin instructions](#installation)
+below. The supported plugin snapshot is the version recorded in both
+[Claude Code](.claude-plugin/plugin.json) and [Codex](.codex-plugin/plugin.json)
+manifests on `main`. The Claude marketplace entry points at this repository;
+update the marketplace and plugin to pick up a newer snapshot.
+
+[GitHub Releases](https://github.com/Dusttoo/orka/releases) are tagged,
+reproducible source snapshots with release notes. GitHub's **Latest Release**
+means the newest published tag, which can trail the plugin version on `main`
+until a matching release is published. Check the manifest version when
+installing through the marketplace, and select a tag if you need a fixed source
+revision. The [release process](docs/releasing.md) explains how these versions
+are published. Orka 2.0 is still in development; the
+[durable runtime roadmap](docs/orka-2-durable-runtime.md) distinguishes shipped
+slices from the remaining cutover work.
+
 ## What Orka adds
 
 Orka 1.0 is designed to keep a long-running sprint moving without choosing
@@ -516,25 +534,31 @@ remain ticket-local failures and never authorize scheduler state changes.
 Please report security-sensitive findings privately according to
 [SECURITY.md](SECURITY.md) and follow the [Code of Conduct](CODE_OF_CONDUCT.md).
 
-## Releasing a change (every PR bumps the version)
+## Versioning and releases
 
-**Every PR MUST bump the version** in BOTH manifests, including PRs limited to
-documentation, tests, scripts, prompts, or repository tooling. Keep the bump in
-the same PR as the change:
+Every change merged into `main`, including documentation and tests, must have a
+new version in BOTH manifests. Contributors do not need to guess that version:
+the maintainer chooses it when the PR is ready to merge, after reconciling other
+open changes. The maintainer updates:
 
 - [`.claude-plugin/plugin.json`](.claude-plugin/plugin.json) (`version`)
 - [`.codex-plugin/plugin.json`](.codex-plugin/plugin.json) (`version`) -- keep the
   two in lockstep
 
-Use semver: patch for prompt/doc/script fixes, minor for new commands/skills/agents
-or behavior changes, major for breaking config or contract changes.
+The maintainer also adds `docs/releases/<version>.md` to the PR and publishes a
+matching signed tag and GitHub Release after merge. Use semver: patch for
+compatible fixes, documentation, and tests; minor for backward-compatible
+features; major for breaking configuration or contract changes. See
+[the maintainer release process](docs/releasing.md).
 
 Why this is non-optional: an installed plugin is a **pinned snapshot**, not a live
 checkout of this repo (Claude Code caches it under
 `~/.claude/plugins/cache/<marketplace>/orka/<version>/`). Update
 detection keys off the version string. Merging to `main` without bumping the
 version means a user's next plugin update sees the same version and does nothing --
-the fix never lands, silently. A merge is not a release; the version bump is.
+the fix never lands, silently. A version bump makes the plugin snapshot
+available; the signed tag and GitHub Release identify the same source revision
+for users who need a fixed version.
 
 After merging, users pick up the change by updating the plugin (`/plugin` ->
 update the marketplace, then the plugin), not by starting a new session.
