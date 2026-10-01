@@ -142,6 +142,8 @@
     {"id": "security_gate_failed", "class": "ticket_hard_decision", "signal": "required security review gate"},
     {"id": "merge_gate_failed", "class": "ticket_hard_decision", "signal": "merge guard"},
     {"id": "destructive_action_required", "class": "ticket_hard_decision", "signal": "destructive-action authority boundary"},
+    {"id": "operator_decision_required", "class": "ticket_hard_decision", "signal": "classified operator decision"},
+    {"id": "recovery_evidence_ambiguous", "class": "ticket_hard_decision", "signal": "recovery eligibility evidence"},
     {"id": "launch_rejected_transient", "class": "ticket_retry_wait", "signal": "worker launch receipt"},
     {"id": "timeout_without_progress", "class": "ticket_retry_wait", "signal": "worker terminal receipt"},
     {"id": "timeout_with_progress", "class": "ticket_recovery", "signal": "worker terminal and progress receipts"},

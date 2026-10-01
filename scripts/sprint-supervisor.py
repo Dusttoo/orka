@@ -53,6 +53,7 @@ class SupervisorError(RuntimeError):
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 CONTRACT_PATH = PLUGIN_ROOT / "contracts/supervisor-lifecycle-v1.json"
+BREAKER_CONTRACT_PATH = PLUGIN_ROOT / "contracts/breaker-classification-v1.json"
 RUNTIME_RELATIVE = Path(".orchestration/.supervisor")
 REQUEST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
 MAX_REASON = 2000
@@ -339,6 +340,9 @@ def runtime_fingerprint() -> str:
         + (PLUGIN_ROOT / "scripts/supervisor_dispatch.py").read_bytes()
         + (PLUGIN_ROOT / "scripts/supervisor_admission.py").read_bytes()
         + CONTRACT_PATH.read_bytes()
+        + BREAKER_CONTRACT_PATH.read_bytes()
+        + (PLUGIN_ROOT / "scripts/breaker_contract.py").read_bytes()
+        + (PLUGIN_ROOT / "scripts/breaker_runtime.py").read_bytes()
         + (PLUGIN_ROOT / "contracts/resource-claims-v1.json").read_bytes()
         + (PLUGIN_ROOT / "scripts/runtime_state.py").read_bytes()
         + (PLUGIN_ROOT / ".codex-plugin/plugin.json").read_bytes()
@@ -601,6 +605,8 @@ def status_response(state: dict[str, Any]) -> dict[str, Any]:
             str(item.get("key") or "")
             for item in planning.get("waiting") or []
         ),
+        "ticket_breakers": list(planning.get("ticket_breakers") or []),
+        "route_breakers": list(planning.get("route_breakers") or []),
         "lane_allocation": planning.get("lane_allocation") or {
             "selections": [],
             "next_cursor": int(planning.get("allocation_cursor") or 0),
@@ -1000,6 +1006,7 @@ def run_daemon(repository: Path, handshake: Path) -> int:
             retry_delay_seconds=float(
                 (state.get("planning") or {}).get("ticket_retry_seconds") or 30
             ),
+            breaker_contract_path=BREAKER_CONTRACT_PATH,
         )
         while not should_stop:
             if signal_number:
