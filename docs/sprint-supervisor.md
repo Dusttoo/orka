@@ -111,9 +111,19 @@ ticket to recovery-ready.
 `status` separates active, queued, retrying, parked, blocked, and terminal job
 sets. A no-progress timeout enters a durable retry wait for
 `supervisor_ticket_retry_seconds` (default 30) and consumes no lane. Once its
-deadline arrives, the supervisor requeues only that exact stopped attempt and
-immediately replans. Controller-authorized repair and recovery continuations are
-returned to the launch queue without holding unrelated capacity.
+deadline arrives, the supervisor requeues only that exact stopped attempt after
+verifying its ticket-scoped breaker record, and immediately replans. A deadline
+with a missing or mismatched breaker binding remains parked. Controller-authorized
+repair and recovery continuations are returned to the launch queue without
+holding unrelated capacity.
+
+Planning and status expose deterministic `ticket_breakers` and
+`route_breakers`. Ticket records bind the stop source, target state, authority,
+and evidence digest to one Jira key. Route records bind a provider incident to
+one exact role and route identity. Neither class changes global supervisor
+state, consumes admission for a skipped candidate, or prevents a healthy route
+from filling another lane. See
+[Breaker classification contract](breaker-classification-contract.md).
 
 Admission is queue-class aware. A single-lane repository remains strictly
 finish-first. With two or more lanes, eligible dependency-unlocking work gets

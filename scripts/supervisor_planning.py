@@ -247,6 +247,8 @@ def classify_cycle(
         "retry_waiting": list(plan.get("retry_waiting") or []),
         "health_probes": list(plan.get("health_probes") or []),
         "provider_holds": list(plan.get("provider_holds") or []),
+        "route_breakers": list(plan.get("route_breakers") or []),
+        "ticket_breakers": list(plan.get("ticket_breakers") or []),
         "decision_queue_count": len(plan.get("decision_queue") or []),
         "legacy_reconciliation_count": len(plan.get("legacy_reconciliation") or []),
         "autonomous_work_remaining": bool(plan.get("autonomous_work_remaining")),

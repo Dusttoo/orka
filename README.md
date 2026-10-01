@@ -458,6 +458,9 @@ The contract inventories every current budget, run-count, review, timeout,
 provider-health, capacity, and integrity stop by scope and strength. Its
 validator rejects missing or duplicate mappings, ticket/route breakers that
 claim global authority, and any attempt to soften protected safety controls.
+Ticket and route stops now carry deterministic runtime records through planning
+and supervisor status. Retry wakeups require the exact ticket binding; provider
+holds bind one role and route so healthy routes and unrelated tickets continue.
 
 Please report security-sensitive findings privately according to
 [SECURITY.md](SECURITY.md) and follow the [Code of Conduct](CODE_OF_CONDUCT.md).

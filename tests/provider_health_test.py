@@ -923,6 +923,12 @@ class AdmissionTests(unittest.TestCase):
             [(h["provider"], h["state"], h.get("scope")) for h in result["provider_holds"]],
             [("openai", "incompatible", "route")],
         )
+        self.assertEqual(len(result["route_breakers"]), 1)
+        breaker = result["route_breakers"][0]
+        self.assertEqual(breaker["class_id"], "route_hard_hold")
+        self.assertEqual(breaker["scope"], "route")
+        self.assertEqual(breaker["subject"], worker)
+        self.assertEqual(breaker["role"], "sprint-worker")
         self.assertEqual(result["health_probes"], [])
         self.assertEqual(health.status("openai")["state"], "healthy")
 

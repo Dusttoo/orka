@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from context_pipeline import llm_route_from_config
+from breaker_runtime import BreakerRuntime, BreakerRuntimeError
 from github_progress import (
     ProgressError,
     number_from_evidence,
@@ -599,6 +600,7 @@ class SupervisorDispatcher:
         adapter: ControllerDispatchAdapter | None = None,
         *,
         retry_delay_seconds: float = 30.0,
+        breaker_contract_path: Path | None = None,
     ) -> None:
         self.repository = repository.resolve()
         self.runtime_directory = runtime_directory.resolve()
@@ -615,6 +617,14 @@ class SupervisorDispatcher:
             validate_contract(self.contract, CONTROLLER)
         except ContractError as exc:
             raise DispatchError(str(exc)) from exc
+        try:
+            self.breakers = BreakerRuntime(
+                breaker_contract_path
+                or PLUGIN_ROOT / "contracts/breaker-classification-v1.json",
+                CONTROLLER,
+            )
+        except BreakerRuntimeError as exc:
+            raise DispatchError(str(exc)) from exc
 
     def _worker_transition(self, outcome: str) -> tuple[str, str]:
         event = (self.contract.get("worker_terminal_results") or {}).get(outcome)
@@ -630,6 +640,23 @@ class SupervisorDispatcher:
         if len(matches) != 1:
             raise DispatchError(f"lifecycle event {event} is not deterministic")
         return event, str(matches[0]["to"])
+
+    def _terminal_breaker(
+        self,
+        outcome: str,
+        target: str,
+        ticket: str,
+        evidence: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        try:
+            return self.breakers.terminal_record(
+                outcome,
+                target_state=target,
+                ticket=ticket,
+                evidence=evidence,
+            )
+        except BreakerRuntimeError as exc:
+            raise DispatchError(str(exc)) from exc
 
     def _contract_evidence(
         self, event: str, result: dict[str, Any], result_digest: str
@@ -874,6 +901,11 @@ class SupervisorDispatcher:
             "validation_error": validation_error,
             "applied_at": time.time(),
         }
+        breaker = self._terminal_breaker(
+            result["outcome"], target, job["ticket"], contract_evidence
+        )
+        if breaker is not None:
+            terminal["breaker"] = breaker
         if target == "retry_wait":
             terminal["retry_at"] = terminal["applied_at"] + self.retry_delay_seconds
             terminal["timer_id"] = f"retry:{job['run_ref']}"
@@ -898,6 +930,20 @@ class SupervisorDispatcher:
             if job.get("state") != "retry_wait":
                 continue
             terminal = job.get("terminal") or {}
+            breaker = terminal.get("breaker") or {}
+            if (
+                breaker.get("class_id") != "ticket_retry_wait"
+                or breaker.get("scope") != "ticket"
+                or breaker.get("durable_state") != "retry_wait"
+                or breaker.get("subject") != job.get("ticket")
+            ):
+                self.last_errors.append(
+                    {
+                        "ticket": str(job.get("ticket") or ""),
+                        "error": "retry wait lacks its exact ticket breaker binding",
+                    }
+                )
+                continue
             retry_at = terminal.get("retry_at")
             if not isinstance(retry_at, (int, float)) or retry_at > current_time:
                 continue
@@ -1032,6 +1078,14 @@ class SupervisorDispatcher:
             "validation_error": "missing structured terminal result",
             "applied_at": time.time(),
         }
+        breaker = self._terminal_breaker(
+            "malformed_result",
+            target,
+            job["ticket"],
+            applied["contract_evidence"],
+        )
+        if breaker is not None:
+            applied["breaker"] = breaker
         job["terminal"] = applied
         job["state"] = target
         try:

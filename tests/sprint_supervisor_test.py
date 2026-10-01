@@ -91,6 +91,12 @@ class PlanningLoopTests(unittest.TestCase):
             "sprint": {"id": "99"},
             "launch": ["PNP-2"],
             "waiting": [{"key": "PNP-1", "reasons": ["dependency blocked"]}],
+            "ticket_breakers": [
+                {"subject": "PNP-1", "class_id": "ticket_external_wait"}
+            ],
+            "route_breakers": [
+                {"subject": "route-a", "class_id": "route_transient_hold"}
+            ],
             "autonomous_work_remaining": True,
         }
         result = classify_cycle(
@@ -103,6 +109,8 @@ class PlanningLoopTests(unittest.TestCase):
         self.assertEqual(result["plan"]["launch"], ["PNP-2"])
         self.assertFalse(result["autonomous_work_exhausted"])
         self.assertFalse(result["all_routes_unavailable"])
+        self.assertEqual(result["ticket_breakers"], plan["ticket_breakers"])
+        self.assertEqual(result["route_breakers"], plan["route_breakers"])
 
     def test_provider_cooldown_is_waitable_and_sets_exact_deadline(self) -> None:
         plan = {
@@ -244,6 +252,12 @@ class PlanningLoopTests(unittest.TestCase):
                     "recovery": [],
                 },
                 "retry_waiting": [{"key": "PNP-2", "retry_at": 200}],
+                "ticket_breakers": [
+                    {"subject": "PNP-3", "class_id": "ticket_hard_decision"}
+                ],
+                "route_breakers": [
+                    {"subject": "route-a", "class_id": "route_transient_hold"}
+                ],
                 "decision_queue": [{"key": "PNP-3", "state": "operator_decision"}],
                 "waiting": [{"key": "PNP-4", "reasons": ["dependency"]}],
             },
@@ -267,6 +281,12 @@ class PlanningLoopTests(unittest.TestCase):
         self.assertEqual(
             result["dispatch"]["lane_allocation"]["selections"][0]["reason"],
             "weighted-fair-share:fresh",
+        )
+        self.assertEqual(
+            result["dispatch"]["ticket_breakers"][0]["subject"], "PNP-3"
+        )
+        self.assertEqual(
+            result["dispatch"]["route_breakers"][0]["subject"], "route-a"
         )
 
 

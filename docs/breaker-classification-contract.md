@@ -1,9 +1,10 @@
 # Breaker classification contract
 
-Orka 1.8.14 introduces the versioned
+Orka 1.8.14 introduced the versioned
 [`orka.breaker-classification/v1`](../contracts/breaker-classification-v1.json)
-contract. It is an inventory and safety contract; later #75 slices apply it to
-runtime transitions.
+contract. Orka 1.8.15 applies its ticket and route classes to controller plans,
+worker terminal transitions, retry wakeups, and supervisor status. Sprint-wide
+pressure and global stop enforcement remain a separate delivery slice.
 
 Every stop source has exactly one class along two independent axes:
 
@@ -51,3 +52,24 @@ Validation fails closed for missing, extra, duplicated, ambiguous, undefined,
 or unsafe mappings. Current controller ticket states must also have an exact
 compatibility entry. No validation uses live Jira, GitHub, provider, or email
 credentials.
+
+## Runtime records
+
+`scripts/breaker_runtime.py` turns a classified stop into a deterministic
+record containing the source, class, scope, strength, durable state, authority,
+subject, and evidence digest. Ticket records bind to one Jira key. Route records
+bind to one exact route identity and role. These records cross the controller,
+planning snapshot, and supervisor status boundary without granting new
+authority or erasing existing state.
+
+Worker terminal outcomes use the contract as the target-state authority. A
+timeout without progress, for example, may enter `retry_wait` only with a
+`ticket_retry_wait` record for that exact ticket. The deadline alone is
+insufficient to wake it: the supervisor also verifies the ticket binding and
+durable state before requeueing the stopped attempt. Malformed or mismatched
+records fail closed.
+
+Controller decisions preserve their ticket-local breaker records, while
+provider holds publish route-local records. Healthy roles and unrelated
+tickets remain eligible, and skipping a held candidate consumes no lane,
+attempt, or reservation.

@@ -66,6 +66,7 @@ from recovery_eligibility import (
     canonical_digest as recovery_digest,
     evaluate_recovery,
 )
+from breaker_runtime import BreakerRuntime, BreakerRuntimeError
 
 from operator_authority import (
     AuthorityError,
@@ -119,6 +120,7 @@ OPERATOR_DECISION_CLASSES = {
     "ambiguous_external_side_effect",
     "trust_boundary_change",
 }
+BREAKER_RUNTIME = BreakerRuntime()
 
 
 class SprintError(RuntimeError):
@@ -1458,21 +1460,26 @@ def usage_snapshots(cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
         if grant_ceiling is not None:
             pause = max(pause, float(grant_ceiling))
         warning = cfg["warn_usd_per_ticket"]
+        breaker_sources = set()
+        if ticket in pause_events and grant_ceiling is None:
+            breaker_sources.add(
+                str(pause_events[ticket].get("reason") or "pause_usd_per_ticket")
+            )
+        if pause and total > pause:
+            breaker_sources.add("pause_usd_per_ticket")
+        if item["run_count"] >= max(
+            cfg["max_model_runs_per_ticket"], allowances.get("model_runs", 0)
+        ):
+            breaker_sources.add("max_model_runs_per_ticket")
+        if item["reviewer_run_count"] >= max(
+            cfg["max_reviewer_runs_per_ticket"],
+            allowances.get("review_runs", 0),
+        ):
+            breaker_sources.add("max_reviewer_runs_per_ticket")
+        item["breaker_sources"] = sorted(breaker_sources)
         item["state"] = (
             "operator_action"
-            if (
-                (ticket in pause_events and grant_ceiling is None)
-                or (pause and total > pause)
-                or item["run_count"]
-                >= max(
-                    cfg["max_model_runs_per_ticket"], allowances.get("model_runs", 0)
-                )
-                or item["reviewer_run_count"]
-                >= max(
-                    cfg["max_reviewer_runs_per_ticket"],
-                    allowances.get("review_runs", 0),
-                )
-            )
+            if breaker_sources
             else "warning"
             if warning and total > warning
             else "ok"
@@ -2569,28 +2576,57 @@ def spending_admission_reason(ticket, cfg, spend):
     return None
 
 
+def ticket_breaker_record(source_id, key, state, reasons):
+    """Bind one controller stop to the canonical ticket breaker contract."""
+    try:
+        record = BREAKER_RUNTIME.record(
+            source_id,
+            subject=key,
+            evidence={"ticket": key, "state": state, "reasons": sorted(set(reasons))},
+        )
+    except BreakerRuntimeError as exc:
+        raise SprintError(str(exc)) from exc
+    if record["scope"] != "ticket" or record.get("subject") != key:
+        raise SprintError(f"breaker source {source_id} escaped ticket scope")
+    return record
+
+
 def runtime_admission(cfg, role="sprint-worker"):
     if not cfg.get("runtime_admission"):
         return None
     route = llm_route_from_config(cfg["config"], role)
     if model_less_desktop_route(route):
+        identity = route_identity(route)
         status = desktop_subscription_status(route)
         return (
             None
             if status["state"] == "healthy"
-            else {"provider": route["provider"], "role": role, **status}
+            else {
+                "provider": route["provider"],
+                "role": role,
+                "route_identity": identity,
+                **status,
+            }
         )
     if not route.get("model"):
         return {
             "provider": route["provider"],
+            "role": role,
+            "route_identity": route_identity(route),
             "state": "unconfigured",
             "reason": "explicit role model required",
         }
+    identity = route_identity(route)
     status = ProviderHealth(cfg["shared_root"]).status(
-        route["provider"], route_identity(route)
+        route["provider"], identity
     )
     return (
-        {"provider": route["provider"], "role": role, **status}
+        {
+            "provider": route["provider"],
+            "role": role,
+            "route_identity": identity,
+            **status,
+        }
         if status["state"] != "healthy"
         else None
     )
@@ -3221,23 +3257,30 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
     recovery_waiting = []
     retry_waiting = []
     decisions = []
+    ticket_breakers = []
     for ticket in ordered:
         key, status = ticket["key"], ticket["state"]
         if key in pr_reconciliation_set:
             if key in pr_reconciliation_requires_authority:
                 evaluation = pr_reconciliation_evaluations[key]
+                decision_reasons = [
+                    f"preserved PR recovery {evaluation['verdict']} "
+                    f"({code}): {reason}"
+                    for code, reason in zip(
+                        evaluation["reason_codes"], evaluation["reasons"]
+                    )
+                ]
+                breaker = ticket_breaker_record(
+                    "recovery_evidence_ambiguous", key, status, decision_reasons
+                )
+                ticket_breakers.append(breaker)
                 decisions.append(
                     {
                         "key": key,
                         "state": status,
-                        "reasons": [
-                            f"preserved PR recovery {evaluation['verdict']} "
-                            f"({code}): {reason}"
-                            for code, reason in zip(
-                                evaluation["reason_codes"], evaluation["reasons"]
-                            )
-                        ],
+                        "reasons": decision_reasons,
                         "action": "resolve-preserved-pr-recovery-evidence",
+                        "breakers": [breaker],
                     }
                 )
             continue
@@ -3255,22 +3298,44 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
             except (ValueError, TypeError):
                 retry_at = 0
             if time.time() < retry_at and attempt_limit_reason(ticket, cfg) is None:
+                breaker = ticket_breaker_record(
+                    "launch_rejected_transient",
+                    key,
+                    "retry_wait",
+                    [f"provider startup cooldown until {retry_at}"],
+                )
+                ticket_breakers.append(breaker)
                 retry_waiting.append(
                     {
                         "key": key,
                         "retry_at": retry_at,
                         "reason": "provider startup cooldown",
+                        "breaker": breaker,
                     }
                 )
                 continue
         if status in {"completed", "decomposed", "running"}:
             continue
         reasons = []
-        if reason := spending_admission_reason(ticket, cfg, spend.get(key, {})):
+        source_ids = []
+        ticket_spend = spend.get(key, {})
+        if reason := spending_admission_reason(ticket, cfg, ticket_spend):
             reasons.append(reason)
+            if reason.startswith("max_usd_without_progress"):
+                source_ids.append("max_usd_without_progress")
+            else:
+                source_ids.extend(
+                    source
+                    if source in BREAKER_RUNTIME.sources
+                    else "operator_decision_required"
+                    for source in ticket_spend.get("breaker_sources") or []
+                )
+                if not source_ids:
+                    source_ids.append("operator_decision_required")
         if status in {"pending", "recoverable", "needs_repair"}:
             if reason := attempt_limit_reason(ticket, cfg):
                 reasons.append(reason)
+                source_ids.append("max_lane_relaunches")
         if status in {
             "operator_decision",
             "user_action",
@@ -3278,10 +3343,21 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
             "external_blocked",
         }:
             reasons.append(ticket.get("reason") or status)
+            source_ids.append(
+                "external_dependency_wait"
+                if status == "external_blocked"
+                else "worker_irrecoverable"
+                if status == "blocked"
+                else "operator_decision_required"
+            )
         if status == "needs_decomposition" and not cfg["auto_decompose_large_tickets"]:
             reasons.append("automatic decomposition is disabled by repository policy")
+            source_ids.append("operator_decision_required")
         if status in {"recoverable", "needs_repair"}:
-            reasons.extend(blockers(state, key, cfg, cycles))
+            dependency_reasons = blockers(state, key, cfg, cycles)
+            reasons.extend(dependency_reasons)
+            if dependency_reasons:
+                source_ids.append("internal_dependency_wait")
             identity = ticket.get("worker_identity")
             unit_status = (
                 execution_unit_status(identity)
@@ -3293,6 +3369,7 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
                 recovery_waiting.append(key)
             if not ticket.get("attempt_token"):
                 reasons.append("recovery requires the current attempt token")
+                source_ids.append("recovery_evidence_ambiguous")
             elif unit_status == "live":
                 if not reasons:
                     continue
@@ -3318,6 +3395,7 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
                     }
                 recovery_evaluations[key] = evaluation
                 if not evaluation["eligible"]:
+                    source_ids.append("recovery_evidence_ambiguous")
                     reasons.extend(
                         f"recovery {evaluation['verdict']} ({code}): {reason}"
                         for code, reason in zip(
@@ -3325,8 +3403,18 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
                         )
                     )
         if reasons:
+            breaker_records = [
+                ticket_breaker_record(source_id, key, status, reasons)
+                for source_id in sorted(set(source_ids))
+            ]
+            ticket_breakers.extend(breaker_records)
             decisions.append(
-                {"key": key, "state": status, "reasons": sorted(set(reasons))}
+                {
+                    "key": key,
+                    "state": status,
+                    "reasons": sorted(set(reasons)),
+                    "breakers": breaker_records,
+                }
             )
         elif status == "needs_decomposition":
             decomposition.append(key)
@@ -3416,6 +3504,13 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
     if scope_candidates:
         needed_roles.add("ticket-scoper")
     health_probes = [item for item in health_probes if item["role"] in needed_roles]
+    provider_holds = [hold for hold in (runtime_hold, scope_hold) if hold]
+    try:
+        route_breakers = [
+            BREAKER_RUNTIME.route_record(hold) for hold in provider_holds
+        ]
+    except BreakerRuntimeError as exc:
+        raise SprintError(str(exc)) from exc
     resource_claims = {
         ticket["key"]: claims
         for ticket in ordered
@@ -3447,7 +3542,8 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
         "needs_reconcile": sorted(running + recovery_waiting),
         "launch": [] if runtime_hold else launch,
         "allocation_candidates": allocation_candidates,
-        "provider_holds": [hold for hold in (runtime_hold, scope_hold) if hold],
+        "provider_holds": provider_holds,
+        "route_breakers": route_breakers,
         "health_probes": health_probes,
         "scope": scope,
         "decomposition": decomposition,
@@ -3460,6 +3556,7 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
         "recovery_waiting": recovery_waiting,
         "recovery_evaluations": recovery_evaluations,
         "retry_waiting": retry_waiting,
+        "ticket_breakers": ticket_breakers,
         "legacy_reconciliation": legacy_reconciliation(state),
         "decision_queue": decisions,
         "stalled": stalled,

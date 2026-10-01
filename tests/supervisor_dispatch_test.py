@@ -260,6 +260,13 @@ class DispatchTests(unittest.TestCase):
         self.write_tombstone(job)
         result = self.dispatcher.apply_process_exit(job)
         self.assertEqual(result["terminal"]["event"], "worker_result_invalid")
+        self.assertEqual(result["terminal"]["breaker"]["scope"], "ticket")
+        self.assertEqual(
+            result["terminal"]["breaker"]["subject"], job["ticket"]
+        )
+        self.assertEqual(
+            result["terminal"]["breaker"]["class_id"], "ticket_recovery"
+        )
         self.assertEqual(self.adapter.finished[-1]["outcome"], "recoverable")
 
     def test_process_exit_without_result_moves_ticket_to_recovery(self) -> None:
@@ -274,6 +281,7 @@ class DispatchTests(unittest.TestCase):
             "needs_repair": (
                 "worker_needs_repair",
                 {"pr_identity": "45", "review_ledger_digest": "review"},
+                None,
             ),
             "external_blocked": (
                 "worker_external_blocked",
@@ -283,6 +291,7 @@ class DispatchTests(unittest.TestCase):
                         "receipt": "jira-relation-receipt",
                     }
                 },
+                "ticket_external_wait",
             ),
             "operator_decision": (
                 "worker_operator_decision",
@@ -290,10 +299,12 @@ class DispatchTests(unittest.TestCase):
                     "decision_class": "product_or_security_policy",
                     "decision_question": "Choose policy",
                 },
+                "ticket_hard_decision",
             ),
             "blocked": (
                 "worker_irrecoverable",
                 {"terminal_receipt": "terminal", "failure_class": "irrecoverable"},
+                "ticket_irrecoverable",
             ),
         }
         for origin in ("desktop", "api"):
@@ -304,11 +315,20 @@ class DispatchTests(unittest.TestCase):
                 ROOT / "contracts/supervisor-lifecycle-v1.json",
                 adapter,
             )
-            for index, (outcome, (event, evidence)) in enumerate(cases.items(), 1):
+            for index, (outcome, (event, evidence, breaker_class)) in enumerate(
+                cases.items(), 1
+            ):
                 job = dispatcher.launch("99", f"PNP-{index}")
                 self.write_result(job, self.envelope(job, outcome, evidence=evidence))
                 applied = dispatcher.apply_terminal(job)
                 self.assertEqual(applied["terminal"]["event"], event)
+                breaker = applied["terminal"].get("breaker")
+                if breaker_class is None:
+                    self.assertIsNone(breaker)
+                else:
+                    self.assertEqual(breaker["class_id"], breaker_class)
+                    self.assertEqual(breaker["scope"], "ticket")
+                    self.assertEqual(breaker["subject"], job["ticket"])
 
     def test_retry_wait_releases_lane_and_wakes_only_after_deadline(self) -> None:
         jobs: dict[str, dict] = {}
@@ -334,6 +354,29 @@ class DispatchTests(unittest.TestCase):
         awakened = self.dispatcher.wake_due_retries(jobs, current_time=deadline)
         self.assertEqual([job["ticket"] for job in awakened], ["PNP-1"])
         self.assertEqual(self.adapter.requeued[-1]["ticket"], "PNP-1")
+
+    def test_retry_wakeup_requires_the_exact_ticket_breaker_binding(self) -> None:
+        jobs: dict[str, dict] = {}
+        job = self.dispatcher.fill("99", ["PNP-1"], jobs, 1)[0]
+        self.write_result(
+            job,
+            self.envelope(
+                job,
+                "timeout_without_progress",
+                evidence={"terminal_receipt": "terminal", "spend_receipt": "spend"},
+            ),
+        )
+        self.write_tombstone(job)
+        applied = self.dispatcher.apply_process_exit(job)
+        deadline = applied["terminal"]["retry_at"]
+        applied["terminal"]["breaker"]["subject"] = "PNP-OTHER"
+
+        self.assertEqual(
+            self.dispatcher.wake_due_retries(jobs, current_time=deadline), []
+        )
+        self.assertEqual(job["state"], "retry_wait")
+        self.assertEqual(self.adapter.requeued, [])
+        self.assertIn("exact ticket breaker", self.dispatcher.last_errors[-1]["error"])
 
     def test_failed_retry_wakeup_is_rescheduled_without_consuming_a_lane(self) -> None:
         jobs: dict[str, dict] = {}
