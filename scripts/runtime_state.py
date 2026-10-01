@@ -306,6 +306,20 @@ def resolve_canonical_policy(start: Path) -> PolicySnapshot:
     return _resolve_policy(layout, str(identity["policy_ref"]), str(identity["policy_path"]))
 
 
+def repository_identity(start: Path) -> dict[str, Any]:
+    """Return the exact initialized repository identity or fail closed."""
+
+    return _read_identity(repository_layout(start))
+
+
+@contextlib.contextmanager
+def repository_initialization_authority(start: Path) -> Iterator[None]:
+    """Exclude identity initialization while an offline state operation runs."""
+
+    with _initialization_lock(repository_layout(start)):
+        yield
+
+
 def _materialize_policy(layout: RepositoryLayout, snapshot: PolicySnapshot) -> Path:
     policy_root = layout.state_root / "policy"
     if policy_root.exists() or policy_root.is_symlink():

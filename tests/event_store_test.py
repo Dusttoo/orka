@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import sqlite3
 import sys
 import tempfile
@@ -138,6 +139,26 @@ class TransactionalEventStoreTests(unittest.TestCase):
                 binding(policy_digest="different"), writer_identity=WRITER
             )
         self.assertEqual(self.store.check_integrity()["integrity"], "ok")
+
+    def test_existing_version_one_database_migrates_forward_once(self) -> None:
+        self.store.close()
+        self.path.unlink()
+        schema_path = ROOT / "contracts/event-store-v1.sql"
+        schema = schema_path.read_text(encoding="utf-8")
+        digest = hashlib.sha256(schema.encode("utf-8")).hexdigest()
+        with sqlite3.connect(self.path) as database:
+            database.executescript(schema)
+            database.execute(
+                "INSERT INTO schema_migrations VALUES (1, ?, ?, ?)",
+                ("0001-initial-event-store", digest, NOW),
+            )
+            database.execute(
+                "INSERT INTO metadata(key, value) VALUES ('schema_version', '1')"
+            )
+        self.store = TransactionalEventStore(self.path, writer_identity=WRITER)
+        self.assertEqual(self.store.status().schema_version, 2)
+        self.assertEqual(len(self.store.rows("schema_migrations")), 2)
+        self.assertEqual(self.store.rows("migration_sources"), [])
 
     def test_unknown_or_modified_migration_ledger_fails_closed(self) -> None:
         self.store.close()

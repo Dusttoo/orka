@@ -22,10 +22,12 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
 
-SCHEMA_VERSION = 1
-MIGRATION_ID = "0001-initial-event-store"
+SCHEMA_VERSION = 2
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 SCHEMA_PATH = Path(__file__).resolve().parents[1] / "contracts/event-store-v1.sql"
+LEGACY_IMPORT_SCHEMA_PATH = (
+    Path(__file__).resolve().parents[1] / "contracts/event-store-v2-legacy-import.sql"
+)
 
 
 class EventStoreError(RuntimeError):
@@ -72,6 +74,14 @@ class TransitionResult:
     sequence: int
     replayed: bool
     aggregate_version: int
+
+
+@dataclass(frozen=True)
+class ImportResult:
+    receipt_id: str
+    replayed: bool
+    source_count: int
+    record_count: int
 
 
 def canonical_json(value: Any) -> str:
@@ -147,7 +157,7 @@ class TransactionalEventStore:
             self._journal_mode, self._journal_reason = self._select_journal_mode(
                 local_filesystem=local_filesystem
             )
-            self._apply_migration(schema_path)
+            self._apply_migrations(schema_path)
             self._validate_connection_settings()
         except BaseException:
             if hasattr(self, "_database"):
@@ -226,40 +236,58 @@ class TransactionalEventStore:
             reason = "WAL enabled: local filesystem and fixed SQLite release verified"
         return selected, reason
 
-    def _apply_migration(self, schema_path: Path) -> None:
-        try:
-            schema = schema_path.read_text(encoding="utf-8")
-        except OSError as exc:
-            raise EventStoreError(f"cannot read event-store schema: {schema_path}") from exc
-        source_digest = hashlib.sha256(schema.encode("utf-8")).hexdigest()
+    def _apply_migrations(self, schema_path: Path) -> None:
+        specifications = (
+            (1, "0001-initial-event-store", schema_path),
+            (2, "0002-legacy-import", LEGACY_IMPORT_SCHEMA_PATH),
+        )
+        migrations: list[tuple[int, str, str, str]] = []
+        for version, migration_id, path in specifications:
+            try:
+                schema = path.read_text(encoding="utf-8")
+            except OSError as exc:
+                raise EventStoreError(f"cannot read event-store schema: {path}") from exc
+            migrations.append(
+                (
+                    version,
+                    migration_id,
+                    hashlib.sha256(schema.encode("utf-8")).hexdigest(),
+                    schema,
+                )
+            )
         has_ledger = self._database.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'"
         ).fetchone()
+        applied: list[tuple[int, str, str]] = []
         if has_ledger:
-            rows = self._database.execute(
+            applied = self._database.execute(
                 "SELECT version, migration_id, source_digest FROM schema_migrations ORDER BY version"
             ).fetchall()
-            expected = [(SCHEMA_VERSION, MIGRATION_ID, source_digest)]
-            if rows != expected:
+            expected_prefix = [row[:3] for row in migrations[: len(applied)]]
+            if applied != expected_prefix or len(applied) > len(migrations):
                 raise EventStoreError(
-                    f"event-store migration ledger mismatch: expected {expected!r}, found {rows!r}"
+                    "event-store migration ledger mismatch: "
+                    f"expected prefix {expected_prefix!r}, found {applied!r}"
                 )
-            return
-        migration = (
-            "BEGIN IMMEDIATE;\n"
-            + schema
-            + "\nINSERT INTO schema_migrations(version, migration_id, source_digest, applied_at) "
-            + f"VALUES ({SCHEMA_VERSION}, {_sql_literal(MIGRATION_ID)}, "
-            + f"{_sql_literal(source_digest)}, {_sql_literal(utc_now())});\n"
-            + "INSERT INTO metadata(key, value) VALUES "
-            + f"('schema_version', {_sql_literal(str(SCHEMA_VERSION))});\nCOMMIT;\n"
-        )
-        try:
-            self._database.executescript(migration)
-        except sqlite3.Error as exc:
-            with contextlib.suppress(sqlite3.Error):
-                self._database.execute("ROLLBACK")
-            raise EventStoreError("event-store migration failed atomically") from exc
+        for version, migration_id, source_digest, schema in migrations[len(applied) :]:
+            migration = (
+                "BEGIN IMMEDIATE;\n"
+                + schema
+                + "\nINSERT INTO schema_migrations(version, migration_id, source_digest, applied_at) "
+                + f"VALUES ({version}, {_sql_literal(migration_id)}, "
+                + f"{_sql_literal(source_digest)}, {_sql_literal(utc_now())});\n"
+                + "INSERT INTO metadata(key, value) VALUES "
+                + f"('schema_version', {_sql_literal(str(version))}) "
+                + "ON CONFLICT(key) DO UPDATE SET value = excluded.value;\nCOMMIT;\n"
+            )
+            try:
+                self._database.executescript(migration)
+            except sqlite3.Error as exc:
+                with contextlib.suppress(sqlite3.Error):
+                    self._database.execute("ROLLBACK")
+                raise EventStoreError(
+                    f"event-store migration {migration_id} failed atomically"
+                ) from exc
 
     def _validate_connection_settings(self) -> None:
         foreign_keys = int(self._database.execute("PRAGMA foreign_keys").fetchone()[0])
@@ -966,6 +994,147 @@ class TransactionalEventStore:
                 raise StaleWriteError("timer was concurrently changed")
             return event
 
+    def import_legacy_snapshot(
+        self,
+        *,
+        repository_id: str,
+        receipt_id: str,
+        manifest_digest: str,
+        normalized_export_digest: str,
+        sources: Sequence[Mapping[str, Any]],
+        writer_identity: str,
+        imported_at: str | None = None,
+    ) -> ImportResult:
+        """Import one validated legacy manifest in a single transaction.
+
+        Callers must inventory, hash, normalize, and prove ownership before
+        entering this boundary. The store refuses both partial replay and a
+        different second migration for the repository.
+        """
+
+        at = imported_at or utc_now()
+        ordered = sorted(
+            (dict(source) for source in sources), key=lambda item: str(item["source_path"])
+        )
+        manifest = {
+            "repository_id": repository_id,
+            "sources": [
+                {
+                    "category": source["category"],
+                    "normalized_digest": source["normalized_digest"],
+                    "record_key": source["record_key"],
+                    "source_digest": source["source_digest"],
+                    "source_kind": source["source_kind"],
+                    "source_path": source["source_path"],
+                }
+                for source in ordered
+            ],
+        }
+        manifest_json = canonical_json(manifest)
+        if _digest(manifest_json) != manifest_digest:
+            raise IdempotencyConflict("legacy import manifest digest does not match its sources")
+        with self._transaction(writer_identity) as database:
+            existing = database.execute(
+                """
+                SELECT repository_id, source_kind, source_digest,
+                       normalized_export_digest, manifest_json
+                FROM migration_receipts WHERE receipt_id = ?
+                """,
+                (receipt_id,),
+            ).fetchone()
+            expected = (
+                repository_id,
+                "legacy-runtime-v1",
+                manifest_digest,
+                normalized_export_digest,
+                manifest_json,
+            )
+            if existing is not None:
+                if tuple(existing) != expected:
+                    raise IdempotencyConflict(
+                        "legacy migration receipt was reused with changed input"
+                    )
+                return ImportResult(receipt_id, True, len(ordered), len(ordered))
+            prior = database.execute(
+                "SELECT receipt_id FROM migration_receipts WHERE repository_id = ? LIMIT 1",
+                (repository_id,),
+            ).fetchone()
+            if prior is not None:
+                raise IdempotencyConflict(
+                    "repository already has a different legacy migration receipt"
+                )
+            database.execute(
+                """
+                INSERT INTO migration_receipts(
+                    receipt_id, repository_id, source_kind, source_digest,
+                    normalized_export_digest, imported_at, manifest_json
+                ) VALUES (?, ?, 'legacy-runtime-v1', ?, ?, ?, ?)
+                """,
+                (
+                    receipt_id,
+                    repository_id,
+                    manifest_digest,
+                    normalized_export_digest,
+                    at,
+                    manifest_json,
+                ),
+            )
+            for index, source in enumerate(ordered, start=1):
+                payload_json = canonical_json(source["payload"])
+                if _digest(payload_json) != source["normalized_digest"]:
+                    raise IdempotencyConflict(
+                        f"normalized digest changed for {source['source_path']}"
+                    )
+                database.execute(
+                    """
+                    INSERT INTO migration_sources(
+                        receipt_id, source_path, source_kind, source_digest,
+                        normalized_digest
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        receipt_id,
+                        source["source_path"],
+                        source["source_kind"],
+                        source["source_digest"],
+                        source["normalized_digest"],
+                    ),
+                )
+                database.execute(
+                    """
+                    INSERT INTO legacy_records(
+                        repository_id, category, record_key, source_path,
+                        payload_json, payload_digest
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        repository_id,
+                        source["category"],
+                        source["record_key"],
+                        source["source_path"],
+                        payload_json,
+                        source["normalized_digest"],
+                    ),
+                )
+                self._append_event(
+                    database,
+                    repository_id=repository_id,
+                    aggregate_type="legacy_import",
+                    aggregate_id=receipt_id,
+                    aggregate_version=index,
+                    event_type="legacy_source_imported",
+                    idempotency_key=f"legacy-import:{receipt_id}:{index}",
+                    payload={
+                        "category": source["category"],
+                        "normalized_digest": source["normalized_digest"],
+                        "record_key": source["record_key"],
+                        "source_digest": source["source_digest"],
+                        "source_path": source["source_path"],
+                    },
+                    occurred_at=at,
+                )
+            return ImportResult(receipt_id, False, len(ordered), len(ordered))
+
     def rows(self, table: str) -> list[dict[str, Any]]:
         """Return deterministic diagnostic rows for tests and pre-cutover status."""
         allowed = {
@@ -973,6 +1142,9 @@ class TransactionalEventStore:
             "events",
             "external_operations",
             "jobs",
+            "legacy_records",
+            "migration_receipts",
+            "migration_sources",
             "resource_claims",
             "schema_migrations",
             "timers",

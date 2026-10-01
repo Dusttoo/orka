@@ -142,8 +142,9 @@ concerns.
    complete in 1.8.19. Repository identity and canonical policy authority are
    complete in 1.8.20. The one-writer transaction API, versioned migration,
    event/projection invariants, claims, timers, and external-operation receipts
-   are complete in 1.8.21; import and production cutover remain tracked by
-   issue #76.**
+   are complete in 1.8.21. Offline legacy import, content-addressed receipts,
+   deterministic export, and shadow comparison are complete in 1.8.23;
+   production cutover remains tracked by issue #76.**
 9. Add supervisor lease takeover and crash recovery.
 10. Expose stable status, pause, resume, and decision CLI commands.
 11. Prove the design with restart, timeout, provider-loss, and malformed-output
