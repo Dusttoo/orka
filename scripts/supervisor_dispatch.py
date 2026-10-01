@@ -28,6 +28,8 @@ from github_progress import (
     repository as github_repository,
 )
 from provider_health import DESKTOP_CLIENTS
+from phase_execution import PhaseExecutionError, PhaseExecutionRuntime
+from phase_worker_contract import ContractError as PhaseContractError
 from supervisor_contract import (
     ContractError,
     load_json as load_contract,
@@ -59,6 +61,7 @@ CONTROLLER = Path(__file__).with_name("sprint-controller.py")
 API_AGENT = Path(__file__).with_name("api_agent.py")
 CONTEXT_PIPELINE = Path(__file__).with_name("context_pipeline.py")
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+PHASE_CONTRACT = PLUGIN_ROOT / "contracts/phase-worker-protocol-v1.json"
 RESULT_SCHEMA = "orka.worker-terminal-result/v1"
 TERMINAL_OUTCOMES = {
     "completed",
@@ -227,7 +230,12 @@ def validate_terminal_result(
 
 
 def result_prompt(
-    ticket: str, sprint: str, attempt_token: str, result_path: Path
+    ticket: str,
+    sprint: str,
+    attempt_token: str,
+    result_path: Path,
+    *,
+    phase_envelope: dict[str, Any] | None = None,
 ) -> str:
     example = {
         "schema_version": RESULT_SCHEMA,
@@ -242,7 +250,7 @@ def result_prompt(
         "pr": "PR number/URL or empty string",
         "evidence": {},
     }
-    return (
+    prompt = (
         f"Run Jira ticket {ticket} from sprint {sprint} through the installed Orka "
         "orchestrate-ticket workflow. Re-fetch authoritative Jira and GitHub state; "
         "preserve every review, security, CI, budget, and merge gate. Do not run a "
@@ -260,6 +268,13 @@ def result_prompt(
         "bounded decision_question. "
         f"Schema template: {json.dumps(example, sort_keys=True)}"
     )
+    if phase_envelope is not None:
+        prompt += (
+            " This invocation is one fresh disposable phase execution. Its immutable "
+            "supervisor-owned job envelope is: "
+            + json.dumps(phase_envelope, sort_keys=True, separators=(",", ":"))
+        )
+    return prompt
 
 
 class ControllerDispatchAdapter:
@@ -602,6 +617,7 @@ class SupervisorDispatcher:
         *,
         retry_delay_seconds: float = 30.0,
         breaker_contract_path: Path | None = None,
+        supervisor_fence: str | None = None,
     ) -> None:
         self.repository = repository.resolve()
         self.runtime_directory = runtime_directory.resolve()
@@ -625,6 +641,19 @@ class SupervisorDispatcher:
                 CONTROLLER,
             )
         except BreakerRuntimeError as exc:
+            raise DispatchError(str(exc)) from exc
+        repository_id = "repository:" + hashlib.sha256(
+            str(self.repository).encode("utf-8")
+        ).hexdigest()
+        try:
+            self.phase_runtime = PhaseExecutionRuntime(
+                PHASE_CONTRACT,
+                repository_id=repository_id,
+                supervisor_fence=supervisor_fence
+                or "legacy-supervisor:"
+                + hashlib.sha256(str(self.runtime_directory).encode()).hexdigest(),
+            )
+        except (PhaseExecutionError, PhaseContractError) as exc:
             raise DispatchError(str(exc)) from exc
 
     def _worker_transition(self, outcome: str) -> tuple[str, str]:
@@ -734,6 +763,84 @@ class SupervisorDispatcher:
         }
         return canonical_digest(identity)[:32]
 
+    def _phase_capability_offer(self) -> dict[str, Any]:
+        config = getattr(self.adapter, "config", None)
+        if isinstance(config, Path) and config.is_file():
+            try:
+                route = llm_route_from_config(config, "sprint-worker")
+            except Exception as exc:
+                raise DispatchError(
+                    f"cannot resolve phase-worker adapter capabilities: {exc}"
+                ) from exc
+            if route["execution"] == "desktop":
+                client = DESKTOP_CLIENTS.get(route["provider"])
+                adapter = f"{client}-desktop"
+                profile_capability = "desktop-subscription"
+            else:
+                adapter = "api"
+                profile_capability = "provider-receipts"
+        else:
+            origin = str(getattr(self.adapter, "origin", "desktop"))
+            adapter = "api" if origin == "api" else "codex-desktop"
+            profile_capability = (
+                "provider-receipts" if adapter == "api" else "desktop-subscription"
+            )
+        mandatory = list(self.phase_runtime.contract["capabilities"]["mandatory"])
+        return {
+            "kind": "capability_offer",
+            "protocol_version": self.phase_runtime.contract["protocol_version"],
+            "adapter": adapter,
+            "adapter_version": "orka-supervisor-v1",
+            "supported_capabilities": [*mandatory, profile_capability],
+            "fresh_context_per_dispatch": True,
+        }
+
+    def _phase_terminal_envelope(
+        self, job: dict[str, Any], result: dict[str, Any]
+    ) -> dict[str, Any]:
+        state = job.get("phase_execution")
+        if not isinstance(state, dict) or not isinstance(state.get("active"), dict):
+            raise DispatchError("job has no active disposable phase execution")
+        identity = state["active"]["identity"]
+        artifacts = {
+            key: value
+            for key, value in {
+                "branch": result.get("branch"),
+                "pr": result.get("pr"),
+            }.items()
+            if isinstance(value, str) and value
+        }
+        return {
+            "kind": "terminal",
+            "protocol_version": self.phase_runtime.contract["protocol_version"],
+            **identity,
+            "outcome": result["outcome"],
+            "summary": result["summary"],
+            "artifacts": artifacts,
+            "evidence": dict(result.get("evidence") or {}),
+        }
+
+    def _phase_runtime_for_state(
+        self, state: dict[str, Any]
+    ) -> PhaseExecutionRuntime:
+        """Use the dispatch's persisted fence after an authenticated takeover."""
+
+        fence = str(state.get("supervisor_fence") or "")
+        repository_id = str(state.get("repository_id") or "")
+        if (
+            fence == self.phase_runtime.supervisor_fence
+            and repository_id == self.phase_runtime.repository_id
+        ):
+            return self.phase_runtime
+        try:
+            return PhaseExecutionRuntime(
+                PHASE_CONTRACT,
+                repository_id=repository_id,
+                supervisor_fence=fence,
+            )
+        except PhaseExecutionError as exc:
+            raise DispatchError(str(exc)) from exc
+
     def resource_claims(
         self,
         ticket: str,
@@ -759,6 +866,9 @@ class SupervisorDispatcher:
         sprint: str,
         ticket: str,
         resource_claims: list[dict[str, Any]] | None = None,
+        *,
+        phase: str = "ticket-workflow",
+        sanitized_input: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if not KEY.fullmatch(ticket):
             raise DispatchError("controller plan returned an invalid ticket key")
@@ -771,15 +881,37 @@ class SupervisorDispatcher:
             resource_claim_digest = claim_set_digest(resource_claims)
         except AdmissionError as exc:
             raise DispatchError(str(exc)) from exc
+        capability_offer = self._phase_capability_offer()
         run_ref = f"supervisor-{ticket}-{uuid.uuid4().hex}"
         reservation = self.adapter.reserve(sprint, ticket, run_ref)
         attempt_token = str(reservation.get("attempt_token") or "")
         if not attempt_token or not reservation.get("attach_capability"):
             raise DispatchError("controller reservation omitted launch capabilities")
         paths = self._job_paths(run_ref)
+        try:
+            phase_execution = self.phase_runtime.create_job(
+                ticket_id=ticket,
+                phase=phase,
+                attempt_token=attempt_token,
+                worktree_id=str(self.repository),
+                sanitized_input=sanitized_input
+                or {"sprint": sprint, "ticket": ticket, "phase": phase},
+            )
+            phase_record = self.phase_runtime.dispatch(
+                phase_execution, capability_offer
+            )
+        except PhaseExecutionError as exc:
+            raise DispatchError(str(exc)) from exc
         _private_write(
             paths["prompt"],
-            result_prompt(ticket, sprint, attempt_token, paths["result"]) + "\n",
+            result_prompt(
+                ticket,
+                sprint,
+                attempt_token,
+                paths["result"],
+                phase_envelope=phase_record["job"],
+            )
+            + "\n",
         )
         job = {
             "ticket": ticket,
@@ -791,6 +923,7 @@ class SupervisorDispatcher:
             "state": "reserved",
             "launched_at": time.time(),
             "terminal": {},
+            "phase_execution": phase_execution,
             "resource_claims": resource_claims,
             "resource_claim_schema": CLAIM_SCHEMA,
             "resource_claim_digest": resource_claim_digest,
@@ -823,6 +956,12 @@ class SupervisorDispatcher:
             job["launch_error"] = "controller attach omitted execution-unit identity"
             return job
         job["execution_identity"] = identity
+        try:
+            self.phase_runtime.bind_attachment(phase_execution, identity)
+        except PhaseExecutionError as exc:
+            job["state"] = "launch_uncertain"
+            job["launch_error"] = f"phase attachment rejected: {exc}"
+            return job
         job["state"] = "running"
         return job
 
@@ -861,6 +1000,15 @@ class SupervisorDispatcher:
                 )
             event, target = self._worker_transition(result["outcome"])
             contract_evidence = self._contract_evidence(event, result, digest)
+            phase_state = job.get("phase_execution")
+            if isinstance(phase_state, dict):
+                try:
+                    self._phase_runtime_for_state(phase_state).ingest(
+                        phase_state,
+                        self._phase_terminal_envelope(job, result),
+                    )
+                except PhaseExecutionError as exc:
+                    raise DispatchError(f"phase terminal rejected: {exc}") from exc
             controller = self.adapter.finish(job["sprint"], job["ticket"], result)
             validation_error = ""
         except StaleResultError:
@@ -881,6 +1029,14 @@ class SupervisorDispatcher:
                 "validation_error": str(exc),
                 "result_digest": digest,
             }
+            phase_state = job.get("phase_execution")
+            if isinstance(phase_state, dict) and phase_state.get("active") is not None:
+                try:
+                    self._phase_runtime_for_state(phase_state).reject_output(
+                        phase_state, str(exc)
+                    )
+                except PhaseExecutionError as phase_exc:
+                    raise DispatchError(str(phase_exc)) from phase_exc
             controller = self.adapter.finish(
                 job["sprint"],
                 job["ticket"],
@@ -1054,6 +1210,14 @@ class SupervisorDispatcher:
             "pr": "",
             "attempt_token": job["attempt_token"],
         }
+        phase_state = job.get("phase_execution")
+        if isinstance(phase_state, dict) and phase_state.get("active") is not None:
+            try:
+                self._phase_runtime_for_state(phase_state).reject_output(
+                    phase_state, "missing structured terminal result"
+                )
+            except PhaseExecutionError as exc:
+                raise DispatchError(str(exc)) from exc
         controller = self.adapter.finish(
             job["sprint"],
             job["ticket"],

@@ -542,6 +542,12 @@ Disposable phase execution uses
 Adapters negotiate mandatory fencing, fresh-context, progress, cancellation,
 and terminal-result capabilities before dispatch. Stale or malformed envelopes
 remain ticket-local failures and never authorize scheduler state changes.
+The durable supervisor now records a stable logical phase job and a fresh
+dispatch/execution identity for every invocation. Failed units can be replaced
+without changing the job or external-operation key, cancellation requires a
+bound acknowledgement or a fence, and restart reconciliation keeps a proven
+live unit instead of launching a duplicate. Existing 1.x ticket-workflow
+launches remain compatible while narrower phase adapters are introduced.
 
 Please report security-sensitive findings privately according to
 [SECURITY.md](SECURITY.md) and follow the [Code of Conduct](CODE_OF_CONDUCT.md).

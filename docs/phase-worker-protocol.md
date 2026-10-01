@@ -96,12 +96,42 @@ This is a compatibility interpretation, not permission to reconstruct missing
 identity. Adapters in later delivery slices must negotiate the contract before
 reservation and preserve these exact bindings through terminal processing.
 
+## Supervisor-managed execution
+
+`scripts/phase_execution.py` is the host-owned reference state machine for this
+contract. It creates one stable logical job and one fresh dispatch/execution
+identity for each worker invocation. A replacement therefore retains the job,
+ticket, phase, attempt, repository, worktree, and external-operation key while
+receiving a new dispatch and execution-unit identity. The external-operation
+key gives adapters a stable idempotency key without preserving a model session.
+
+Capability negotiation happens before dispatch. Progress, heartbeat,
+cancellation acknowledgement, and terminal evidence are accepted only when
+their attempt, supervisor fence, dispatch, and execution unit match the active
+record. Progress sequence numbers are exact and replayed envelopes are
+idempotent. Invalid structured output becomes a bounded `malformed_result` and
+makes only that logical job replaceable.
+
+Cancellation has two safe endings: a fully bound acknowledgement carrying a
+terminal receipt, or a supervisor fence backed by a bounded absence/deadline
+receipt. A replacement cannot start while an execution is active or merely
+being cancelled. On restart, an exact live observation keeps the existing
+execution and refuses a duplicate; an exact mechanically proven absence makes
+the same job replaceable.
+
+The existing 1.x ticket-workflow launcher remains supported during rollout.
+It is represented as the `ticket-workflow` phase, receives a protocol `job`
+envelope in its prompt, and has its legacy terminal result translated into a
+bound phase terminal envelope. New callers may name narrower phases without
+reusing the prior model conversation.
+
 ## Conformance
 
 Run the focused suite with:
 
 ```bash
 bash tests/phase-worker-protocol.test.sh
+bash tests/phase-execution.test.sh
 ```
 
 The fixture set covers Codex desktop, Claude desktop, and API capability offers;
