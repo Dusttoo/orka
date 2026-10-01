@@ -1,7 +1,7 @@
 # Orka 2: durable supervisor runtime
 
 Status: accepted architectural direction; implementation in independently
-releasable slices. Orka 1.8.18 provides the detached supervisor, repository
+releasable slices. Orka 1.8.19 provides the detached supervisor, repository
 lease lifecycle, deterministic synchronization/planning loop, controller-owned
 desktop/API worker dispatch, versioned terminal-result transitions, ticket-local
 parking, durable retry wakeups, classified operator-decision resolution, and
@@ -11,7 +11,9 @@ allocation, a versioned recovery eligibility contract, automatic recovery of
 exact mechanically proven-dead worker attempts and authenticated preserved PRs,
 recovery-specific crash/replay proofs, contract-driven ticket/route breaker
 transitions, generation-bound sprint pressure/global breakers, and the
-provider-neutral disposable phase-worker protocol with shared adapter fixtures.
+provider-neutral disposable phase-worker protocol with shared adapter fixtures,
+and the accepted transactional event-store architecture with an executable
+concurrency prototype.
 
 Orka's controller has durable checkpoints and mechanical gates, but a
 model-driven captain still performs the outer `plan -> launch -> wait -> finish
@@ -134,6 +136,8 @@ concerns.
 7. Specify the disposable phase-worker protocol and shared adapter fixtures.
    **Complete in 1.8.18.**
 8. Introduce a transactional event store with checkpoint import/export.
+   **The architecture decision, schema prototype, and implementation slices are
+   complete in 1.8.19; production cutover remains tracked by issue #76.**
 9. Add supervisor lease takeover and crash recovery.
 10. Expose stable status, pause, resume, and decision CLI commands.
 11. Prove the design with restart, timeout, provider-loss, and malformed-output
