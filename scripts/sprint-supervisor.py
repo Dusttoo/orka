@@ -30,6 +30,7 @@ from typing import Any
 
 from runtime_state import (
     RuntimeStateError,
+    assert_legacy_runtime_writable,
     canonical_config_path,
     shared_repository_root,
     shared_runtime_path,
@@ -1034,12 +1035,13 @@ def write_handshake(path: Path, value: dict[str, Any]) -> None:
 def run_daemon(repository: Path, handshake: Path) -> int:
     paths = runtime_paths(repository)
     try:
+        assert_legacy_runtime_writable(repository)
         ensure_private_directory(paths["directory"])
         contract_value, lifecycle, contract_digest = contract()
         del contract_value
         lock_flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
         lock_descriptor = os.open(paths["lock"], lock_flags, 0o600)
-    except (OSError, SupervisorError) as exc:
+    except (OSError, RuntimeStateError, SupervisorError) as exc:
         write_handshake(handshake, {"status": "error", "error": str(exc)})
         return 2
     lock_handle = os.fdopen(lock_descriptor, "a+")

@@ -23,6 +23,7 @@ from typing import Any, Iterator
 IDENTITY_SCHEMA_VERSION = 1
 RUNTIME_DIRECTORY = "orka-runtime"
 IDENTITY_FILE = "repository.json"
+CUTOVER_FILE = "cutover.json"
 
 
 class RuntimeStateError(RuntimeError):
@@ -318,6 +319,76 @@ def repository_initialization_authority(start: Path) -> Iterator[None]:
 
     with _initialization_lock(repository_layout(start)):
         yield
+
+
+def runtime_cutover_marker(start: Path) -> dict[str, Any] | None:
+    """Return and authenticate the repository-local cutover marker."""
+
+    layout = repository_layout(start)
+    marker = layout.state_root / CUTOVER_FILE
+    if not marker.exists() and not marker.is_symlink():
+        return None
+    try:
+        mode = marker.lstat().st_mode
+        if stat.S_ISLNK(mode) or not stat.S_ISREG(mode) or mode & 0o077:
+            raise RuntimeStateError(
+                "runtime cutover marker must be a private regular file"
+            )
+        value = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeStateError("runtime cutover marker is unreadable") from exc
+    required = {
+        "schema_version",
+        "repository_id",
+        "minimum_orka_version",
+        "legacy_snapshot_digest",
+        "activated_at",
+        "activation_id",
+    }
+    if not isinstance(value, dict) or required - value.keys():
+        raise RuntimeStateError("runtime cutover marker is missing required fields")
+    if value["schema_version"] != 1:
+        raise RuntimeStateError("unsupported runtime cutover marker schema")
+    identity = _read_identity(layout)
+    if value["repository_id"] != identity["repository_uuid"]:
+        raise RuntimeStateError("runtime cutover marker belongs to another repository")
+    material = {key: value[key] for key in sorted(value) if key != "activation_id"}
+    expected = hashlib.sha256(
+        json.dumps(
+            material, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+    ).hexdigest()
+    if value["activation_id"] != f"cutover-{expected}":
+        raise RuntimeStateError("runtime cutover marker digest is invalid")
+    return value
+
+
+def assert_legacy_runtime_writable(
+    start: Path, *, plugin_root: Path | None = None
+) -> None:
+    """Refuse every legacy JSON mutation once transactional cutover is active."""
+
+    marker = runtime_cutover_marker(start)
+    if marker is None:
+        return
+    try:
+        from version_policy import manifest_version, release_version
+
+        root = plugin_root or Path(__file__).resolve().parent.parent
+        active = manifest_version(root)
+        minimum = str(marker["minimum_orka_version"])
+        if release_version(active) < release_version(minimum):
+            raise RuntimeStateError(
+                f"active Orka version {active} is below transactional cutover minimum {minimum}"
+            )
+    except (ImportError, ValueError) as exc:
+        raise RuntimeStateError(
+            "transactional cutover cannot verify the active Orka version"
+        ) from exc
+    raise RuntimeStateError(
+        "legacy JSON runtime is read-only after transactional cutover; "
+        "use the repository supervisor"
+    )
 
 
 def _materialize_policy(layout: RepositoryLayout, snapshot: PolicySnapshot) -> Path:
