@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import shutil
@@ -24,6 +25,10 @@ from supervisor_planning import (  # noqa: E402
     classify_cycle,
     due_health_roles,
     planning_cycle,
+)
+from supervisor_state import (  # noqa: E402
+    SupervisorStateError,
+    migrate_supervisor_state,
 )
 
 SUPERVISOR_SPEC = __import__("importlib.util").util.spec_from_file_location(
@@ -315,7 +320,13 @@ class PlanningLoopTests(unittest.TestCase):
                 "route_breakers": [
                     {"subject": "route-a", "class_id": "route_transient_hold"}
                 ],
-                "pressure_breakers": [{"subject": "99", "class_id": "sprint_pressure"}],
+                "pressure_breakers": [
+                    {
+                        "source_id": "unfinished_pr_pressure",
+                        "subject": "99",
+                        "class_id": "sprint_pressure",
+                    }
+                ],
                 "active_global_breaker": {
                     "source_id": "unfinished_pr_pressure",
                     "generation": "1:1:pressure",
@@ -328,6 +339,7 @@ class PlanningLoopTests(unittest.TestCase):
                     "run-1": {"ticket": "PNP-1", "state": "running"},
                     "run-2": {"ticket": "PNP-2", "state": "retry_wait"},
                     "run-3": {"ticket": "PNP-3", "state": "parked_decision"},
+                    "run-4": {"ticket": "PNP-7", "state": "completed"},
                 },
                 "launch_count": 3,
                 "terminal_count": 2,
@@ -336,10 +348,32 @@ class PlanningLoopTests(unittest.TestCase):
         with patch.object(sprint_supervisor, "process_status", return_value="live"):
             result = sprint_supervisor.status_response(state)
         self.assertEqual(result["dispatch"]["active_jobs"], 1)
+        self.assertEqual(result["dispatch"]["terminal_jobs"], 1)
         self.assertEqual(result["dispatch"]["queued"], ["PNP-5", "PNP-6"])
         self.assertEqual(result["dispatch"]["retrying"], ["PNP-2"])
         self.assertEqual(result["dispatch"]["parked"], ["PNP-3"])
         self.assertEqual(result["dispatch"]["blocked"], ["PNP-4"])
+        self.assertEqual(result["dispatch"]["active"], ["PNP-1"])
+        self.assertEqual(result["dispatch"]["route_held"], ["route-a"])
+        self.assertEqual(
+            result["dispatch"]["pressure_limited"], ["unfinished_pr_pressure"]
+        )
+        self.assertEqual(result["dispatch"]["globally_paused"], {})
+        self.assertEqual(result["dispatch"]["terminal"], ["PNP-7"])
+        self.assertEqual(
+            set(result["dispatch"]["categories"]),
+            {
+                "queued",
+                "active",
+                "retrying",
+                "parked",
+                "route_held",
+                "pressure_limited",
+                "globally_paused",
+                "blocked",
+                "terminal",
+            },
+        )
         self.assertEqual(
             result["dispatch"]["lane_allocation"]["selections"][0]["reason"],
             "weighted-fair-share:fresh",
@@ -449,6 +483,198 @@ class GlobalBreakerTests(unittest.TestCase):
         )
         self.assertEqual(state["planning"]["active_global_breaker"], {})
         self.assertEqual(state["dispatch"]["jobs"]["run-1"]["state"], "running")
+
+
+class BreakerStateMigrationTests(unittest.TestCase):
+    def legacy(self) -> dict:
+        return {
+            "schema_version": 1,
+            "contract_id": "orka.supervisor-lifecycle",
+            "contract_schema_version": 1,
+            "repository": "/tmp/repo",
+            "lifecycle_state": "active",
+            "last_event": "controller_plan_updated",
+            "started_at": "2026-09-01T00:00:00+00:00",
+            "updated_at": "2026-09-01T01:00:00+00:00",
+            "process": {"pid": 123, "start_fingerprint": "old-process"},
+            "lease": {"id": "old-lease", "generation": 4},
+            "history": [{"event": "preserved-history", "evidence": {"attempt": 2}}],
+            "requests": [{"request_id": "preserved-request"}],
+            "runtime_fingerprint": "old-runtime",
+            "contract_digest": "old-contract",
+            "planning": {
+                "sprint": {"id": "99"},
+                "decision_queue": [
+                    {
+                        "key": "PNP-1",
+                        "state": "operator_decision",
+                        "reasons": ["hard review decision"],
+                        "pr": 40,
+                    }
+                ],
+                "provider_holds": [
+                    {
+                        "state": "rate_limited",
+                        "provider": "openai",
+                        "role": "sprint-worker",
+                        "route_identity": "openai:sprint-worker",
+                        "retry_at": 100,
+                    }
+                ],
+                "spend": {"PNP-1": {"spent_usd": "12.30"}},
+                "dependency_graph": {"PNP-2": ["PNP-1"]},
+                "review_ledgers": {"PNP-1": "sha256:review"},
+            },
+            "dispatch": {
+                "jobs": {
+                    "run-1": {
+                        "ticket": "PNP-1",
+                        "state": "parked_decision",
+                        "attempt_token": "attempt-2",
+                        "pr": 40,
+                    }
+                }
+            },
+        }
+
+    def migrate(self, state: dict) -> tuple[dict, bool]:
+        return migrate_supervisor_state(
+            state,
+            target_runtime_fingerprint="new-runtime",
+            target_contract_digest="new-contract",
+        )
+
+    def test_migration_is_once_only_and_preserves_history_and_bindings(self) -> None:
+        legacy = self.legacy()
+        migrated, changed = self.migrate(legacy)
+        self.assertTrue(changed)
+        self.assertEqual(migrated["schema_version"], 2)
+        self.assertEqual(migrated["dispatch"], legacy["dispatch"])
+        self.assertEqual(migrated["requests"], legacy["requests"])
+        self.assertEqual(migrated["history"], legacy["history"])
+        self.assertEqual(migrated["planning"]["spend"], legacy["planning"]["spend"])
+        self.assertEqual(
+            migrated["planning"]["dependency_graph"],
+            legacy["planning"]["dependency_graph"],
+        )
+        self.assertEqual(
+            migrated["planning"]["review_ledgers"],
+            legacy["planning"]["review_ledgers"],
+        )
+        self.assertEqual(
+            migrated["planning"]["ticket_breakers"][0]["class_id"],
+            "ticket_hard_decision",
+        )
+        self.assertEqual(
+            migrated["planning"]["route_breakers"][0]["class_id"],
+            "route_transient_hold",
+        )
+        repeated, changed_again = self.migrate(copy.deepcopy(migrated))
+        self.assertFalse(changed_again)
+        self.assertEqual(repeated, migrated)
+
+    def test_unknown_or_ambiguous_legacy_stop_fails_closed(self) -> None:
+        unknown = self.legacy()
+        unknown["planning"]["decision_queue"][0]["source_id"] = "invented-stop"
+        with self.assertRaisesRegex(SupervisorStateError, "unknown breaker source"):
+            self.migrate(unknown)
+        ambiguous = self.legacy()
+        ambiguous["planning"]["decision_queue"][0]["state"] = "mystery"
+        with self.assertRaisesRegex(SupervisorStateError, "ambiguous"):
+            self.migrate(ambiguous)
+
+    def test_migration_rejects_softening_protected_review_and_security_gates(
+        self,
+    ) -> None:
+        for source_id in (
+            "review_gate_failed",
+            "security_gate_failed",
+            "merge_gate_failed",
+        ):
+            with self.subTest(source_id=source_id):
+                legacy = self.legacy()
+                legacy["planning"]["decision_queue"] = []
+                legacy["planning"]["ticket_breakers"] = [
+                    {
+                        "source_id": source_id,
+                        "subject": "PNP-1",
+                        "class_id": "ticket_retry_wait",
+                        "scope": "ticket",
+                        "strength": "soft",
+                        "durable_state": "retry_wait",
+                    }
+                ]
+                with self.assertRaisesRegex(SupervisorStateError, "protected"):
+                    self.migrate(legacy)
+
+    def test_legacy_route_degradation_becomes_local_without_losing_jobs(self) -> None:
+        legacy = self.legacy()
+        legacy["lifecycle_state"] = "degraded"
+        jobs = copy.deepcopy(legacy["dispatch"]["jobs"])
+        migrated, _changed = self.migrate(legacy)
+        self.assertEqual(migrated["lifecycle_state"], "active")
+        self.assertEqual(migrated["dispatch"]["jobs"], jobs)
+        self.assertEqual(
+            migrated["history"][-1]["event"],
+            "legacy-route-degradation-reclassified",
+        )
+
+    def test_hard_budget_pause_migrates_to_exact_global_generation(self) -> None:
+        legacy = self.legacy()
+        legacy["lifecycle_state"] = "paused"
+        legacy["planning"].update(
+            {
+                "pause_cause": "hard_sprint_budget_exhausted",
+                "budget": {
+                    "digest": "budget-receipt",
+                    "absolute_ceiling_usd": "50",
+                },
+            }
+        )
+        migrated, _changed = self.migrate(legacy)
+        active = migrated["planning"]["active_global_breaker"]
+        self.assertEqual(active["source_id"], "max_usd_per_sprint")
+        self.assertEqual(active["strength"], "hard")
+        self.assertIn(":migration:", active["generation"])
+        self.assertEqual(
+            active["transition_evidence"]["budget_receipt"], "budget-receipt"
+        )
+
+    def test_existing_global_generation_survives_schema_migration_exactly(self) -> None:
+        legacy = self.legacy()
+        legacy["lifecycle_state"] = "paused"
+        legacy["planning"]["pause_cause"] = "hard_sprint_budget_exhausted"
+        breaker = sprint_supervisor.BREAKER_RUNTIME.sprint_record(
+            "max_usd_per_sprint",
+            sprint="99",
+            evidence={"budget_receipt": "existing-budget"},
+        )
+        breaker.update(
+            {
+                "generation": "4:7:existing",
+                "transition_evidence": {
+                    "budget_receipt": "existing-budget",
+                    "absolute_ceiling": "75",
+                },
+                "activated_at": "before",
+            }
+        )
+        legacy["planning"]["active_global_breaker"] = copy.deepcopy(breaker)
+        migrated, _changed = self.migrate(legacy)
+        self.assertEqual(migrated["planning"]["active_global_breaker"], breaker)
+
+    def test_unknown_global_pause_fails_closed_with_action(self) -> None:
+        legacy = self.legacy()
+        legacy["lifecycle_state"] = "paused"
+        legacy["planning"]["pause_cause"] = "legacy-mystery"
+        with self.assertRaisesRegex(SupervisorStateError, "classify it explicitly"):
+            self.migrate(legacy)
+
+    def test_schema_two_replay_rejects_tampered_breaker_identity(self) -> None:
+        migrated, _changed = self.migrate(self.legacy())
+        migrated["planning"]["ticket_breakers"][0]["record_digest"] = "forged"
+        with self.assertRaisesRegex(SupervisorStateError, "mismatched record digest"):
+            self.migrate(migrated)
 
 
 class TakeoverStateTests(unittest.TestCase):
@@ -603,6 +829,77 @@ class TakeoverStateTests(unittest.TestCase):
             recovered["history"][-1]["evidence"]["breaker_generation"],
             "4:1:budget",
         )
+
+    def test_takeover_restores_pressure_and_all_routes_generations(self) -> None:
+        _contract, lifecycle, _digest = sprint_supervisor.contract()
+        cases = (
+            (
+                "degraded",
+                "unfinished_pr_pressure",
+                "4:1:pressure",
+                {
+                    "pressure_class": "unfinished_pr_pressure",
+                    "capacity_snapshot": "capacity",
+                },
+            ),
+            (
+                "paused",
+                "all_routes_unavailable",
+                "4:2:routes",
+                {"route_incidents": "routes", "next_probe_at": 200},
+            ),
+        )
+        for lifecycle_state, source_id, generation, transition_evidence in cases:
+            with self.subTest(source_id=source_id):
+                previous = self.previous(lifecycle_state)
+                previous["planning"]["pause_cause"] = (
+                    "all_routes_unavailable" if lifecycle_state == "paused" else ""
+                )
+                evidence = (
+                    {
+                        "pressure_class": "unfinished_prs",
+                        "capacity_snapshot": {"count": 3},
+                    }
+                    if lifecycle_state == "degraded"
+                    else {"route_incidents": ["route-a"], "next_probe_at": 200}
+                )
+                breaker = sprint_supervisor.BREAKER_RUNTIME.sprint_record(
+                    source_id, sprint="99", evidence=evidence
+                )
+                breaker.update(
+                    {
+                        "generation": generation,
+                        "transition_evidence": transition_evidence,
+                        "activated_at": "before",
+                    }
+                )
+                previous["planning"]["active_global_breaker"] = breaker
+                with patch.object(
+                    sprint_supervisor, "process_status", return_value="absent"
+                ):
+                    recovered = sprint_supervisor.takeover_state(
+                        previous,
+                        identity={
+                            "pid": 123,
+                            "start_fingerprint": "new-process",
+                            "session_id": 123,
+                        },
+                        lease={"id": "new-lease", "generation": 5},
+                        lifecycle=lifecycle,
+                        config_digest=self.config_digest,
+                        runtime_digest=self.runtime_digest,
+                        contract_digest=self.contract_digest,
+                        settings=self.settings,
+                    )
+                self.assertEqual(recovered["lifecycle_state"], lifecycle_state)
+                self.assertEqual(
+                    recovered["planning"]["active_global_breaker"]["generation"],
+                    generation,
+                )
+                self.assertEqual(
+                    recovered["history"][-1]["evidence"]["breaker_generation"],
+                    generation,
+                )
 
     def test_takeover_rejects_live_unknown_or_changed_predecessor_evidence(
         self,
@@ -905,6 +1202,48 @@ class SupervisorProcessTests(unittest.TestCase):
         events = [item["event"] for item in recovered["history"]]
         self.assertIn("takeover_requested", events)
         self.assertIn("predecessor_absent", events)
+
+    def test_authenticated_schema_one_state_migrates_once_on_unclean_restart(
+        self,
+    ) -> None:
+        repository = self.repository()
+        self.run_cli("start", repository)
+        previous = self.read_state(repository)
+        os.kill(previous["process"]["pid"], signal.SIGKILL)
+        self.wait_for(lambda: not self.process_live(previous))
+
+        state_path = repository / ".orchestration/.supervisor/state.json"
+        receipt_path = repository / ".orchestration/.supervisor/state.sha256.json"
+        legacy = self.read_state(repository)
+        legacy["schema_version"] = 1
+        legacy["runtime_fingerprint"] = "legacy-runtime-fingerprint"
+        legacy["contract_digest"] = "legacy-contract-digest"
+        legacy.pop("breaker_migration", None)
+        state_path.write_text(
+            json.dumps(legacy, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+        )
+        receipt_path.write_text(
+            json.dumps(
+                {
+                    "sha256": hashlib.sha256(state_path.read_bytes()).hexdigest(),
+                    "recorded_at": "legacy",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        restarted = self.output(self.run_cli("start", repository))
+        self.assertEqual(restarted["lifecycle_state"], "active")
+        migrated = self.read_state(repository)
+        self.assertEqual(migrated["schema_version"], 2)
+        self.assertEqual(
+            migrated["breaker_migration"]["prior_runtime_fingerprint"],
+            "legacy-runtime-fingerprint",
+        )
+        self.assertEqual(
+            migrated["takeover"]["predecessor_process"], previous["process"]
+        )
 
     def test_pause_and_idempotent_request_survive_unclean_restart(self) -> None:
         repository = self.repository()

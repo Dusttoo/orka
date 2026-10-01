@@ -108,8 +108,11 @@ and immediately replans when a lane exits. Duplicate delivery is a journaled
 no-op; stale bindings are rejected; malformed or missing output moves only that
 ticket to recovery-ready.
 
-`status` separates active, queued, retrying, parked, blocked, and terminal job
-sets. A no-progress timeout enters a durable retry wait for
+`status` exposes stable `queued`, `active`, `retrying`, `parked`, `route_held`,
+`pressure_limited`, `globally_paused`, `blocked`, and `terminal` categories.
+Only authenticated completion, decomposition, and cancellation are terminal;
+parked, retrying, blocked, repair, and recovery work is not reported as
+complete or hidden as exhaustion. A no-progress timeout enters a durable retry wait for
 `supervisor_ticket_retry_seconds` (default 30) and consumes no lane. Once its
 deadline arrives, the supervisor requeues only that exact stopped attempt after
 verifying its ticket-scoped breaker record, and immediately replans. A deadline
@@ -139,6 +142,14 @@ automatically. A hard-budget generation remains paused after the ceiling is
 raised until an operator resume consumes the new budget receipt against that
 generation. Status exposes the active global breaker without exposing
 credentials.
+
+Supervisor state schema v2 deterministically imports an authenticated schema-v1
+checkpoint once. The migration receipt binds the source state plus the old and
+new runtime and contract fingerprints. Dispatch jobs, attempts, spend, review
+and PR bindings, dependency state, request history, and lifecycle history are
+preserved. Unknown stops and incomplete global pause evidence fail closed with
+an explicit recovery instruction; hard review, security, merge, and budget
+controls are revalidated rather than reclassified.
 
 Admission is queue-class aware. A single-lane repository remains strictly
 finish-first. With two or more lanes, eligible dependency-unlocking work gets
