@@ -440,6 +440,15 @@ repositories to share an enforcement domain. See
 existing JSON controller state is intentionally not relocated until the
 separate import and cutover slices are complete.
 
+Orka 1.8.21 adds the transactional store core behind that boundary. A single
+supervisor-owned writer now provides atomic job reservation, launch,
+completion, resource-claim release, retry timers, and idempotent external
+operation receipts over the versioned SQLite schema. WAL remains opt-in and is
+enabled only after the caller proves a local filesystem and the loaded SQLite
+contains the documented reset fix; otherwise the store reports its rollback
+journal fallback. This API is not yet the production controller authority. See
+[Transactional event-store core](docs/transactional-event-store.md).
+
 Multi-lane supervisors allocate work through durable queue classes rather than
 globally pausing for the oldest repair. Repair and recovery retain greater
 weight, one lane is reserved for dependency-unlocking work when eligible, and a

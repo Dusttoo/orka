@@ -1,6 +1,6 @@
 # ADR 0001: Transactional repository event store
 
-- Status: proposed for acceptance in issue #76
+- Status: accepted in issue #76
 - Date: 2026-10-01
 - Owners: Orka maintainers
 - Supersedes: no prior ADR
@@ -315,7 +315,7 @@ Costs and constraints:
    policy binding, and fail-closed legacy-root discovery.
 2. Issue #116: transactional store core, schema, one-writer transaction API,
    event and projection invariants, idempotency, timers, and concurrent
-   completion tests.
+   completion tests. **Implemented in Orka 1.8.21.**
 3. Issue #117: deterministic export, legacy JSON importer, migration receipts,
    ambiguity handling, and shadow comparison.
 4. Issue #118: controller/supervisor integration, socket-owned mutations,
