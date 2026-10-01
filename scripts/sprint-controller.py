@@ -3544,6 +3544,14 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
         "allocation_candidates": allocation_candidates,
         "provider_holds": provider_holds,
         "route_breakers": route_breakers,
+        "required_roles": sorted(needed_roles),
+        "route_blocked_roles": sorted(
+            {
+                str(hold.get("role") or "")
+                for hold in provider_holds
+                if hold.get("role") in needed_roles
+            }
+        ),
         "health_probes": health_probes,
         "scope": scope,
         "decomposition": decomposition,

@@ -62,7 +62,7 @@
     "operator_resumed": {
       "entity": "supervisor",
       "scope": "global",
-      "required_evidence": ["operator_request_id"],
+      "required_evidence": ["operator_request_id", "breaker_generation"],
       "replay": "no_op_if_applied"
     },
     "drain_requested": {
@@ -89,16 +89,28 @@
       "required_evidence": ["route_identity", "health_receipt"],
       "replay": "reconcile_then_no_op"
     },
+    "sprint_pressure_applied": {
+      "entity": "supervisor",
+      "scope": "global",
+      "required_evidence": ["breaker_generation", "pressure_class", "capacity_snapshot"],
+      "replay": "reconcile_then_no_op"
+    },
+    "sprint_pressure_cleared": {
+      "entity": "supervisor",
+      "scope": "global",
+      "required_evidence": ["breaker_generation", "capacity_snapshot"],
+      "replay": "reconcile_then_no_op"
+    },
     "all_routes_unavailable": {
       "entity": "supervisor",
       "scope": "global",
-      "required_evidence": ["route_incidents", "next_probe_at"],
+      "required_evidence": ["route_incidents", "next_probe_at", "breaker_generation"],
       "replay": "reconcile_then_no_op"
     },
     "routes_available": {
       "entity": "supervisor",
       "scope": "global",
-      "required_evidence": ["route_health_receipts"],
+      "required_evidence": ["route_health_receipts", "breaker_generation"],
       "replay": "reconcile_then_no_op"
     },
     "takeover_requested": {
@@ -134,7 +146,7 @@
     "hard_sprint_budget_exhausted": {
       "entity": "supervisor",
       "scope": "global",
-      "required_evidence": ["budget_receipt", "absolute_ceiling"],
+      "required_evidence": ["budget_receipt", "absolute_ceiling", "breaker_generation"],
       "replay": "reconcile_then_no_op"
     },
     "sprint_completed": {
@@ -319,9 +331,9 @@
     {"entity": "supervisor", "from": "active", "event": "drain_requested", "to": "draining"},
     {"entity": "supervisor", "from": "degraded", "event": "drain_requested", "to": "draining"},
     {"entity": "supervisor", "from": "draining", "event": "drain_completed", "to": "paused"},
-    {"entity": "supervisor", "from": "active", "event": "route_degraded", "to": "degraded"},
-    {"entity": "supervisor", "from": "degraded", "event": "route_degraded", "to": "degraded"},
-    {"entity": "supervisor", "from": "degraded", "event": "route_recovered", "to": "active", "guard": "all required routes are healthy or another eligible route can run queued work"},
+    {"entity": "supervisor", "from": "active", "event": "sprint_pressure_applied", "to": "degraded"},
+    {"entity": "supervisor", "from": "degraded", "event": "sprint_pressure_applied", "to": "degraded"},
+    {"entity": "supervisor", "from": "degraded", "event": "sprint_pressure_cleared", "to": "active"},
     {"entity": "supervisor", "from": "active", "event": "all_routes_unavailable", "to": "paused"},
     {"entity": "supervisor", "from": "degraded", "event": "all_routes_unavailable", "to": "paused"},
     {"entity": "supervisor", "from": "paused", "event": "routes_available", "to": "active", "guard": "pause reason is all_routes_unavailable"},

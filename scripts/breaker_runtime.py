@@ -79,7 +79,7 @@ class BreakerRuntime:
             raise BreakerRuntimeError("breaker evidence must be a nonempty object")
         class_id = source["class"]
         definition = self.classes[class_id]
-        return {
+        record = {
             "source_id": source_id,
             "class_id": class_id,
             "scope": definition["scope"],
@@ -87,9 +87,12 @@ class BreakerRuntime:
             "durable_state": definition["durable_state"],
             "wake_condition": definition["wake_condition"],
             "authority": definition["authority"],
+            "global_transition": bool(definition["global_transition"]),
             "subject": subject.strip(),
             "evidence_digest": canonical_digest(evidence),
         }
+        record["record_digest"] = canonical_digest(record)
+        return record
 
     def terminal_record(
         self,
@@ -144,4 +147,23 @@ class BreakerRuntime:
             )
         record["role"] = role
         record["provider"] = str(hold.get("provider") or "")
+        return record
+
+    def sprint_record(
+        self,
+        source_id: str,
+        *,
+        sprint: str,
+        evidence: dict[str, Any],
+    ) -> dict[str, Any]:
+        record = self.record(source_id, subject=sprint, evidence=evidence)
+        if record["scope"] != "sprint" or not record["global_transition"]:
+            raise BreakerRuntimeError(
+                f"breaker source {source_id} cannot change sprint state"
+            )
+        if record["durable_state"] not in {"degraded", "paused", "stopped"}:
+            raise BreakerRuntimeError(
+                f"sprint breaker {source_id} has invalid durable state "
+                f"{record['durable_state']}"
+            )
         return record

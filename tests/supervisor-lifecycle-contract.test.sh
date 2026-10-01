@@ -54,6 +54,12 @@ if validate "$TMP/route-stop.json"; then
 fi
 pass "route-local events cannot pause the supervisor"
 
+jq '.transitions += [{"entity":"supervisor","from":"active","event":"route_degraded","to":"degraded"}]' "$CONTRACT" >"$TMP/route-degrade.json"
+if validate "$TMP/route-degrade.json"; then
+  fail "route-local events cannot degrade the supervisor"
+fi
+pass "route-local events cannot degrade the supervisor"
+
 jq '.queue_policy.skipped_jobs_remain_queued = false' "$CONTRACT" >"$TMP/consuming-queue.json"
 if validate "$TMP/consuming-queue.json"; then
   fail "weakened non-consuming queue policy is rejected"

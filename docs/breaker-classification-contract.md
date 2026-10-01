@@ -3,8 +3,9 @@
 Orka 1.8.14 introduced the versioned
 [`orka.breaker-classification/v1`](../contracts/breaker-classification-v1.json)
 contract. Orka 1.8.15 applies its ticket and route classes to controller plans,
-worker terminal transitions, retry wakeups, and supervisor status. Sprint-wide
-pressure and global stop enforcement remain a separate delivery slice.
+worker terminal transitions, retry wakeups, and supervisor status. Orka 1.8.16
+enforces sprint pressure and hard global transitions. Checkpoint migration and
+the final cross-version integration matrix remain a separate delivery slice.
 
 Every stop source has exactly one class along two independent axes:
 
@@ -73,3 +74,16 @@ Controller decisions preserve their ticket-local breaker records, while
 provider holds publish route-local records. Healthy roles and unrelated
 tickets remain eligible, and skipping a held candidate consumes no lane,
 attempt, or reservation.
+
+Sprint pressure records are also deterministic, but only their class may move
+the supervisor to `degraded`. Unfinished-PR, lane-capacity, and heavy-process
+pressure reduce new admission through their existing queue/capacity policy;
+they never cancel active work. Route records cannot change supervisor state.
+
+`all_routes_unavailable` and the authenticated absolute sprint budget are the
+only breaker-driven pauses. Lease loss, invalid state, and preflight failure are
+the hard integrity stops. Each activation receives a durable generation derived
+from the repository lease generation, monotonic breaker sequence, and evidence
+record. Restart restores that exact generation. A hard-budget resume requires a
+new authoritative budget receipt and an operator request bound to the stored
+generation; duplicate activation or request delivery is a no-op.
