@@ -121,6 +121,16 @@ class PlanningLoopTests(unittest.TestCase):
             "health_probes": [
                 {"provider": "openai", "role": "sprint-worker", "retry_at": 125}
             ],
+            "required_roles": ["sprint-worker"],
+            "route_blocked_roles": ["sprint-worker"],
+            "route_breakers": [
+                {
+                    "source_id": "provider_rate_limited",
+                    "class_id": "route_transient_hold",
+                    "subject": "openai-worker",
+                    "role": "sprint-worker",
+                }
+            ],
             "autonomous_work_remaining": True,
         }
         result = classify_cycle(
@@ -134,7 +144,54 @@ class PlanningLoopTests(unittest.TestCase):
         self.assertEqual(result["wait_reason"], "durable-deadline")
         self.assertTrue(result["all_routes_unavailable"])
         self.assertFalse(result["autonomous_work_exhausted"])
+        self.assertEqual(
+            result["global_breakers"][0]["source_id"], "all_routes_unavailable"
+        )
         self.assertEqual(due_health_roles(plan, 125), ["sprint-worker"])
+
+    def test_one_held_route_does_not_pause_work_with_an_eligible_route(self) -> None:
+        plan = {
+            "sprint": {"id": "99"},
+            "scope": ["PNP-2"],
+            "required_roles": ["sprint-worker", "ticket-scoper"],
+            "route_blocked_roles": ["sprint-worker"],
+            "provider_holds": [{"role": "sprint-worker", "state": "transport"}],
+            "autonomous_work_remaining": True,
+        }
+        result = classify_cycle(
+            plan,
+            {"sprint_complete": False},
+            self.budget(),
+            current_time=100,
+        )
+        self.assertFalse(result["all_routes_unavailable"])
+        self.assertEqual(result["plan"]["scope"], ["PNP-2"])
+        self.assertEqual(result["global_breakers"], [])
+
+    def test_soft_pressure_is_evidence_bearing_without_cancelling_work(self) -> None:
+        plan = {
+            "sprint": {"id": "99"},
+            "concurrency_max": 2,
+            "running": ["PNP-1", "PNP-2"],
+            "work_in_progress": {
+                "fresh_launch_paused": True,
+                "count": 2,
+                "limit": 2,
+            },
+            "autonomous_work_remaining": True,
+        }
+        result = classify_cycle(
+            plan,
+            {"sprint_complete": False},
+            self.budget(),
+            current_time=100,
+        )
+        self.assertEqual(result["running"], ["PNP-1", "PNP-2"])
+        self.assertEqual(
+            {item["source_id"] for item in result["pressure_breakers"]},
+            {"unfinished_pr_pressure", "lane_capacity_pressure"},
+        )
+        self.assertFalse(result["all_routes_unavailable"])
 
     def test_true_exhaustion_is_distinct_from_authenticated_completion(self) -> None:
         exhausted = classify_cycle(
@@ -258,6 +315,11 @@ class PlanningLoopTests(unittest.TestCase):
                 "route_breakers": [
                     {"subject": "route-a", "class_id": "route_transient_hold"}
                 ],
+                "pressure_breakers": [{"subject": "99", "class_id": "sprint_pressure"}],
+                "active_global_breaker": {
+                    "source_id": "unfinished_pr_pressure",
+                    "generation": "1:1:pressure",
+                },
                 "decision_queue": [{"key": "PNP-3", "state": "operator_decision"}],
                 "waiting": [{"key": "PNP-4", "reasons": ["dependency"]}],
             },
@@ -282,12 +344,111 @@ class PlanningLoopTests(unittest.TestCase):
             result["dispatch"]["lane_allocation"]["selections"][0]["reason"],
             "weighted-fair-share:fresh",
         )
+        self.assertEqual(result["dispatch"]["ticket_breakers"][0]["subject"], "PNP-3")
+        self.assertEqual(result["dispatch"]["route_breakers"][0]["subject"], "route-a")
         self.assertEqual(
-            result["dispatch"]["ticket_breakers"][0]["subject"], "PNP-3"
+            result["dispatch"]["active_global_breaker"]["generation"],
+            "1:1:pressure",
         )
+
+
+class GlobalBreakerTests(unittest.TestCase):
+    def state(self) -> dict:
+        return {
+            "repository": "/tmp/orka-global-breaker-test",
+            "lifecycle_state": "active",
+            "lease": {"id": "lease-1", "generation": 3},
+            "process": {"pid": 123, "start_fingerprint": "process-1"},
+            "updated_at": "before",
+            "last_event": "preflight_succeeded",
+            "planning": {},
+            "dispatch": {"jobs": {"run-1": {"ticket": "PNP-1", "state": "running"}}},
+            "history": [],
+            "requests": [],
+        }
+
+    def test_pressure_transition_and_clear_are_generation_bound_and_idempotent(
+        self,
+    ) -> None:
+        _contract, lifecycle, _digest = sprint_supervisor.contract()
+        state = self.state()
+        breaker = sprint_supervisor.BREAKER_RUNTIME.sprint_record(
+            "unfinished_pr_pressure",
+            sprint="99",
+            evidence={"pressure_class": "wip", "capacity_snapshot": {"used": 3}},
+        )
+        evidence = {
+            "pressure_class": "unfinished_pr_pressure",
+            "capacity_snapshot": "capacity-digest",
+        }
+        self.assertTrue(
+            sprint_supervisor.transition_global_breaker(
+                state, lifecycle, breaker, "sprint_pressure_applied", evidence
+            )
+        )
+        generation = state["planning"]["active_global_breaker"]["generation"]
+        self.assertEqual(state["lifecycle_state"], "degraded")
+        self.assertEqual(state["dispatch"]["jobs"]["run-1"]["state"], "running")
+        history_length = len(state["history"])
+        self.assertFalse(
+            sprint_supervisor.transition_global_breaker(
+                state, lifecycle, breaker, "sprint_pressure_applied", evidence
+            )
+        )
+        self.assertEqual(len(state["history"]), history_length)
+        sprint_supervisor.clear_global_breaker(
+            state,
+            lifecycle,
+            "sprint_pressure_cleared",
+            {"capacity_snapshot": "clear-digest"},
+        )
+        self.assertEqual(state["lifecycle_state"], "active")
         self.assertEqual(
-            result["dispatch"]["route_breakers"][0]["subject"], "route-a"
+            state["planning"]["global_breaker_history"][-1]["generation"],
+            generation,
         )
+
+    def test_hard_budget_requires_resolution_of_its_exact_generation(self) -> None:
+        _contract, lifecycle, _digest = sprint_supervisor.contract()
+        state = self.state()
+        breaker = sprint_supervisor.BREAKER_RUNTIME.sprint_record(
+            "max_usd_per_sprint",
+            sprint="99",
+            evidence={"budget_receipt": "budget-1"},
+        )
+        sprint_supervisor.transition_global_breaker(
+            state,
+            lifecycle,
+            breaker,
+            "hard_sprint_budget_exhausted",
+            {"budget_receipt": "budget-1", "absolute_ceiling": "20"},
+        )
+        state["planning"]["pause_cause"] = "hard_sprint_budget_exhausted"
+        with self.assertRaisesRegex(
+            sprint_supervisor.SupervisorError, "cannot override"
+        ):
+            sprint_supervisor.apply_control(
+                state,
+                lifecycle,
+                {"command": "resume", "request_id": "resume-1", "reason": ""},
+            )
+        active = state["planning"]["active_global_breaker"]
+        generation = active["generation"]
+        active["resolution_receipt"] = "budget-2"
+        active["resolved_at"] = "now"
+        response, should_stop = sprint_supervisor.apply_control(
+            state,
+            lifecycle,
+            {"command": "resume", "request_id": "resume-2", "reason": ""},
+        )
+        self.assertFalse(should_stop)
+        self.assertEqual(response["lifecycle_state"], "active")
+        self.assertEqual(
+            state["planning"]["global_breaker_history"][-1]["generation"],
+            generation,
+        )
+        self.assertEqual(state["planning"]["active_global_breaker"], {})
+        self.assertEqual(state["dispatch"]["jobs"]["run-1"]["state"], "running")
 
 
 class TakeoverStateTests(unittest.TestCase):
@@ -397,6 +558,51 @@ class TakeoverStateTests(unittest.TestCase):
                 events = [item["event"] for item in recovered["history"]]
                 self.assertIn("takeover_requested", events)
                 self.assertIn("predecessor_absent", events)
+
+    def test_takeover_restores_the_exact_hard_budget_generation(self) -> None:
+        _contract, lifecycle, _digest = sprint_supervisor.contract()
+        previous = self.previous("paused")
+        previous["planning"]["pause_cause"] = "hard_sprint_budget_exhausted"
+        breaker = sprint_supervisor.BREAKER_RUNTIME.sprint_record(
+            "max_usd_per_sprint",
+            sprint="99",
+            evidence={"budget_receipt": "budget-1"},
+        )
+        breaker.update(
+            {
+                "generation": "4:1:budget",
+                "transition_evidence": {
+                    "budget_receipt": "budget-1",
+                    "absolute_ceiling": "20",
+                },
+                "activated_at": "before",
+            }
+        )
+        previous["planning"]["active_global_breaker"] = breaker
+        with patch.object(sprint_supervisor, "process_status", return_value="absent"):
+            recovered = sprint_supervisor.takeover_state(
+                previous,
+                identity={
+                    "pid": 123,
+                    "start_fingerprint": "new-process",
+                    "session_id": 123,
+                },
+                lease={"id": "new-lease", "generation": 5},
+                lifecycle=lifecycle,
+                config_digest=self.config_digest,
+                runtime_digest=self.runtime_digest,
+                contract_digest=self.contract_digest,
+                settings=self.settings,
+            )
+        self.assertEqual(recovered["lifecycle_state"], "paused")
+        self.assertEqual(
+            recovered["planning"]["active_global_breaker"]["generation"],
+            "4:1:budget",
+        )
+        self.assertEqual(
+            recovered["history"][-1]["evidence"]["breaker_generation"],
+            "4:1:budget",
+        )
 
     def test_takeover_rejects_live_unknown_or_changed_predecessor_evidence(
         self,
@@ -633,6 +839,9 @@ class SupervisorProcessTests(unittest.TestCase):
         )
         final = self.read_state(repository)
         self.assertEqual(final["last_event"], "lease_lost")
+        self.assertEqual(
+            final["planning"]["active_global_breaker"]["source_id"], "lease_lost"
+        )
         self.wait_for(lambda: not self.process_live(final))
         self.assertFalse(self.process_live(final))
 
@@ -652,6 +861,10 @@ class SupervisorProcessTests(unittest.TestCase):
         )
         final = self.read_state(repository)
         self.assertEqual(final["last_event"], "durable_state_invalid")
+        self.assertEqual(
+            final["planning"]["active_global_breaker"]["source_id"],
+            "durable_state_invalid",
+        )
         self.wait_for(lambda: not self.process_live(final))
         self.assertFalse(self.process_live(final))
 
@@ -666,6 +879,10 @@ class SupervisorProcessTests(unittest.TestCase):
         state = self.read_state(repository)
         self.assertEqual(state["lifecycle_state"], "stopped")
         self.assertIn("preflight_failed", [item["event"] for item in state["history"]])
+        self.assertEqual(
+            state["planning"]["active_global_breaker"]["source_id"],
+            "preflight_failed",
+        )
         self.assertEqual(state["lease"]["release_count"], 1)
         self.assertFalse(self.process_live(state))
 

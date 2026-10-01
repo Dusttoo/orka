@@ -125,6 +125,21 @@ state, consumes admission for a skipped candidate, or prevents a healthy route
 from filling another lane. See
 [Breaker classification contract](breaker-classification-contract.md).
 
+`pressure_breakers` describe unfinished-PR, lane, and heavy-process pressure.
+They move the supervisor to `degraded` while the existing queue and resource
+policies reduce only new admission; running workers continue to terminal state.
+A route hold by itself never changes global lifecycle state. The supervisor
+pauses only when every route required by otherwise eligible work is held, or
+when the authenticated absolute sprint budget is exhausted.
+
+Every global breaker activation owns a durable generation. Duplicate delivery
+of the same evidence is a no-op, and unclean takeover restores the exact stored
+generation. Route recovery clears its matching all-routes generation
+automatically. A hard-budget generation remains paused after the ceiling is
+raised until an operator resume consumes the new budget receipt against that
+generation. Status exposes the active global breaker without exposing
+credentials.
+
 Admission is queue-class aware. A single-lane repository remains strictly
 finish-first. With two or more lanes, eligible dependency-unlocking work gets
 one reserved slot and the remaining slots rotate through weighted repair,

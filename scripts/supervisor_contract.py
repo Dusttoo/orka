@@ -132,11 +132,14 @@ def validate(contract: dict[str, Any], controller: Path) -> dict[str, Any]:
                 f"ambiguous transition for entity={entity} from={source} event={event_name}"
             )
         seen.add(key)
-        if entity == "supervisor" and target in {"paused", "stopped"}:
-            if events[event_name]["scope"] != "global":
-                raise ContractError(
-                    f"non-global event {event_name} cannot pause or stop the supervisor"
-                )
+        if (
+            entity == "supervisor"
+            and target != source
+            and events[event_name]["scope"] != "global"
+        ):
+            raise ContractError(
+                f"non-global event {event_name} cannot change supervisor state"
+            )
 
     results = contract.get("worker_terminal_results")
     if not isinstance(results, dict) or not results:

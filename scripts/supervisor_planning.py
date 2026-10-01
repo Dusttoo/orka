@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from api_agent import AgentError, UsageLedger, budgets_from_config, load_yaml
+from breaker_runtime import BreakerRuntime
 
 
 class PlanningError(RuntimeError):
@@ -36,6 +37,7 @@ ACTION_KEYS = (
     "recovery",
     "pr_reconciliation",
 )
+BREAKER_RUNTIME = BreakerRuntime()
 
 
 def canonical_digest(value: Any) -> str:
@@ -233,12 +235,67 @@ def classify_cycle(
         [sync_deadline, *deadlines, *([current_time + 0.1] if overdue_work else [])]
     )
     planned = {key: list(plan.get(key) or []) for key in ACTION_KEYS}
+    required_roles = set(plan.get("required_roles") or [])
+    route_blocked_roles = set(plan.get("route_blocked_roles") or [])
     all_routes_unavailable = (
-        bool(plan.get("provider_holds"))
-        and bool(plan.get("autonomous_work_remaining"))
+        bool(required_roles)
+        and required_roles <= route_blocked_roles
         and not any(planned.values())
         and not plan.get("running")
     )
+    sprint = str((plan.get("sprint") or summary.get("sprint") or {}).get("id") or "")
+    if not sprint:
+        sprint = "unknown-sprint"
+    pressure_breakers = []
+    work_in_progress = plan.get("work_in_progress") or {}
+    if work_in_progress.get("fresh_launch_paused"):
+        pressure_breakers.append(
+            BREAKER_RUNTIME.sprint_record(
+                "unfinished_pr_pressure",
+                sprint=sprint,
+                evidence={
+                    "pressure_class": "unfinished_prs",
+                    "capacity_snapshot": work_in_progress,
+                },
+            )
+        )
+    concurrency = int(plan.get("concurrency_max") or 1)
+    running_count = len(plan.get("running") or [])
+    if running_count >= concurrency or int(plan.get("over_capacity") or 0) > 0:
+        pressure_breakers.append(
+            BREAKER_RUNTIME.sprint_record(
+                "lane_capacity_pressure",
+                sprint=sprint,
+                evidence={
+                    "pressure_class": "lane_capacity",
+                    "capacity_snapshot": {
+                        "running": running_count,
+                        "capacity": concurrency,
+                        "over_capacity": int(plan.get("over_capacity") or 0),
+                    },
+                },
+            )
+        )
+    global_breakers = []
+    if all_routes_unavailable:
+        global_breakers.append(
+            BREAKER_RUNTIME.sprint_record(
+                "all_routes_unavailable",
+                sprint=sprint,
+                evidence={
+                    "route_incidents": list(plan.get("route_breakers") or []),
+                    "next_probe_at": next_wake,
+                },
+            )
+        )
+    if budget.get("exhausted"):
+        global_breakers.append(
+            BREAKER_RUNTIME.sprint_record(
+                "max_usd_per_sprint",
+                sprint=sprint,
+                evidence={"budget_receipt": budget},
+            )
+        )
     snapshot = {
         "sprint": plan.get("sprint") or summary.get("sprint") or {},
         "plan": planned,
@@ -249,6 +306,10 @@ def classify_cycle(
         "provider_holds": list(plan.get("provider_holds") or []),
         "route_breakers": list(plan.get("route_breakers") or []),
         "ticket_breakers": list(plan.get("ticket_breakers") or []),
+        "pressure_breakers": pressure_breakers,
+        "global_breakers": global_breakers,
+        "required_roles": sorted(required_roles),
+        "route_blocked_roles": sorted(route_blocked_roles),
         "decision_queue_count": len(plan.get("decision_queue") or []),
         "legacy_reconciliation_count": len(plan.get("legacy_reconciliation") or []),
         "autonomous_work_remaining": bool(plan.get("autonomous_work_remaining")),

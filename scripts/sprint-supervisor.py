@@ -36,6 +36,7 @@ from runtime_state import (
     working_repository_root,
 )
 from api_agent import AgentError, load_yaml
+from breaker_runtime import BreakerRuntime
 from supervisor_planning import (
     ControllerAdapter,
     PlanningError,
@@ -68,6 +69,7 @@ SUPERVISOR_STATES = {
     "stopped",
 }
 ACTIVE_JOB_STATES = {"running", "reserved", "launch_uncertain"}
+BREAKER_RUNTIME = BreakerRuntime(BREAKER_CONTRACT_PATH)
 
 
 def now() -> str:
@@ -332,6 +334,85 @@ def contract() -> tuple[dict[str, Any], Lifecycle, str]:
     return value, Lifecycle(value), digest_bytes(CONTRACT_PATH.read_bytes())
 
 
+def bind_global_breaker(
+    state: dict[str, Any],
+    breaker: dict[str, Any],
+    transition_evidence: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    """Bind one sprint breaker to a durable generation without replay churn."""
+
+    if (
+        breaker.get("scope") != "sprint"
+        or not breaker.get("global_transition")
+        or breaker.get("durable_state") not in {"degraded", "paused", "stopped"}
+        or not breaker.get("record_digest")
+    ):
+        raise SupervisorError(
+            "only a contract-declared sprint breaker may change global state"
+        )
+    planning = state.setdefault("planning", {})
+    active = planning.get("active_global_breaker") or {}
+    if active.get("record_digest") == breaker["record_digest"]:
+        return active, False
+    if active:
+        archived = copy.deepcopy(active)
+        archived["superseded_at"] = now()
+        planning.setdefault("global_breaker_history", []).append(archived)
+        planning["global_breaker_history"] = planning["global_breaker_history"][-64:]
+    sequence = int(planning.get("global_breaker_sequence") or 0) + 1
+    bound = copy.deepcopy(breaker)
+    bound["generation"] = (
+        f"{int((state.get('lease') or {}).get('generation') or 0)}:"
+        f"{sequence}:{breaker['record_digest'][:16]}"
+    )
+    bound["transition_evidence"] = copy.deepcopy(transition_evidence)
+    bound["activated_at"] = now()
+    planning["global_breaker_sequence"] = sequence
+    planning["active_global_breaker"] = bound
+    return bound, True
+
+
+def transition_global_breaker(
+    state: dict[str, Any],
+    lifecycle: Lifecycle,
+    breaker: dict[str, Any],
+    event: str,
+    evidence: dict[str, Any],
+) -> bool:
+    previous_planning = copy.deepcopy(state.get("planning") or {})
+    bound, changed = bind_global_breaker(state, breaker, evidence)
+    if not changed and state.get("lifecycle_state") == bound["durable_state"]:
+        return False
+    supplied = {**evidence, "breaker_generation": bound["generation"]}
+    try:
+        lifecycle.transition(state, event, supplied)
+    except Exception:
+        state["planning"] = previous_planning
+        raise
+    return True
+
+
+def clear_global_breaker(
+    state: dict[str, Any],
+    lifecycle: Lifecycle,
+    event: str,
+    evidence: dict[str, Any],
+) -> bool:
+    planning = state.setdefault("planning", {})
+    active = planning.get("active_global_breaker") or {}
+    generation = str(active.get("generation") or "")
+    if not generation:
+        raise SupervisorError("global breaker resolution lacks an exact generation")
+    lifecycle.transition(state, event, {**evidence, "breaker_generation": generation})
+    archived = copy.deepcopy(active)
+    archived["resolved_at"] = now()
+    archived["resolution_event"] = event
+    planning.setdefault("global_breaker_history", []).append(archived)
+    planning["global_breaker_history"] = planning["global_breaker_history"][-64:]
+    planning["active_global_breaker"] = {}
+    return True
+
+
 def runtime_fingerprint() -> str:
     """Bind restart authority to the exact runtime that wrote durable state."""
 
@@ -384,11 +465,15 @@ def takeover_state(
             "prior supervisor absence is not mechanically verified; takeover refused"
         )
     if previous.get("config_digest") != config_digest:
-        raise SupervisorError("repository config changed since the unclean supervisor stop")
+        raise SupervisorError(
+            "repository config changed since the unclean supervisor stop"
+        )
     if previous.get("runtime_fingerprint") != runtime_digest:
         raise SupervisorError("Orka runtime changed since the unclean supervisor stop")
     if previous.get("contract_digest") != contract_digest:
-        raise SupervisorError("supervisor lifecycle contract changed since the unclean stop")
+        raise SupervisorError(
+            "supervisor lifecycle contract changed since the unclean stop"
+        )
 
     old_lease = copy.deepcopy(previous.get("lease") or {})
     if (
@@ -396,7 +481,9 @@ def takeover_state(
         or old_lease.get("lock_device") != lease.get("lock_device")
         or old_lease.get("lock_inode") != lease.get("lock_inode")
     ):
-        raise SupervisorError("repository supervisor lease identity changed after the crash")
+        raise SupervisorError(
+            "repository supervisor lease identity changed after the crash"
+        )
 
     previous_state = str(previous.get("lifecycle_state") or "")
     resume_state = previous_state
@@ -465,7 +552,21 @@ def takeover_state(
     state.setdefault("dispatch", {"jobs": {}, "launch_count": 0, "terminal_count": 0})
     state.setdefault("requests", [])
 
-    if resume_state == "paused":
+    active_breaker = planning.get("active_global_breaker") or {}
+    if resume_state in {"paused", "degraded"} and active_breaker:
+        event = {
+            "sprint_pressure": "sprint_pressure_applied",
+            "sprint_wait": "all_routes_unavailable",
+            "sprint_hard_budget": "hard_sprint_budget_exhausted",
+        }.get(str(active_breaker.get("class_id") or ""))
+        if not event:
+            raise SupervisorError(
+                "persisted global breaker cannot restore supervisor state"
+            )
+        evidence = dict(active_breaker.get("transition_evidence") or {})
+        evidence["breaker_generation"] = active_breaker.get("generation")
+        lifecycle.transition(state, event, evidence)
+    elif resume_state == "paused":
         lifecycle.transition(
             state,
             "operator_paused",
@@ -506,9 +607,7 @@ def state_snapshot(path: Path, repository: Path | None = None) -> dict[str, Any]
     return value
 
 
-def verify_state_digest(
-    state_path: Path, digest_path: Path, *, required: bool
-) -> str:
+def verify_state_digest(state_path: Path, digest_path: Path, *, required: bool) -> str:
     """Authenticate the last fully persisted state before restart."""
 
     if not digest_path.is_file():
@@ -524,7 +623,9 @@ def verify_state_digest(
     except OSError as exc:
         raise SupervisorError("cannot authenticate durable supervisor state") from exc
     if not expected or expected != observed:
-        raise SupervisorError("durable supervisor state digest does not match its receipt")
+        raise SupervisorError(
+            "durable supervisor state digest does not match its receipt"
+        )
     return observed
 
 
@@ -574,14 +675,10 @@ def status_response(state: dict[str, Any]) -> dict[str, Any]:
     planning = state.get("planning") or {"enabled": False}
     result["dispatch"] = {
         "active_jobs": sum(
-            1
-            for job in jobs.values()
-            if job.get("state") in ACTIVE_JOB_STATES
+            1 for job in jobs.values() if job.get("state") in ACTIVE_JOB_STATES
         ),
         "terminal_jobs": sum(
-            1
-            for job in jobs.values()
-            if job.get("state") not in ACTIVE_JOB_STATES
+            1 for job in jobs.values() if job.get("state") not in ACTIVE_JOB_STATES
         ),
         "launch_count": int(dispatch.get("launch_count") or 0),
         "terminal_count": int(dispatch.get("terminal_count") or 0),
@@ -594,20 +691,20 @@ def status_response(state: dict[str, Any]) -> dict[str, Any]:
             }
         ),
         "retrying": sorted(
-            str(item.get("key") or "")
-            for item in planning.get("retry_waiting") or []
+            str(item.get("key") or "") for item in planning.get("retry_waiting") or []
         ),
         "parked": sorted(
-            str(item.get("key") or "")
-            for item in planning.get("decision_queue") or []
+            str(item.get("key") or "") for item in planning.get("decision_queue") or []
         ),
         "blocked": sorted(
-            str(item.get("key") or "")
-            for item in planning.get("waiting") or []
+            str(item.get("key") or "") for item in planning.get("waiting") or []
         ),
         "ticket_breakers": list(planning.get("ticket_breakers") or []),
         "route_breakers": list(planning.get("route_breakers") or []),
-        "lane_allocation": planning.get("lane_allocation") or {
+        "pressure_breakers": list(planning.get("pressure_breakers") or []),
+        "active_global_breaker": dict(planning.get("active_global_breaker") or {}),
+        "lane_allocation": planning.get("lane_allocation")
+        or {
             "selections": [],
             "next_cursor": int(planning.get("allocation_cursor") or 0),
         },
@@ -639,7 +736,11 @@ def planning_settings(repository: Path) -> dict[str, Any]:
         concurrency = int(raw_concurrency)
     except (TypeError, ValueError) as exc:
         raise SupervisorError("concurrency_max must be a positive integer") from exc
-    if isinstance(raw_concurrency, bool) or str(concurrency) != str(raw_concurrency) or concurrency < 1:
+    if (
+        isinstance(raw_concurrency, bool)
+        or str(concurrency) != str(raw_concurrency)
+        or concurrency < 1
+    ):
         raise SupervisorError("concurrency_max must be a positive integer")
     raw_heavy = config.get("max_heavy_processes", concurrency)
     try:
@@ -656,7 +757,9 @@ def planning_settings(repository: Path) -> dict[str, Any]:
     try:
         retry_delay = float(raw_retry_delay)
     except (TypeError, ValueError) as exc:
-        raise SupervisorError("supervisor_ticket_retry_seconds must be numeric") from exc
+        raise SupervisorError(
+            "supervisor_ticket_retry_seconds must be numeric"
+        ) from exc
     if retry_delay < 5 or retry_delay > 3600:
         raise SupervisorError(
             "supervisor_ticket_retry_seconds must be from 5 through 3600"
@@ -702,22 +805,51 @@ def apply_control(
             "operator_paused",
             {"operator_request_id": request_id, "pause_mode": "hold"},
         )
-        state.setdefault("planning", {})["pause_cause"] = "operator_paused"
+        planning = state.setdefault("planning", {})
+        planning["pause_cause"] = "operator_paused"
+        planning["operator_pause_generation"] = canonical_digest(
+            {
+                "request_id": request_id,
+                "lease_id": (state.get("lease") or {}).get("id"),
+                "reason": reason,
+            }
+        )
     elif command == "resume":
-        pause_cause = (state.get("planning") or {}).get("pause_cause")
-        if pause_cause in {
-            "all_routes_unavailable",
-            "hard_sprint_budget_exhausted",
-        }:
+        planning = state.setdefault("planning", {})
+        pause_cause = planning.get("pause_cause")
+        active_breaker = planning.get("active_global_breaker") or {}
+        if pause_cause == "all_routes_unavailable":
             raise SupervisorError(
                 f"cannot override global pause condition: {pause_cause}"
             )
-        lifecycle.transition(
-            state,
-            "operator_resumed",
-            {"operator_request_id": request_id, "blockers_checked": True},
-        )
-        state.setdefault("planning", {})["pause_cause"] = ""
+        if active_breaker:
+            if active_breaker.get(
+                "class_id"
+            ) != "sprint_hard_budget" or not active_breaker.get("resolution_receipt"):
+                raise SupervisorError(
+                    f"cannot override global pause condition: {pause_cause or active_breaker.get('source_id')}"
+                )
+            clear_global_breaker(
+                state,
+                lifecycle,
+                "operator_resumed",
+                {"operator_request_id": request_id, "blockers_checked": True},
+            )
+        else:
+            generation = str(planning.get("operator_pause_generation") or "")
+            if not generation:
+                raise SupervisorError("operator pause has no resumable generation")
+            lifecycle.transition(
+                state,
+                "operator_resumed",
+                {
+                    "operator_request_id": request_id,
+                    "blockers_checked": True,
+                    "breaker_generation": generation,
+                },
+            )
+        planning["pause_cause"] = ""
+        planning["operator_pause_generation"] = ""
     elif command == "drain":
         lifecycle.transition(
             state, "drain_requested", {"operator_request_id": request_id}
@@ -955,8 +1087,19 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                 write_handshake(handshake, {"status": "error", "error": diagnostic})
                 return 2
             if state.get("lifecycle_state") == "starting":
-                lifecycle.transition(
+                transition_global_breaker(
                     state,
+                    lifecycle,
+                    BREAKER_RUNTIME.sprint_record(
+                        "preflight_failed",
+                        sprint=str(repository),
+                        evidence={
+                            "failure_class": type(exc).__name__,
+                            "diagnostic_digest": digest_bytes(
+                                diagnostic.encode("utf-8")
+                            ),
+                        },
+                    ),
                     "preflight_failed",
                     {
                         "failure_class": type(exc).__name__,
@@ -964,8 +1107,17 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                     },
                 )
             else:
-                lifecycle.transition(
+                transition_global_breaker(
                     state,
+                    lifecycle,
+                    BREAKER_RUNTIME.sprint_record(
+                        "durable_state_invalid",
+                        sprint=str(repository),
+                        evidence={
+                            "state_digest": expected_state_digest or "unavailable",
+                            "validation_error": type(exc).__name__,
+                        },
+                    ),
                     "durable_state_invalid",
                     {
                         "state_digest": expected_state_digest or "unavailable",
@@ -1028,25 +1180,55 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                 except OSError:
                     observed_state_digest = "missing"
                 if observed_state_digest != expected_state_digest:
-                    lifecycle.transition(
+                    breaker_evidence = {
+                        "state_digest": observed_state_digest,
+                        "validation_error": "durable supervisor state changed outside its owner",
+                    }
+                    transition_global_breaker(
                         state,
+                        lifecycle,
+                        BREAKER_RUNTIME.sprint_record(
+                            "durable_state_invalid",
+                            sprint=str(
+                                (
+                                    (
+                                        (state.get("planning") or {}).get("sprint")
+                                        or {}
+                                    ).get("id")
+                                )
+                                or repository
+                            ),
+                            evidence=breaker_evidence,
+                        ),
                         "durable_state_invalid",
-                        {
-                            "state_digest": observed_state_digest,
-                            "validation_error": "durable supervisor state changed outside its owner",
-                        },
+                        breaker_evidence,
                     )
                     persist_state()
                     should_stop = True
                     continue
                 if not lease_is_current(lock_handle, paths["lock"]):
-                    lifecycle.transition(
+                    breaker_evidence = {
+                        "lease_id": lease_id,
+                        "observed_owner": "lease path no longer names the held inode",
+                    }
+                    transition_global_breaker(
                         state,
+                        lifecycle,
+                        BREAKER_RUNTIME.sprint_record(
+                            "lease_lost",
+                            sprint=str(
+                                (
+                                    (
+                                        (state.get("planning") or {}).get("sprint")
+                                        or {}
+                                    ).get("id")
+                                )
+                                or repository
+                            ),
+                            evidence=breaker_evidence,
+                        ),
                         "lease_lost",
-                        {
-                            "lease_id": lease_id,
-                            "observed_owner": "lease path no longer names the held inode",
-                        },
+                        breaker_evidence,
                     )
                     persist_state()
                     should_stop = True
@@ -1069,9 +1251,7 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                             "evidence": {
                                 "ticket": job["ticket"],
                                 "run_ref": job["run_ref"],
-                                "timer_id": (job.get("terminal") or {}).get(
-                                    "timer_id"
-                                ),
+                                "timer_id": (job.get("terminal") or {}).get("timer_id"),
                             },
                         }
                     )
@@ -1085,9 +1265,9 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                     result = dispatcher.apply_process_exit(job)
                     if result and result.get("applied"):
                         terminal_applied = True
-                        dispatch["terminal_count"] = int(
-                            dispatch.get("terminal_count") or 0
-                        ) + 1
+                        dispatch["terminal_count"] = (
+                            int(dispatch.get("terminal_count") or 0) + 1
+                        )
                         state.setdefault("history", []).append(
                             {
                                 "at": now(),
@@ -1097,7 +1277,9 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                                 "evidence": {
                                     "ticket": job["ticket"],
                                     "run_ref": run_ref,
-                                    "result_digest": result["terminal"]["result_digest"],
+                                    "result_digest": result["terminal"][
+                                        "result_digest"
+                                    ],
                                     "contract_event": result["terminal"]["event"],
                                 },
                             }
@@ -1144,9 +1326,7 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                 persist_state()
             if state.get("lifecycle_state") == "draining":
                 active = sum(
-                    1
-                    for job in jobs.values()
-                    if job.get("state") in ACTIVE_JOB_STATES
+                    1 for job in jobs.values() if job.get("state") in ACTIVE_JOB_STATES
                 )
                 if active == 0:
                     lifecycle.transition(
@@ -1182,7 +1362,6 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                         sync_interval=float(planning["sync_interval_seconds"]),
                     )
                     previous_digest = str(planning.get("plan_digest") or "")
-                    previous_provider_holds = list(planning.get("provider_holds") or [])
                     planning.update(
                         {
                             **snapshot,
@@ -1191,6 +1370,30 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                             "last_error": "",
                         }
                     )
+                    active_job_count = sum(
+                        1
+                        for job in jobs.values()
+                        if job.get("state") in ACTIVE_JOB_STATES
+                    )
+                    heavy_capacity = int(planning.get("max_heavy_processes") or 1)
+                    if active_job_count >= heavy_capacity:
+                        snapshot["pressure_breakers"].append(
+                            BREAKER_RUNTIME.sprint_record(
+                                "heavy_process_pressure",
+                                sprint=str(
+                                    (snapshot.get("sprint") or {}).get("id")
+                                    or "unknown-sprint"
+                                ),
+                                evidence={
+                                    "pressure_class": "heavy_process",
+                                    "capacity_snapshot": {
+                                        "active": active_job_count,
+                                        "capacity": heavy_capacity,
+                                    },
+                                },
+                            )
+                        )
+                        planning["pressure_breakers"] = snapshot["pressure_breakers"]
                     if snapshot["plan_digest"] != previous_digest:
                         state.setdefault("history", []).append(
                             {
@@ -1226,8 +1429,15 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                     elif snapshot["budget"].get("exhausted") and state[
                         "lifecycle_state"
                     ] in {"active", "degraded"}:
-                        lifecycle.transition(
+                        breaker = next(
+                            item
+                            for item in snapshot["global_breakers"]
+                            if item["source_id"] == "max_usd_per_sprint"
+                        )
+                        transition_global_breaker(
                             state,
+                            lifecycle,
+                            breaker,
                             "hard_sprint_budget_exhausted",
                             {
                                 "budget_receipt": snapshot["budget"]["digest"],
@@ -1240,8 +1450,15 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                     elif snapshot["all_routes_unavailable"] and state[
                         "lifecycle_state"
                     ] in {"active", "degraded"}:
-                        lifecycle.transition(
+                        breaker = next(
+                            item
+                            for item in snapshot["global_breakers"]
+                            if item["source_id"] == "all_routes_unavailable"
+                        )
+                        transition_global_breaker(
                             state,
+                            lifecycle,
+                            breaker,
                             "all_routes_unavailable",
                             {
                                 "route_incidents": canonical_digest(
@@ -1251,38 +1468,40 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                             },
                         )
                         planning["pause_cause"] = "all_routes_unavailable"
-                    elif (
-                        snapshot["provider_holds"]
-                        and state["lifecycle_state"] == "active"
-                    ):
-                        lifecycle.transition(
+                    elif snapshot["pressure_breakers"] and state["lifecycle_state"] in {
+                        "active",
+                        "degraded",
+                    }:
+                        breaker = sorted(
+                            snapshot["pressure_breakers"],
+                            key=lambda item: (item["source_id"], item["record_digest"]),
+                        )[0]
+                        transition_global_breaker(
                             state,
-                            "route_degraded",
+                            lifecycle,
+                            breaker,
+                            "sprint_pressure_applied",
                             {
-                                "route_identity": canonical_digest(
-                                    snapshot["provider_holds"]
+                                "pressure_class": breaker["source_id"],
+                                "capacity_snapshot": canonical_digest(
+                                    snapshot["pressure_breakers"]
                                 ),
-                                "incident_id": canonical_digest(
-                                    {
-                                        "holds": snapshot["provider_holds"],
-                                        "plan": snapshot["plan_digest"],
-                                    }
-                                ),
-                                "retry_at": snapshot["next_wake_epoch"],
                             },
                         )
                     elif (
-                        not snapshot["provider_holds"]
+                        not snapshot["pressure_breakers"]
                         and state["lifecycle_state"] == "degraded"
+                        and (planning.get("active_global_breaker") or {}).get(
+                            "class_id"
+                        )
+                        == "sprint_pressure"
                     ):
-                        lifecycle.transition(
+                        clear_global_breaker(
                             state,
-                            "route_recovered",
+                            lifecycle,
+                            "sprint_pressure_cleared",
                             {
-                                "route_identity": canonical_digest(
-                                    previous_provider_holds
-                                ),
-                                "health_receipt": snapshot["plan_digest"],
+                                "capacity_snapshot": snapshot["plan_digest"],
                             },
                         )
                     elif (
@@ -1290,8 +1509,9 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                         and pause_cause == "all_routes_unavailable"
                         and not snapshot["all_routes_unavailable"]
                     ):
-                        lifecycle.transition(
+                        clear_global_breaker(
                             state,
+                            lifecycle,
                             "routes_available",
                             {"route_health_receipts": snapshot["plan_digest"]},
                         )
@@ -1301,14 +1521,17 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                         and pause_cause == "hard_sprint_budget_exhausted"
                         and not snapshot["budget"].get("exhausted")
                     ):
-                        # Budget authority changed outside the supervisor. Keep
-                        # the explicit pause, but allow a subsequent operator
-                        # resume now that the hard blocker is gone.
-                        planning["pause_cause"] = ""
+                        active_breaker = planning.get("active_global_breaker") or {}
+                        if active_breaker.get("class_id") != "sprint_hard_budget":
+                            raise SupervisorError(
+                                "budget pause lost its exact global breaker generation"
+                            )
+                        active_breaker["resolution_receipt"] = snapshot["budget"][
+                            "digest"
+                        ]
+                        active_breaker["resolved_at"] = now()
                     if state["lifecycle_state"] in {"active", "degraded"}:
-                        sprint_id = str(
-                            (snapshot.get("sprint") or {}).get("id") or ""
-                        )
+                        sprint_id = str((snapshot.get("sprint") or {}).get("id") or "")
                         action_plan = {
                             name: list(values or [])
                             for name, values in (snapshot.get("plan") or {}).items()
@@ -1329,9 +1552,7 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                             for job in jobs.values()
                             if job.get("state") in ACTIVE_JOB_STATES
                         )
-                        candidates = dict(
-                            planning.get("allocation_candidates") or {}
-                        )
+                        candidates = dict(planning.get("allocation_candidates") or {})
                         if not candidates:
                             candidates = {
                                 "repair": list(action_plan.get("repair") or []),
@@ -1491,7 +1712,9 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                 float((job.get("terminal") or {}).get("retry_at"))
                 for job in jobs.values()
                 if job.get("state") == "retry_wait"
-                and isinstance((job.get("terminal") or {}).get("retry_at"), (int, float))
+                and isinstance(
+                    (job.get("terminal") or {}).get("retry_at"), (int, float)
+                )
             )
             if planning.get("enabled") and (
                 state.get("lifecycle_state") in {"active", "degraded"} or system_pause
@@ -1524,13 +1747,20 @@ def run_daemon(repository: Path, handshake: Path) -> int:
     except Exception as exc:  # fail closed and leave a diagnostic handshake
         if state is not None and state.get("lifecycle_state") != "stopped":
             try:
-                lifecycle.transition(
+                breaker_evidence = {
+                    "state_digest": expected_state_digest or "unavailable",
+                    "validation_error": type(exc).__name__,
+                }
+                transition_global_breaker(
                     state,
+                    lifecycle,
+                    BREAKER_RUNTIME.sprint_record(
+                        "durable_state_invalid",
+                        sprint=str(repository),
+                        evidence=breaker_evidence,
+                    ),
                     "durable_state_invalid",
-                    {
-                        "state_digest": expected_state_digest or "unavailable",
-                        "validation_error": type(exc).__name__,
-                    },
+                    breaker_evidence,
                 )
                 persist_state()
             except Exception:
@@ -1585,9 +1815,10 @@ def start(args: argparse.Namespace) -> None:
         "--handshake",
         str(handshake),
     ]
-    with open_private_file(paths["log"], append=True) as output, open(
-        os.devnull, "rb"
-    ) as input_stream:
+    with (
+        open_private_file(paths["log"], append=True) as output,
+        open(os.devnull, "rb") as input_stream,
+    ):
         process = subprocess.Popen(
             command,
             stdin=input_stream,
@@ -1697,7 +1928,9 @@ def resolve_decision_command(args: argparse.Namespace) -> None:
     settings = planning_settings(repository)
     sprint = str(args.sprint or settings.get("requested_sprint") or "").strip()
     if not sprint:
-        raise SupervisorError("resolve-decision requires a configured or explicit sprint")
+        raise SupervisorError(
+            "resolve-decision requires a configured or explicit sprint"
+        )
     contract_value, _lifecycle, _digest = contract()
     allowed = {
         item.get("class")
@@ -1705,7 +1938,9 @@ def resolve_decision_command(args: argparse.Namespace) -> None:
         if isinstance(item, dict)
     }
     if args.decision_class not in allowed:
-        raise SupervisorError("decision class is not permitted by the lifecycle contract")
+        raise SupervisorError(
+            "decision class is not permitted by the lifecycle contract"
+        )
     operator_token = ""
     if args.operator_capability_stdin:
         operator_token = sys.stdin.readline().strip()
@@ -1788,9 +2023,7 @@ def parser() -> argparse.ArgumentParser:
     decision.add_argument("--reason", required=True)
     decision_capability = decision.add_mutually_exclusive_group()
     decision_capability.add_argument("--operator-capability")
-    decision_capability.add_argument(
-        "--operator-capability-stdin", action="store_true"
-    )
+    decision_capability.add_argument("--operator-capability-stdin", action="store_true")
     decision.set_defaults(func=resolve_decision_command)
 
     internal = commands.add_parser("_run", help=argparse.SUPPRESS)

@@ -117,6 +117,43 @@ class BreakerRuntimeTests(unittest.TestCase):
         self.assertEqual(first["class_id"], "ticket_hard_decision")
         self.assertEqual(first["authority"], "ticket_scoped_operator")
 
+    def test_sprint_breakers_are_global_and_target_only_declared_states(self) -> None:
+        pressure = self.runtime.sprint_record(
+            "unfinished_pr_pressure",
+            sprint="99",
+            evidence={"pressure_class": "wip", "capacity_snapshot": {"used": 3}},
+        )
+        budget = self.runtime.sprint_record(
+            "max_usd_per_sprint",
+            sprint="99",
+            evidence={"budget_receipt": "receipt"},
+        )
+        self.assertEqual(
+            (pressure["scope"], pressure["durable_state"], pressure["strength"]),
+            ("sprint", "degraded", "soft"),
+        )
+        self.assertEqual(
+            (budget["scope"], budget["durable_state"], budget["strength"]),
+            ("sprint", "paused", "hard"),
+        )
+        self.assertTrue(pressure["global_transition"])
+        self.assertEqual(
+            pressure["record_digest"],
+            self.runtime.sprint_record(
+                "unfinished_pr_pressure",
+                sprint="99",
+                evidence={"pressure_class": "wip", "capacity_snapshot": {"used": 3}},
+            )["record_digest"],
+        )
+
+    def test_ticket_or_route_source_cannot_be_promoted_to_sprint(self) -> None:
+        with self.assertRaisesRegex(BreakerRuntimeError, "cannot change sprint state"):
+            self.runtime.sprint_record(
+                "provider_transport",
+                sprint="99",
+                evidence={"route": "worker"},
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

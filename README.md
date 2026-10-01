@@ -461,6 +461,9 @@ claim global authority, and any attempt to soften protected safety controls.
 Ticket and route stops now carry deterministic runtime records through planning
 and supervisor status. Retry wakeups require the exact ticket binding; provider
 holds bind one role and route so healthy routes and unrelated tickets continue.
+Sprint pressure now degrades only new admission while active work continues.
+Only contract-declared sprint breakers may pause or stop the supervisor, and
+each global activation and resume is bound to one durable breaker generation.
 
 Please report security-sensitive findings privately according to
 [SECURITY.md](SECURITY.md) and follow the [Code of Conduct](CODE_OF_CONDUCT.md).
