@@ -431,6 +431,15 @@ SQLite event store, a supervisor-owned writer, deterministic JSON export, and
 an explicit fail-closed migration from existing checkpoints. The current JSON
 runtime remains authoritative until the tracked cutover slices are complete.
 
+Orka 1.8.20 adds the first implementation slice: an explicitly initialized,
+private repository identity beneath the absolute Git common directory and a
+canonical policy binding to an exact Git ref and blob. This works for normal,
+linked-worktree, and bare-backed layouts without allowing sibling bare
+repositories to share an enforcement domain. See
+[Repository identity and canonical policy](docs/repository-identity.md). The
+existing JSON controller state is intentionally not relocated until the
+separate import and cutover slices are complete.
+
 Multi-lane supervisors allocate work through durable queue classes rather than
 globally pausing for the oldest repair. Repair and recovery retain greater
 weight, one lane is reserved for dependency-unlocking work when eligible, and a

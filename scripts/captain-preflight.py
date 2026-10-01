@@ -14,6 +14,12 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from version_policy import VersionPolicyError, assert_minimum_version, release_version
+from runtime_state import (
+    RuntimeStateError,
+    canonical_config_path,
+    repository_layout,
+    repository_status,
+)
 
 
 REQUIRED = (
@@ -133,7 +139,25 @@ def main() -> int:
         version = "unknown"
     else:
         version = str(json.loads(manifest.read_text(encoding="utf-8")).get("version") or "unknown")
-    config = repo / ".orchestration/config.yaml"
+    try:
+        config = canonical_config_path(repo)
+        repository_identity = repository_status(repo)
+    except RuntimeStateError as exc:
+        try:
+            repository_layout(repo)
+        except RuntimeStateError:
+            # Compatibility for isolated config-validation fixtures. A real
+            # Git repository always resolves a common directory.
+            config = repo / ".orchestration/config.yaml"
+            repository_identity = {"mode": "not-a-git-repository"}
+        else:
+            print(json.dumps({
+                "status": "blocked",
+                "installation_status": "ready",
+                "execution_ready": False,
+                "reason": str(exc),
+            }, indent=2))
+            return 2
     if not config.is_file():
         failures.append(str(config))
     if failures:
@@ -187,6 +211,7 @@ def main() -> int:
         "plugin_root": str(plugin),
         "plugin_version": version,
         "minimum_orka_version": minimum_version or None,
+        "repository_identity": repository_identity,
         "runtime_fingerprint": digest.hexdigest(),
         "rules": [
             "do not implement sprint tickets in the captain context",

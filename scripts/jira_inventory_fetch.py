@@ -20,7 +20,7 @@ from urllib.parse import urlencode, urljoin, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from context_pipeline import sanitize_jira_response
-from runtime_state import shared_repository_root
+from runtime_state import canonical_config_path, shared_repository_root
 
 Fetch = Callable[[str, str, int, int, str, list[str]], dict[str, Any]]
 MAX_PAGES = 10_000
@@ -819,7 +819,12 @@ def run_adapter(
     config_override: Path | None = None,
 ) -> int:
     template = json.loads(Path(args.inventory_template).read_text())
-    config = (config_override or Path(".orchestration/config.yaml")).resolve()
+    repository = (
+        config_override.resolve().parent.parent
+        if config_override is not None
+        else Path.cwd().resolve()
+    )
+    config = config_override.resolve() if config_override is not None else canonical_config_path(repository)
     project = ticket_project_from_config(config).upper()
     sprint_policy = scalar_config(config, "sprint_id", "").strip()
     base_url = scalar_config(config, "jira_base_url", "").strip()
@@ -842,7 +847,7 @@ def run_adapter(
         # config lives at <checkout>/.orchestration/config.yaml; credentials
         # resolve from that checkout's shared repository root, as in preflight.
         approved = validate_base_url(base_url)
-        credentials = resolve_jira_credentials(config.parent.parent)
+        credentials = resolve_jira_credentials(repository)
         authority, fetch = "provider-network", network_fetcher(base_url, credentials)
     inventory, artifact = build_inventory(
         template,

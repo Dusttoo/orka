@@ -106,9 +106,19 @@ def main() -> int:
     parser.add_argument("--active-version")
     args = parser.parse_args()
     try:
+        config = Path(args.config).expanduser().resolve()
+        try:
+            from runtime_state import resolve_config_argument
+        except ImportError:
+            # Standalone hook fixtures may copy only this validator. Production
+            # plugin installs always include runtime_state.py.
+            pass
+        else:
+            config = resolve_config_argument(Path.cwd(), config)
+
         result = assert_minimum_version(
             Path(args.plugin_root).expanduser().resolve(),
-            Path(args.config).expanduser().resolve(),
+            config,
             active_version=args.active_version,
         )
     except VersionPolicyError as exc:

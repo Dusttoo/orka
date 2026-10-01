@@ -22,6 +22,7 @@ from typing import Any
 
 from api_agent import AgentError, UsageLedger, budgets_from_config, load_yaml
 from breaker_runtime import BreakerRuntime
+from runtime_state import canonical_config_path
 
 
 class PlanningError(RuntimeError):
@@ -141,7 +142,7 @@ def sprint_budget(repository: Path, sprint: str) -> dict[str, Any]:
     """Return an evidence-bearing view of the hard sprint budget."""
 
     try:
-        config = load_yaml(repository / ".orchestration/config.yaml")
+        config = load_yaml(canonical_config_path(repository))
         limit = budgets_from_config(config, repository)["max_usd_per_sprint"]
         events = UsageLedger(repository).snapshot()
     except AgentError as exc:
