@@ -290,6 +290,8 @@ def validate_review_output(
             raise ContextError("finding regression must be a boolean")
         blocking += finding["disposition"] == "blocking"
         normalized_findings.append(finding)
+    if value["verdict"] == "PASS" and not normalized_checks:
+        raise ContextError("PASS review requires at least one check")
     if value["verdict"] == "PASS" and blocking:
         raise ContextError("PASS review cannot contain blocking findings")
     if value["verdict"] == "FAIL" and not blocking:
