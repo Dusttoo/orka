@@ -23,6 +23,7 @@ from typing import Any
 from api_agent import AgentError, UsageLedger, budgets_from_config, load_yaml
 from breaker_runtime import BreakerRuntime
 from runtime_state import canonical_config_path
+from controller_runtime import execute_request, supervisor_request
 
 
 class PlanningError(RuntimeError):
@@ -125,6 +126,45 @@ class ControllerAdapter:
             "--ticket",
             ticket,
         )
+
+
+class TransactionalControllerAdapter(ControllerAdapter):
+    """Run controller operations inside the elected supervisor after cutover."""
+
+    def __init__(
+        self,
+        repository: Path,
+        runtime_directory: Path,
+        *,
+        supervisor_fence: str,
+        writer_identity: str,
+    ) -> None:
+        super().__init__(repository, runtime_directory)
+        self.supervisor_fence = supervisor_fence
+        self.writer_identity = writer_identity
+        self.private_root = runtime_directory / "controller-materializations"
+
+    def _run(self, *arguments: str) -> dict:
+        request = supervisor_request(
+            self.repository,
+            arguments,
+            self.supervisor_fence,
+        )
+        response = execute_request(
+            self.repository,
+            request,
+            supervisor_fence=self.supervisor_fence,
+            writer_identity=self.writer_identity,
+            private_root=self.private_root,
+            controller_path=CONTROLLER,
+        )
+        result = subprocess.CompletedProcess(
+            args=list(arguments),
+            returncode=int(response["returncode"]),
+            stdout=str(response.get("stdout") or ""),
+            stderr=str(response.get("stderr") or ""),
+        )
+        return parse_json_output(result, arguments[0])
 
 
 def _open_reservations(events: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:

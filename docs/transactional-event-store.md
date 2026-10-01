@@ -1,9 +1,11 @@
 # Transactional event-store core
 
-Orka 1.8.21 implements the storage core selected by
-[ADR 0001](adr/0001-transactional-event-store.md). It is an integration API for
-the later importer and controller-cutover slices. The existing JSON controller
-remains production authority in this release.
+Orka 1.8.21 introduced the storage core selected by
+[ADR 0001](adr/0001-transactional-event-store.md). Orka 1.8.27 connects the
+controller to that core after explicit cutover. Before cutover, the JSON
+controller remains compatible and authoritative. After cutover, direct
+controller commands route through the elected repository supervisor and JSON
+checkpoints are private, ephemeral materializations only.
 
 ## Ownership boundary
 
@@ -70,7 +72,43 @@ exclusive-claim rollback, timer generations, external-operation receipts, and
 timers, or receipts.
 
 Orka 1.8.23 adds the explicit offline importer and deterministic export. See
-[Legacy state migration](legacy-state-migration.md). The later tracked slices
-still own controller/supervisor integration (#125–#127), and backup, replay
+[Legacy state migration](legacy-state-migration.md). Orka 1.8.27 completes the
+controller-command routing slice (#125). Later slices still own the complete
+supervisor-state cutover (#126–#127), and backup, replay
 validation, cross-platform behavior, and broader injected crash recovery
 (#119).
+
+## Controller command boundary after cutover
+
+The public `sprint-controller.py` interface remains unchanged. When an active
+cutover marker is present, it reads the current controller generation set and
+sends the original argument vector to the repository-derived Unix socket. The
+request binds:
+
+- repository UUID and cutover activation;
+- supervisor lease UUID and generation;
+- a bounded command identity; and
+- every expected controller-document generation.
+
+The supervisor rejects stale or mismatched bindings. It materializes controller
+documents beneath its private `0700` runtime directory, supplies an unforgeable
+per-execution capability to the legacy controller process, and forbids state or
+policy path overrides. A successful invocation may change at most one sprint
+document. The supervisor commits that document through
+`write_runtime_document`; the legacy checkpoint is never replaced.
+
+Every successful command advances the selected controller generation, even
+when the command is logically read-only. That generation is also the durable
+command receipt: exact delivery of the same command identity and material is a
+no-op, while changed arguments or bindings fail closed.
+
+| Failure or adversarial case | Required behavior |
+| --- | --- |
+| Missing or stopped supervisor | Direct command fails without touching legacy JSON. |
+| Stale repository, activation, lease, or controller generation | Supervisor rejects before materialization or execution. |
+| Duplicate command identity and exact material | Return the recorded generation without re-executing the controller. |
+| Duplicate command identity with changed material | Reject as an idempotency conflict. |
+| `--state-dir` or `--config` override | Reject before controller execution. |
+| Controller failure or malformed checkpoint | Discard the private materialization; commit nothing. |
+| More than one changed sprint document | Reject the whole command; commit nothing. |
+| Pre-cutover repository | Preserve the existing file-backed controller behavior. |

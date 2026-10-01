@@ -371,6 +371,24 @@ def assert_legacy_runtime_writable(
     marker = runtime_cutover_marker(start)
     if marker is None:
         return
+    assert_cutover_runtime_compatible(start, plugin_root=plugin_root, marker=marker)
+    raise RuntimeStateError(
+        "legacy JSON runtime is read-only after transactional cutover; "
+        "use the repository supervisor"
+    )
+
+
+def assert_cutover_runtime_compatible(
+    start: Path,
+    *,
+    plugin_root: Path | None = None,
+    marker: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Verify an active cutover's minimum version without rejecting its supervisor."""
+
+    marker = marker if marker is not None else runtime_cutover_marker(start)
+    if marker is None:
+        return None
     try:
         from version_policy import manifest_version, release_version
 
@@ -385,10 +403,7 @@ def assert_legacy_runtime_writable(
         raise RuntimeStateError(
             "transactional cutover cannot verify the active Orka version"
         ) from exc
-    raise RuntimeStateError(
-        "legacy JSON runtime is read-only after transactional cutover; "
-        "use the repository supervisor"
-    )
+    return marker
 
 
 def _materialize_policy(layout: RepositoryLayout, snapshot: PolicySnapshot) -> Path:

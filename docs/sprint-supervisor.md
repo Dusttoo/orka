@@ -60,6 +60,13 @@ control socket.
 Operator request IDs are idempotency keys. Repeating the same command with the
 same ID returns its prior result. Reusing an ID for another command is rejected.
 
+After transactional cutover, direct `sprint-controller.py` invocations use this
+same authenticated socket. Controller requests additionally bind repository,
+cutover, supervisor-fence, command, and expected controller-generation
+identities. The supervisor runs the controller against a private ephemeral
+checkpoint and commits only through the generation-fenced event-store API. See
+[Transactional event-store core](transactional-event-store.md#controller-command-boundary-after-cutover).
+
 ## Deterministic planning
 
 When `sprint_id` is configured, startup enables deterministic planning. The

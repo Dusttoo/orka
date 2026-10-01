@@ -1227,6 +1227,7 @@ class TransactionalEventStore:
         supervisor_fence: str,
         idempotency_key: str,
         writer_identity: str,
+        operation_digest: str = "",
         occurred_at: str | None = None,
     ) -> RuntimeDocumentResult:
         """Commit one authoritative runtime generation under the active fence."""
@@ -1244,6 +1245,8 @@ class TransactionalEventStore:
             "payload_digest": payload_digest,
             "supervisor_fence": supervisor_fence,
         }
+        if operation_digest:
+            event_payload["operation_digest"] = operation_digest
         with self._transaction(writer_identity) as database:
             replay = self._existing_event(
                 database,
