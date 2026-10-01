@@ -46,6 +46,12 @@ from supervisor_planning import (
 from supervisor_dispatch import DispatchError, StaleResultError, SupervisorDispatcher
 from supervisor_admission import AdmissionError, validate_persisted_jobs
 from supervisor_allocation import AllocationError, allocate_lanes
+from supervisor_state import (
+    CURRENT_SCHEMA_VERSION,
+    SupervisorStateError,
+    migrate_supervisor_state,
+    migration_authorizes_runtime,
+)
 
 
 class SupervisorError(RuntimeError):
@@ -69,6 +75,7 @@ SUPERVISOR_STATES = {
     "stopped",
 }
 ACTIVE_JOB_STATES = {"running", "reserved", "launch_uncertain"}
+TERMINAL_JOB_STATES = {"completed", "decomposed", "cancelled"}
 BREAKER_RUNTIME = BreakerRuntime(BREAKER_CONTRACT_PATH)
 
 
@@ -424,6 +431,7 @@ def runtime_fingerprint() -> str:
         + BREAKER_CONTRACT_PATH.read_bytes()
         + (PLUGIN_ROOT / "scripts/breaker_contract.py").read_bytes()
         + (PLUGIN_ROOT / "scripts/breaker_runtime.py").read_bytes()
+        + (PLUGIN_ROOT / "scripts/supervisor_state.py").read_bytes()
         + (PLUGIN_ROOT / "contracts/resource-claims-v1.json").read_bytes()
         + (PLUGIN_ROOT / "scripts/runtime_state.py").read_bytes()
         + (PLUGIN_ROOT / ".codex-plugin/plugin.json").read_bytes()
@@ -468,9 +476,17 @@ def takeover_state(
         raise SupervisorError(
             "repository config changed since the unclean supervisor stop"
         )
-    if previous.get("runtime_fingerprint") != runtime_digest:
+    migration_authorized = migration_authorizes_runtime(
+        previous,
+        runtime_fingerprint=runtime_digest,
+        contract_digest=contract_digest,
+    )
+    if (
+        previous.get("runtime_fingerprint") != runtime_digest
+        and not migration_authorized
+    ):
         raise SupervisorError("Orka runtime changed since the unclean supervisor stop")
-    if previous.get("contract_digest") != contract_digest:
+    if previous.get("contract_digest") != contract_digest and not migration_authorized:
         raise SupervisorError(
             "supervisor lifecycle contract changed since the unclean stop"
         )
@@ -584,14 +600,33 @@ def takeover_state(
     return state
 
 
-def state_snapshot(path: Path, repository: Path | None = None) -> dict[str, Any] | None:
+def state_snapshot(
+    path: Path,
+    repository: Path | None = None,
+    *,
+    migrate: bool = True,
+    target_runtime_fingerprint: str | None = None,
+    target_contract_digest: str | None = None,
+) -> dict[str, Any] | None:
     if not path.exists():
         return None
     if path.is_symlink():
         raise SupervisorError("supervisor state must not be a symlink")
     value = load_json(path, "supervisor state")
+    if migrate:
+        try:
+            value, _changed = migrate_supervisor_state(
+                value,
+                target_runtime_fingerprint=(
+                    target_runtime_fingerprint or runtime_fingerprint()
+                ),
+                target_contract_digest=(target_contract_digest or contract()[2]),
+            )
+        except SupervisorStateError as exc:
+            raise SupervisorError(str(exc)) from exc
     if (
-        value.get("schema_version") != 1
+        value.get("schema_version")
+        not in ({CURRENT_SCHEMA_VERSION} if migrate else {1, CURRENT_SCHEMA_VERSION})
         or value.get("contract_id") != "orka.supervisor-lifecycle"
         or value.get("lifecycle_state") not in SUPERVISOR_STATES
         or not isinstance(value.get("process"), dict)
@@ -673,32 +708,95 @@ def status_response(state: dict[str, Any]) -> dict[str, Any]:
     for tickets in job_states.values():
         tickets.sort()
     planning = state.get("planning") or {"enabled": False}
+    active = sorted(
+        str(job.get("ticket") or "")
+        for job in jobs.values()
+        if job.get("state") in ACTIVE_JOB_STATES
+    )
+    terminal = sorted(
+        str(job.get("ticket") or "")
+        for job in jobs.values()
+        if job.get("state") in TERMINAL_JOB_STATES
+    )
+    queued = sorted(
+        {
+            ticket
+            for action in ("launch", "scope", "decomposition", "repair", "recovery")
+            for ticket in ((planning.get("plan") or {}).get(action) or [])
+        }
+        | {
+            str(job.get("ticket") or "")
+            for job in jobs.values()
+            if job.get("state")
+            in {"queued", "repair_ready", "recovery_ready", "decomposition_ready"}
+        }
+    )
+    retrying = sorted(
+        {str(item.get("key") or "") for item in planning.get("retry_waiting") or []}
+        | {
+            str(job.get("ticket") or "")
+            for job in jobs.values()
+            if job.get("state") == "retry_wait"
+        }
+    )
+    parked = sorted(
+        {str(item.get("key") or "") for item in planning.get("decision_queue") or []}
+        | {
+            str(job.get("ticket") or "")
+            for job in jobs.values()
+            if job.get("state") in {"parked_decision", "parked_external"}
+        }
+    )
+    blocked = sorted(
+        {str(item.get("key") or "") for item in planning.get("waiting") or []}
+        | {
+            str(job.get("ticket") or "")
+            for job in jobs.values()
+            if job.get("state") == "blocked"
+        }
+    )
+    route_held = sorted(
+        str(item.get("subject") or "") for item in planning.get("route_breakers") or []
+    )
+    pressure_limited = sorted(
+        str(item.get("source_id") or "")
+        for item in planning.get("pressure_breakers") or []
+    )
+    active_global = dict(planning.get("active_global_breaker") or {})
+    globally_paused = (
+        active_global if state.get("lifecycle_state") in {"paused", "stopped"} else {}
+    )
+    categories = {
+        "queued": queued,
+        "active": active,
+        "retrying": retrying,
+        "parked": parked,
+        "route_held": route_held,
+        "pressure_limited": pressure_limited,
+        "globally_paused": globally_paused,
+        "blocked": blocked,
+        "terminal": terminal,
+    }
     result["dispatch"] = {
         "active_jobs": sum(
             1 for job in jobs.values() if job.get("state") in ACTIVE_JOB_STATES
         ),
         "terminal_jobs": sum(
-            1 for job in jobs.values() if job.get("state") not in ACTIVE_JOB_STATES
+            1 for job in jobs.values() if job.get("state") in TERMINAL_JOB_STATES
         ),
         "launch_count": int(dispatch.get("launch_count") or 0),
         "terminal_count": int(dispatch.get("terminal_count") or 0),
         "job_states": job_states,
-        "queued": sorted(
-            {
-                ticket
-                for action in ("launch", "scope", "decomposition", "repair", "recovery")
-                for ticket in ((planning.get("plan") or {}).get(action) or [])
-            }
-        ),
-        "retrying": sorted(
-            str(item.get("key") or "") for item in planning.get("retry_waiting") or []
-        ),
-        "parked": sorted(
-            str(item.get("key") or "") for item in planning.get("decision_queue") or []
-        ),
-        "blocked": sorted(
-            str(item.get("key") or "") for item in planning.get("waiting") or []
-        ),
+        "queued": queued,
+        "active": active,
+        "retrying": retrying,
+        "parked": parked,
+        "route_held": route_held,
+        "pressure_limited": pressure_limited,
+        "globally_paused": globally_paused,
+        "blocked": blocked,
+        "terminal": terminal,
+        "categories": categories,
         "ticket_breakers": list(planning.get("ticket_breakers") or []),
         "route_breakers": list(planning.get("route_breakers") or []),
         "pressure_breakers": list(planning.get("pressure_breakers") or []),
@@ -970,7 +1068,7 @@ def run_daemon(repository: Path, handshake: Path) -> int:
             )
             return 2
 
-        previous = state_snapshot(paths["state"], repository)
+        previous = state_snapshot(paths["state"], repository, migrate=False)
         previous_lease = (previous or {}).get("lease") or {}
         previous_clean = bool(
             previous
@@ -984,6 +1082,15 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                 paths["state_digest"],
                 required=not previous_clean,
             )
+            try:
+                previous, _migrated = migrate_supervisor_state(
+                    previous,
+                    target_runtime_fingerprint=runtime_fingerprint(),
+                    target_contract_digest=contract_digest,
+                )
+            except SupervisorStateError as exc:
+                write_handshake(handshake, {"status": "error", "error": str(exc)})
+                return 2
         generation = int(previous_lease.get("generation") or 0) + 1
         os.fchmod(lock_handle.fileno(), 0o600)
         identity = process_identity(os.getpid())
@@ -1001,7 +1108,7 @@ def run_daemon(repository: Path, handshake: Path) -> int:
         if not previous or previous_clean:
             prior_history = list((previous or {}).get("history") or [])[-255:]
             state = {
-                "schema_version": 1,
+                "schema_version": CURRENT_SCHEMA_VERSION,
                 "contract_id": "orka.supervisor-lifecycle",
                 "contract_schema_version": 1,
                 "repository": str(repository),

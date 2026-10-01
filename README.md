@@ -464,6 +464,11 @@ holds bind one role and route so healthy routes and unrelated tickets continue.
 Sprint pressure now degrades only new admission while active work continues.
 Only contract-declared sprint breakers may pause or stop the supervisor, and
 each global activation and resume is bound to one durable breaker generation.
+Authenticated schema-v1 supervisor checkpoints migrate once to the v2 breaker
+model without losing attempts, spend, reviews, PRs, dependencies, or history.
+Status keeps queued, active, retrying, parked, route-held, pressure-limited,
+globally paused, blocked, and terminal work distinct; parked work is never
+reported as complete.
 
 Please report security-sensitive findings privately according to
 [SECURITY.md](SECURITY.md) and follow the [Code of Conduct](CODE_OF_CONDUCT.md).

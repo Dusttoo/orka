@@ -123,8 +123,9 @@ concerns.
 6. Add soft/hard breakers and ticket parking.
    **The canonical breaker taxonomy and legacy-state mapping are complete in
    1.8.14. Ticket/route runtime enforcement is complete in 1.8.15. Sprint
-   pressure and hard global breakers are complete in 1.8.16. Migration/status
-   integration remains a separate slice.**
+   pressure and hard global breakers are complete in 1.8.16. Deterministic
+   migration, stable status categories, and restart/reclassification proof are
+   complete in 1.8.17.**
 7. Introduce a transactional event store with checkpoint import/export.
 8. Add supervisor lease takeover and crash recovery.
 9. Expose stable status, pause, resume, and decision CLI commands.
