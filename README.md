@@ -189,6 +189,7 @@ supports them.
 | `agents/` | Role briefs: ticket-scoper, design-reviewer, implementer, code-reviewer, security-reviewer, visual-qa |
 | `commands/` | Claude Code slash commands: `/orchestrate`, `/orchestrate-sprint`, `/gate`, `/release`, `/orchestration-init`, `/orchestration-report` |
 | `hooks/` | Claude Code/Codex `PreToolUse` merge-guard + `Stop` worktree sweep |
+| `contracts/` | Versioned machine-readable lifecycle, persistence, recovery, and worker boundaries |
 | `scripts/` | The mechanics: config reader, sprint controller, workflow engine, gate runner, merge-guard, safe-merge, worktree lifecycle, verification |
 | `skills/` | Codex/Claude natural-language procedures: orchestrate ticket/sprint, gate, release, init, scope, recover, report |
 | `templates/` | Configuration template plus the plugin-owned process reference |
@@ -423,6 +424,12 @@ migration, PR, worktree, provider route, visual-QA slot, or heavy process can
 delay only conflicting work. See
 [Durable resource admission](docs/resource-admission.md) for the claim contract
 and the optional Jira-label convention.
+
+Orka 2's state-store direction is defined by
+[ADR 0001](docs/adr/0001-transactional-event-store.md): one repository-scoped
+SQLite event store, a supervisor-owned writer, deterministic JSON export, and
+an explicit fail-closed migration from existing checkpoints. The current JSON
+runtime remains authoritative until the tracked cutover slices are complete.
 
 Multi-lane supervisors allocate work through durable queue classes rather than
 globally pausing for the oldest repair. Repair and recovery retain greater
