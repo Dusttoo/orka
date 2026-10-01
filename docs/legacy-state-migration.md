@@ -41,6 +41,35 @@ Repeating an exact import is an evidenced no-op. If any recognized source has
 changed, the existing receipt cannot be reused or replaced. Operators must
 reconcile that conflict explicitly instead of selecting a newer file.
 
+## Cutover authority foundation
+
+Orka 1.8.24 adds explicit `activate`, `status`, and `rollback` operations:
+
+```bash
+python3 "$ORKA_ROOT/scripts/state_migration.py" activate --repo .
+python3 "$ORKA_ROOT/scripts/state_migration.py" status --repo .
+python3 "$ORKA_ROOT/scripts/state_migration.py" rollback --repo . \
+  --reason "pre-write validation failed"
+```
+
+Activation rechecks the live source inventory and shadow digest under the
+supervisor lease and repository initialization lock. It writes a private,
+repository-bound minimum-version marker and seeds generation-zero controller
+and supervisor runtime documents transactionally. The same activation is an
+idempotent replay; a different marker or shadow fails closed.
+
+The marker makes cutover-aware controller and supervisor binaries refuse the
+legacy JSON writer before mutation. Orka 1.8.24 deliberately does not start a
+transactional production supervisor: issues #125 through #127 provide that
+integration. Activating at this foundation release therefore creates a safe
+maintenance hold.
+
+Rollback is available only while the cutover has no authoritative
+runtime-document event. The first generation-fenced write permanently closes
+that route; subsequent recovery must use deterministic export or backup. Both
+activation and rollback are replay-safe if the process stops between the
+marker and database boundaries.
+
 ## Preserved state and redaction
 
 The version-2 store retains each normalized source as an immutable migration

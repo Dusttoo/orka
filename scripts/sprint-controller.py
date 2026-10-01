@@ -80,6 +80,7 @@ from operator_authority import (
 
 from runtime_state import (
     RuntimeStateError,
+    assert_legacy_runtime_writable,
     canonical_config_path,
     migrate_legacy_runtime_dir,
     shared_repository_root,
@@ -6668,10 +6669,11 @@ def parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = parser().parse_args()
     try:
+        assert_legacy_runtime_writable(project_root())
         cfg = settings(args)
         args.func(args, cfg)
         return 0
-    except (SprintError, AgentError, HealthError) as exc:
+    except (SprintError, AgentError, HealthError, RuntimeStateError) as exc:
         print(f"sprint-controller: {exc}", file=sys.stderr)
         return 2
 

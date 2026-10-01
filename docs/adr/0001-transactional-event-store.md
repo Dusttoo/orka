@@ -319,7 +319,10 @@ Costs and constraints:
 3. Issue #117: deterministic export, legacy JSON importer, migration receipts,
    ambiguity handling, and shadow comparison. **Implemented in Orka 1.8.23.**
 4. Issue #118: controller/supervisor integration, socket-owned mutations,
-   minimum-version marker, and no-dual-writer activation.
+   minimum-version marker, and no-dual-writer activation. The activation,
+   generation-fenced runtime-document, and pre-first-write rollback foundation
+   is implemented in Orka 1.8.24 through issue #124; integration remains in
+   #125 through #127.
 5. Issue #119: backup, corruption detection, replay validation,
    cross-platform locking/path behavior, and crash injection at every boundary.
 

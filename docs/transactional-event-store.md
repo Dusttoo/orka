@@ -43,10 +43,12 @@ without another mutation; changing its operation material fails closed.
 ## Schema and durability
 
 The version-1 schema is `contracts/event-store-v1.sql`; the additive legacy
-import schema is `contracts/event-store-v2-legacy-import.sql`. Initialization
-records each migration identifier and SHA-256 source digest. Reopening is
-idempotent; unknown, missing, or changed migration history is rejected rather
-than inferred.
+import schema is `contracts/event-store-v2-legacy-import.sql`; and the cutover
+authority/runtime-document schema is
+`contracts/event-store-v3-runtime-cutover.sql`. Initialization records each
+migration identifier and SHA-256 source digest. Reopening is idempotent;
+unknown, missing, or changed migration history is rejected rather than
+inferred.
 
 Connections enable foreign keys, `synchronous=FULL`, and a bounded busy
 timeout. WAL is requested only when the caller explicitly proves a local
@@ -69,5 +71,6 @@ timers, or receipts.
 
 Orka 1.8.23 adds the explicit offline importer and deterministic export. See
 [Legacy state migration](legacy-state-migration.md). The later tracked slices
-still own controller/supervisor cutover (#118), and backup, replay validation,
-cross-platform behavior, and broader injected crash recovery (#119).
+still own controller/supervisor integration (#125–#127), and backup, replay
+validation, cross-platform behavior, and broader injected crash recovery
+(#119).
