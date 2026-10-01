@@ -195,6 +195,12 @@ supports them.
 | `tests/` | Plugin-owned conformance suites; never copied into target repos |
 | `.codex-plugin/` | Codex plugin manifest exposing the `skills/` directory |
 
+The durable supervisor and disposable workers communicate through a versioned,
+provider-neutral [phase-worker protocol](docs/phase-worker-protocol.md). Codex,
+Claude, and API adapters share the same capability and envelope fixtures. A host
+process may remain available, but every phase dispatch starts a fresh model
+context and carries immutable attempt and supervisor-fence identity.
+
 ## Configuration
 
 Per-repo mechanics live in `.orchestration/config.yaml`
@@ -469,6 +475,12 @@ model without losing attempts, spend, reviews, PRs, dependencies, or history.
 Status keeps queued, active, retrying, parked, route-held, pressure-limited,
 globally paused, blocked, and terminal work distinct; parked work is never
 reported as complete.
+
+Disposable phase execution uses
+[`orka.phase-worker-protocol/v1`](contracts/phase-worker-protocol-v1.json).
+Adapters negotiate mandatory fencing, fresh-context, progress, cancellation,
+and terminal-result capabilities before dispatch. Stale or malformed envelopes
+remain ticket-local failures and never authorize scheduler state changes.
 
 Please report security-sensitive findings privately according to
 [SECURITY.md](SECURITY.md) and follow the [Code of Conduct](CODE_OF_CONDUCT.md).
