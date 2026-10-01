@@ -44,7 +44,10 @@ true:
 - the predecessor PID is live or its identity cannot be verified;
 - another process still owns the repository lease;
 - the lease file was replaced;
-- `.orchestration/.supervisor/state.json` differs from its digest receipt;
+- before transactional cutover, `.orchestration/.supervisor/state.json`
+  differs from its digest receipt;
+- after transactional cutover, the authoritative supervisor document is
+  missing, corrupt, or belongs to another activation;
 - Orka, the lifecycle contract, or repository orchestration config changed.
 
 Do not edit supervisor runtime files to force recovery. Stop the supervisor
@@ -59,6 +62,7 @@ Run the integration and contract suites:
 
 ```bash
 python3 tests/sprint_supervisor_test.py
+python3 tests/authoritative_supervisor_state_test.py
 python3 tests/supervisor_dispatch_test.py
 python3 tests/sprint_controller_resilience_test.py
 python3 scripts/supervisor_contract.py \

@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from event_store import EventStoreError, TransactionalEventStore, canonical_json
+from authoritative_supervisor_state import read_authoritative_state
 from runtime_state import (
     repository_identity,
     repository_layout,
@@ -66,6 +67,7 @@ def _database_path(repository: Path) -> Path:
 
 def _read_documents(
     repository: Path,
+    store: TransactionalEventStore | None = None,
 ) -> tuple[dict[str, Any], dict[str, ControllerDocument]]:
     """Read the active cutover and controller generation set without writer authority."""
 
@@ -73,33 +75,51 @@ def _read_documents(
     marker = runtime_cutover_marker(repository)
     if marker is None:
         raise ControllerRuntimeError("transactional runtime cutover is not active")
-    database_path = _database_path(repository)
-    try:
-        database = sqlite3.connect(f"file:{database_path}?mode=ro", uri=True)
-        database.row_factory = sqlite3.Row
-        cutover = database.execute(
-            """
-            SELECT activation_id, state FROM runtime_cutovers
-            WHERE repository_id = ?
-            """,
-            (identity["repository_uuid"],),
-        ).fetchone()
-        rows = database.execute(
-            """
-            SELECT document_id, generation, payload_json, payload_digest
-            FROM runtime_documents
-            WHERE repository_id = ? AND document_type = 'controller'
-            ORDER BY document_id
-            """,
-            (identity["repository_uuid"],),
-        ).fetchall()
-    except (OSError, sqlite3.Error) as exc:
-        raise ControllerRuntimeError(
-            f"cannot read transactional controller state: {exc}"
-        ) from exc
-    finally:
-        if "database" in locals():
-            database.close()
+    if store is not None:
+        snapshot = store.runtime_snapshot(repository_id=identity["repository_uuid"])
+        cutover_value = snapshot.get("cutover") or {}
+        cutover = {
+            "activation_id": cutover_value.get("activation_id"),
+            "state": cutover_value.get("state"),
+        }
+        rows = [
+            {
+                "document_id": item["document_id"],
+                "generation": item["generation"],
+                "payload_json": canonical_json(item["payload"]),
+                "payload_digest": item["payload_digest"],
+            }
+            for item in snapshot.get("documents") or []
+            if item.get("document_type") == "controller"
+        ]
+    else:
+        database_path = _database_path(repository)
+        try:
+            database = sqlite3.connect(f"file:{database_path}?mode=ro", uri=True)
+            database.row_factory = sqlite3.Row
+            cutover = database.execute(
+                """
+                SELECT activation_id, state FROM runtime_cutovers
+                WHERE repository_id = ?
+                """,
+                (identity["repository_uuid"],),
+            ).fetchone()
+            rows = database.execute(
+                """
+                SELECT document_id, generation, payload_json, payload_digest
+                FROM runtime_documents
+                WHERE repository_id = ? AND document_type = 'controller'
+                ORDER BY document_id
+                """,
+                (identity["repository_uuid"],),
+            ).fetchall()
+        except (OSError, sqlite3.Error) as exc:
+            raise ControllerRuntimeError(
+                f"cannot read transactional controller state: {exc}"
+            ) from exc
+        finally:
+            if "database" in locals():
+                database.close()
     if cutover is None or str(cutover["state"]) != "active":
         raise ControllerRuntimeError(
             "transactional runtime cutover is not active in the event store"
@@ -132,7 +152,19 @@ def _read_documents(
     return {"identity": identity, "marker": marker}, documents
 
 
-def _command_receipt(repository: Path, command_id: str) -> dict[str, Any] | None:
+def _command_receipt(
+    repository: Path,
+    command_id: str,
+    store: TransactionalEventStore | None = None,
+) -> dict[str, Any] | None:
+    if store is not None:
+        receipt = store.event_receipt(f"controller:{command_id}")
+        if receipt is None:
+            return None
+        return {
+            "generation": receipt["aggregate_version"],
+            "payload": receipt["payload"],
+        }
     try:
         database = sqlite3.connect(
             f"file:{_database_path(repository)}?mode=ro", uri=True
@@ -165,13 +197,11 @@ def direct_request(repository: Path, argv: Sequence[str]) -> int:
         raise ControllerRuntimeError(
             "controller command identity has an invalid format"
         )
-    state_path = repository / ".orchestration/.supervisor/state.json"
-    try:
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    state = read_authoritative_state(repository)
+    if state is None:
         raise ControllerRuntimeError(
             "cannot authenticate the active repository supervisor"
-        ) from exc
+        )
     lease = state.get("lease") or {}
     fence = f"{lease.get('id', '')}:{lease.get('generation', '')}"
     if not lease.get("id") or not isinstance(lease.get("generation"), int):
@@ -221,10 +251,11 @@ def supervisor_request(
     supervisor_fence: str,
     *,
     command_id: str | None = None,
+    store: TransactionalEventStore | None = None,
 ) -> dict[str, Any]:
     """Bind one command to the repository and current controller generation set."""
 
-    binding, documents = _read_documents(repository)
+    binding, documents = _read_documents(repository, store)
     identity = command_id or str(uuid.uuid4())
     if not COMMAND_ID.fullmatch(identity):
         raise ControllerRuntimeError(
@@ -279,6 +310,7 @@ def execute_request(
     writer_identity: str,
     private_root: Path,
     controller_path: Path,
+    store: TransactionalEventStore | None = None,
 ) -> dict[str, Any]:
     """Execute and transactionally commit one authenticated controller command."""
 
@@ -330,7 +362,7 @@ def execute_request(
             "supervisor_fence": request["supervisor_fence"],
         }
     )
-    receipt = _command_receipt(repository, command_id)
+    receipt = _command_receipt(repository, command_id, store)
     if receipt is not None:
         if (receipt["payload"] or {}).get("operation_digest") != request_digest:
             raise ControllerRuntimeError(
@@ -349,7 +381,7 @@ def execute_request(
             "commits": [replay],
         }
 
-    binding, documents = _read_documents(repository)
+    binding, documents = _read_documents(repository, store)
     observed = {key: item.generation for key, item in documents.items()}
     if generations != observed:
         raise ControllerRuntimeError(
@@ -448,10 +480,15 @@ def execute_request(
             expected_generation = int(generations.get(document_id, 0))
             database_path = _database_path(repository)
             try:
-                with TransactionalEventStore(
-                    database_path, writer_identity=writer_identity
-                ) as store:
-                    written = store.write_runtime_document(
+                owned_store: TransactionalEventStore | None = None
+                active_store = store
+                if active_store is None:
+                    owned_store = TransactionalEventStore(
+                        database_path, writer_identity=writer_identity
+                    )
+                    active_store = owned_store
+                try:
+                    written = active_store.write_runtime_document(
                         repository_id=identity["repository_uuid"],
                         activation_id=marker["activation_id"],
                         document_type="controller",
@@ -463,6 +500,9 @@ def execute_request(
                         writer_identity=writer_identity,
                         operation_digest=request_digest,
                     )
+                finally:
+                    if owned_store is not None:
+                        owned_store.close()
             except EventStoreError as exc:
                 raise ControllerRuntimeError(str(exc)) from exc
             commits.append(

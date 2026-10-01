@@ -24,6 +24,7 @@ from api_agent import AgentError, UsageLedger, budgets_from_config, load_yaml
 from breaker_runtime import BreakerRuntime
 from runtime_state import canonical_config_path
 from controller_runtime import execute_request, supervisor_request
+from event_store import TransactionalEventStore
 
 
 class PlanningError(RuntimeError):
@@ -138,10 +139,12 @@ class TransactionalControllerAdapter(ControllerAdapter):
         *,
         supervisor_fence: str,
         writer_identity: str,
+        store: TransactionalEventStore | None = None,
     ) -> None:
         super().__init__(repository, runtime_directory)
         self.supervisor_fence = supervisor_fence
         self.writer_identity = writer_identity
+        self.store = store
         self.private_root = runtime_directory / "controller-materializations"
 
     def _run(self, *arguments: str) -> dict:
@@ -149,6 +152,7 @@ class TransactionalControllerAdapter(ControllerAdapter):
             self.repository,
             arguments,
             self.supervisor_fence,
+            store=self.store,
         )
         response = execute_request(
             self.repository,
@@ -157,6 +161,7 @@ class TransactionalControllerAdapter(ControllerAdapter):
             writer_identity=self.writer_identity,
             private_root=self.private_root,
             controller_path=CONTROLLER,
+            store=self.store,
         )
         result = subprocess.CompletedProcess(
             args=list(arguments),

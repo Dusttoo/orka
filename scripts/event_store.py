@@ -351,6 +351,25 @@ class TransactionalEventStore:
             foreign_keys = self._database.execute("PRAGMA foreign_key_check").fetchall()
         return {"integrity": result, "foreign_key_violations": foreign_keys}
 
+    def event_receipt(self, idempotency_key: str) -> dict[str, Any] | None:
+        """Read an immutable event receipt on the supervisor-owned connection."""
+
+        with self._write_lock:
+            row = self._database.execute(
+                """
+                SELECT sequence, aggregate_version, payload_json
+                FROM events WHERE idempotency_key = ?
+                """,
+                (idempotency_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "sequence": int(row[0]),
+            "aggregate_version": int(row[1]),
+            "payload": json.loads(str(row[2])),
+        }
+
     def bind_repository(
         self, binding: RepositoryBinding, *, writer_identity: str
     ) -> None:

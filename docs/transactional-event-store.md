@@ -2,10 +2,12 @@
 
 Orka 1.8.21 introduced the storage core selected by
 [ADR 0001](adr/0001-transactional-event-store.md). Orka 1.8.27 connects the
-controller to that core after explicit cutover. Before cutover, the JSON
-controller remains compatible and authoritative. After cutover, direct
-controller commands route through the elected repository supervisor and JSON
-checkpoints are private, ephemeral materializations only.
+controller to that core after explicit cutover, and Orka 1.8.29 makes the
+transactional supervisor snapshot authoritative. Before cutover, the JSON
+controller and supervisor checkpoints remain compatible and authoritative.
+After cutover, direct controller commands route through the elected repository
+supervisor, controller JSON is a private ephemeral materialization, and the
+supervisor no longer writes its legacy JSON checkpoint.
 
 ## Ownership boundary
 
@@ -73,10 +75,31 @@ timers, or receipts.
 
 Orka 1.8.23 adds the explicit offline importer and deterministic export. See
 [Legacy state migration](legacy-state-migration.md). Orka 1.8.27 completes the
-controller-command routing slice (#125). Later slices still own the complete
-supervisor-state cutover (#126–#127), and backup, replay
-validation, cross-platform behavior, and broader injected crash recovery
-(#119).
+controller-command routing slice (#125). Orka 1.8.29 makes the supervisor's
+whole state generation authoritative in the store (#126). The final no-dual-
+writer proof remains in #127; backup, replay validation, cross-platform
+behavior, and broader injected crash recovery remain in #119.
+
+## Authoritative supervisor generations
+
+Once cutover is active, the elected supervisor opens the event store once and
+holds its writer lock until lease release. Controller commands share that
+connection instead of opening a second production writer. Each supervisor
+mutation commits the complete `supervisor:primary` document as one generation,
+so status never combines planning, dispatch, attempt, claim, timer, decision,
+or external-operation ambiguity from different points in time.
+
+Worker and adapter processes receive neither the connection nor its writer
+identity. Their results remain untrusted envelopes delivered to the supervisor;
+only the supervisor may turn them into another generation. Concurrent host
+callbacks serialize on the connection lock. A restart reads the last committed
+generation, advances the supervisor lease fence, and restores exact attempts,
+claims, timers, decisions, and ambiguous external operations without consulting
+or replacing `.orchestration/.supervisor/state.json`.
+
+The legacy JSON path is deliberately unchanged before cutover. This permits an
+operator to qualify the imported shadow state before activation without
+silently changing the established 1.x runtime.
 
 ## Controller command boundary after cutover
 
