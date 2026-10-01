@@ -29,9 +29,39 @@ data, or unsanitized provider transcripts in an issue.
 4. Preserve backward compatibility unless the issue is labelled
    `breaking change` and has an accepted migration plan.
 5. Update documentation for user-visible behavior or configuration.
-6. Bump both plugin manifests in the same pull request. Orka installations are
-   pinned snapshots, so every merged change requires a new version.
-7. Link the pull request to its issue with `Closes #123` when appropriate.
+6. Link the pull request to its issue with `Closes #123` when appropriate.
+
+You do not need to choose the next Orka version or edit the plugin manifests.
+The maintainer assigns the final version, updates both manifests, and adds the
+release note when the pull request is ready to merge. This avoids version
+collisions between concurrent contributions. If your change needs a specific
+compatibility or migration note, describe it in the pull request.
+
+## Signed commits
+
+Orka's protected `main` branch requires every incoming commit to have a
+signature that GitHub marks **Verified**. Set up [GPG or SSH commit signing on
+GitHub](https://docs.github.com/en/authentication/managing-commit-signature-verification/about-commit-signature-verification)
+and add the corresponding public signing key to your GitHub account before your
+first commit. Configure signing by default for your fork, or use `git commit -S`
+for each commit:
+
+```bash
+git config commit.gpgsign true
+git commit -S -m "Describe the change"
+git log --show-signature origin/main..HEAD
+```
+
+Check the signatures on *all* commits you are introducing before pushing, and
+confirm that each commit shows **Verified** on the pull request's **Commits** tab.
+A local signature alone does not guarantee GitHub can verify it; the signing key
+must be associated with your account. An unsigned commit can block the pull
+request even when the final squash or merge commit would be signed. If you
+already pushed unsigned commits, rewrite and sign those commits on your fork,
+then update the pull request with `git push --force-with-lease`. Ask in the pull
+request if you need help; maintainers will not disable the signature rule to
+merge it. See [GitHub's signing guide](https://docs.github.com/en/authentication/managing-commit-signature-verification/signing-commits)
+and [protected branch behavior](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches#require-signed-commits).
 
 ## Local verification
 
@@ -83,7 +113,10 @@ A reviewable pull request includes:
 - tests covering success, failure, retry, and restart where relevant;
 - compatibility and migration impact;
 - the commands run and their results;
-- matching version bumps in both manifests.
+- release note details when users need to change how they use Orka.
+
+Before merge, the maintainer follows the [release process](docs/releasing.md)
+to choose the next version, bump both manifests, and write its release note.
 
 Maintainers may ask for a design issue to be resolved before reviewing a large
 implementation. This protects contributors from spending time on an approach
@@ -94,4 +127,3 @@ that conflicts with the durable runtime or safety model.
 Do not open public issues for vulnerabilities involving credential exposure,
 authorization bypass, unsafe command execution, merge-guard bypass, or
 cross-repository data disclosure. Follow [SECURITY.md](SECURITY.md).
-

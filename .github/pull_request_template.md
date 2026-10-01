@@ -29,6 +29,13 @@ Write "No runtime behavior change" when appropriate.
 - [ ] I added or updated regression tests for behavior changes.
 - [ ] I did not include credentials, private repository data, or
       project-specific policy in the plugin.
-- [ ] I bumped the version in both `.claude-plugin/plugin.json` and
-      `.codex-plugin/plugin.json`, kept the versions identical, and selected the
-      appropriate semantic-version increment. Every PR requires a version bump.
+- [ ] Every commit I introduced is signed and shows **Verified** on GitHub.
+- [ ] I described any user-facing compatibility or migration impact for the
+      release note. The maintainer will choose the final version before merge.
+
+### Maintainer before merge
+
+- [ ] Choose a version after reconciling other open or recently merged PRs.
+- [ ] Bump both plugin manifests to the same version and add
+      `docs/releases/<version>.md` on the exact PR head that will merge.
+- [ ] Verify the final commits are signed and rerun the required checks.
