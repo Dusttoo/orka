@@ -24,7 +24,7 @@ esac
 echo "== orchestration preflight =="
 
 # Repo + config sanity
-[ -d .git ] || fail "run this from the repository root (no .git here)"
+[ -e .git ] || fail "run this from the repository root (no .git entry here)"
 [ -f .orchestration/config.yaml ] || fail "missing .orchestration/config.yaml (copy templates/config.yaml)"
 ok "in repo root with orchestration config"
 

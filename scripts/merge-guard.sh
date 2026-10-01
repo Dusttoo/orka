@@ -281,7 +281,7 @@ fi
 
 # Configured policy can block selected merge targets and squash merges. If the
 # policy cannot be read, block the merge rather than under-enforcing.
-POLICY="$(python3 "$HERE/orchestration-engine.py" guard-policy 2>/dev/null)"
+POLICY="$(ORCH_CONFIG_FILE="$CONFIG_FILE" python3 "$HERE/orchestration-engine.py" guard-policy 2>/dev/null)"
 if [ "$?" -ne 0 ]; then
   echo "BLOCKED by merge-guard: orchestration config is invalid or guard policy cannot be resolved." >&2
   exit 2

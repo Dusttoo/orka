@@ -1160,6 +1160,10 @@ def parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = parser().parse_args()
     try:
+        if getattr(args, "config", None):
+            from runtime_state import resolve_config_argument
+
+            args.config = str(resolve_config_argument(Path.cwd(), args.config))
         if args.command == "jira-fields":
             fields = jira_fields_from_config(Path(args.config))
             output = {"fields": ",".join(fields), "field_list": fields}

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # lib-config.sh -- resolve per-repo orchestration config for the shell scripts.
 #
-# The config lives at <repo>/.orchestration/config.yaml. This library reads the
+# The legacy config lives at <repo>/.orchestration/config.yaml. An initialized
+# repository resolves its operator-bound Git blob through runtime_state.py.
 # two shapes the harness relies on, with no external YAML dependency:
 #
 #   1. flat scalars           key: value
@@ -30,11 +31,11 @@ orch_engine() {
 orch_branch_name() {
   local role="${1:?branch role required}"
   shift || true
-  python3 "$(orch_engine)" branch-name "$role" "$@"
+  ORCH_CONFIG_FILE="$(orch_config_file)" python3 "$(orch_engine)" branch-name "$role" "$@"
 }
 
 orch_validate_config() {
-  python3 "$(orch_engine)" validate-config >/dev/null
+  ORCH_CONFIG_FILE="$(orch_config_file)" python3 "$(orch_engine)" validate-config >/dev/null
 }
 
 orch_assert_minimum_version() {
@@ -51,7 +52,21 @@ orch_project_root() {
 }
 
 orch_config_file() {
-  printf '%s/.orchestration/config.yaml' "$(orch_project_root)"
+  local root common marker
+  root="$(orch_project_root)"
+  common="$(git -C "$root" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+  marker="${common%/}/orka-runtime/repository.json"
+  if [ -z "$common" ] || { [ ! -e "$marker" ] && [ ! -L "$marker" ]; }; then
+    printf '%s/.orchestration/config.yaml' "$root"
+    return 0
+  fi
+  python3 - "$(orch_script_dir)" "$root" <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from runtime_state import canonical_config_path
+print(canonical_config_path(Path(sys.argv[2])))
+PY
 }
 
 # --- readers ------------------------------------------------------------------

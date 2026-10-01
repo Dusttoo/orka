@@ -601,7 +601,9 @@ def config_path(args: argparse.Namespace) -> Path:
     override = getattr(args, "config", None) or os.environ.get("ORCH_CONFIG_FILE")
     if override:
         return Path(override).resolve()
-    return project_root() / ".orchestration" / "config.yaml"
+    from runtime_state import resolve_config_argument
+
+    return resolve_config_argument(project_root(), Path(".orchestration/config.yaml"))
 
 
 def load_config(args: argparse.Namespace) -> dict[str, Any]:

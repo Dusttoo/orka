@@ -44,6 +44,7 @@ from supervisor_admission import (
     normalize_claims,
     release_claims,
 )
+from runtime_state import canonical_config_path
 
 
 class DispatchError(RuntimeError):
@@ -267,7 +268,7 @@ class ControllerDispatchAdapter:
     def __init__(self, repository: Path, runtime_directory: Path):
         self.repository = repository.resolve()
         self.runtime_directory = runtime_directory.resolve()
-        self.config = self.repository / ".orchestration/config.yaml"
+        self.config = canonical_config_path(self.repository)
 
     def _run(self, *arguments: str) -> dict[str, Any]:
         try:
