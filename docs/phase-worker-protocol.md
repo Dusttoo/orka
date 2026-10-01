@@ -125,6 +125,29 @@ envelope in its prompt, and has its legacy terminal result translated into a
 bound phase terminal envelope. New callers may name narrower phases without
 reusing the prior model conversation.
 
+## Adapter negotiation
+
+Codex desktop, Claude desktop, and direct API execution use the same
+capability builder and the same protocol validator. The adapter—not the
+supervisor—advertises its profile, adapter version, protocol version, and
+supported capabilities. The supervisor validates that offer before asking the
+controller for a reservation. Unsupported versions, absent profile
+capabilities, or malformed offers therefore consume no attempt, provider
+request, or subscription turn.
+
+Accepted negotiation produces a persisted compatibility receipt alongside the
+phase execution. Every route receives the same sanitized job envelope and
+returns the same progress, heartbeat, cancellation acknowledgement, and
+terminal envelopes. Codex uses an ephemeral execution, Claude uses a fresh
+print invocation, and API payload construction uses one on-demand request;
+none may resume a prior conversation or provider session.
+
+Protocol drift is recorded as a route-scoped `protocol_incompatibility`
+incident. It does not claim the upstream provider is unavailable and cannot
+hold compatible routes. Authentication, rate limits, and transport failures
+remain provider incidents. An adapter upgrade requires an explicit successful
+route repair probe before its protocol hold clears.
+
 ## Conformance
 
 Run the focused suite with:
@@ -132,6 +155,7 @@ Run the focused suite with:
 ```bash
 bash tests/phase-worker-protocol.test.sh
 bash tests/phase-execution.test.sh
+bash tests/phase-worker-adapter.test.sh
 ```
 
 The fixture set covers Codex desktop, Claude desktop, and API capability offers;

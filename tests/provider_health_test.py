@@ -299,6 +299,21 @@ class HealthTests(unittest.TestCase):
         with self.assertRaises(HealthError):
             self.health.failure("openai", "rate_limited", scope="route-a")
 
+    def test_protocol_incompatibility_is_route_scoped_and_distinct(self):
+        self.health.failure(
+            "openai",
+            "incompatible",
+            scope="phase-route",
+            client="phase-worker-protocol",
+            detail="unsupported protocol version",
+            incident_class="protocol_incompatibility",
+        )
+        held = self.health.status("openai", route="phase-route")
+        self.assertEqual(held["state"], "incompatible")
+        self.assertEqual(held["scope"], "route")
+        self.assertEqual(held["incident_class"], "protocol_incompatibility")
+        self.assertEqual(self.health.status("openai")["state"], "unverified")
+
     def test_plain_probe_keeps_scoped_hold_and_after_repair_clears_only_that_route(self):
         from context_pipeline import llm_route_from_config
         from provider_health import route_identity

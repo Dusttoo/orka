@@ -29,6 +29,23 @@ class FakeAdapter:
         self.finished: list[dict] = []
         self.requeued: list[dict] = []
 
+    def phase_capability_offer(self, contract: dict) -> dict:
+        profile = "api" if self.origin == "api" else "codex-desktop"
+        profile_capability = (
+            "provider-receipts" if profile == "api" else "desktop-subscription"
+        )
+        return {
+            "kind": "capability_offer",
+            "protocol_version": contract["protocol_version"],
+            "adapter": profile,
+            "adapter_version": "fixture-1",
+            "supported_capabilities": [
+                *contract["capabilities"]["mandatory"],
+                profile_capability,
+            ],
+            "fresh_context_per_dispatch": True,
+        }
+
     def reserve(self, sprint: str, ticket: str, run_ref: str) -> dict:
         self.count += 1
         return {

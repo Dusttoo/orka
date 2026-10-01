@@ -118,8 +118,13 @@ no-op; stale bindings are rejected; malformed or missing output moves only that
 ticket to recovery-ready.
 
 Every new launch now negotiates the versioned phase-worker protocol before it
-submits provider work. The supervisor records a stable logical phase job plus a
-fresh dispatch and execution-unit identity, and includes the complete bound
+reserves a controller attempt or submits provider work. Codex desktop, Claude
+desktop, and API adapters advertise their own protocol version and capabilities
+through the shared adapter contract. Missing capabilities and mixed protocol
+versions fail as route-scoped protocol incompatibilities rather than provider
+outages. The supervisor records the accepted negotiation receipt, a stable
+logical phase job, and a fresh dispatch and execution-unit identity, and
+includes the complete bound
 job envelope in the worker input. The default `ticket-workflow` phase preserves
 the existing 1.x controller path; narrower phase dispatch is available without
 retaining a prior Codex, Claude, or provider conversation. A failed execution
