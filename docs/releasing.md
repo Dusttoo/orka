@@ -4,7 +4,7 @@ Orka has two visible version surfaces:
 
 - The Claude marketplace and Codex plugin source use the paired plugin manifest
   version on `main`. This is the current supported plugin snapshot.
-- A GitHub Release is a signed, tagged source snapshot with release notes. Its
+- A GitHub Release is a tagged source snapshot with release notes. Its
   **Latest** label changes only when a release is published. A just-merged
   version can appear in the marketplace before its GitHub Release is published.
 
