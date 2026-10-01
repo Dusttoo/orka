@@ -29,6 +29,8 @@ The state snapshot records:
   digests, contract events, and resulting job states.
 - normalized resource claims, claim-set digests, conflict receipts, and
   exact-once release receipts.
+- disposable phase job, dispatch, execution-unit, capability, progress,
+  cancellation, and terminal bindings from the phase-worker protocol.
 
 It never writes provider, Jira, GitHub, or application credentials.
 
@@ -114,6 +116,15 @@ against GitHub, maps accepted results through the versioned lifecycle contract,
 and immediately replans when a lane exits. Duplicate delivery is a journaled
 no-op; stale bindings are rejected; malformed or missing output moves only that
 ticket to recovery-ready.
+
+Every new launch now negotiates the versioned phase-worker protocol before it
+submits provider work. The supervisor records a stable logical phase job plus a
+fresh dispatch and execution-unit identity, and includes the complete bound
+job envelope in the worker input. The default `ticket-workflow` phase preserves
+the existing 1.x controller path; narrower phase dispatch is available without
+retaining a prior Codex, Claude, or provider conversation. A failed execution
+can be replaced only after terminal evidence or fencing, using the same job and
+external-operation key with new execution identities.
 
 `status` exposes stable `queued`, `active`, `retrying`, `parked`, `route_held`,
 `pressure_limited`, `globally_paused`, `blocked`, and `terminal` categories.

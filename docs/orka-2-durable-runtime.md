@@ -12,6 +12,7 @@ exact mechanically proven-dead worker attempts and authenticated preserved PRs,
 recovery-specific crash/replay proofs, contract-driven ticket/route breaker
 transitions, generation-bound sprint pressure/global breakers, and the
 provider-neutral disposable phase-worker protocol with shared adapter fixtures,
+supervisor-managed disposable phase execution with bounded replacement,
 and the accepted transactional event-store architecture. It also implements
 the Git-common-directory repository identity, canonical Git-blob policy
 boundary, and supervisor-owned transactional store core without moving current
@@ -137,6 +138,8 @@ concerns.
    complete in 1.8.17.**
 7. Specify the disposable phase-worker protocol and shared adapter fixtures.
    **Complete in 1.8.18.**
+   Supervisor-managed launch, progress, cancellation, terminal attribution,
+   replacement, and restart reconciliation are complete in 1.8.28.
 8. Introduce a transactional event store with checkpoint import/export.
    **The architecture decision, schema prototype, and implementation slices are
    complete in 1.8.19. Repository identity and canonical policy authority are

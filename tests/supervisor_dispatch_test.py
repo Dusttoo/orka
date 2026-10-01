@@ -164,6 +164,79 @@ class DispatchTests(unittest.TestCase):
         refill = self.dispatcher.fill("99", ["PNP-3"], jobs, 2)
         self.assertEqual([job["ticket"] for job in refill], ["PNP-3"])
 
+    def test_launch_records_a_fresh_protocol_phase_execution(self) -> None:
+        first = self.dispatcher.launch("99", "PNP-1", phase="implement")
+        second = self.dispatcher.launch("99", "PNP-2", phase="implement")
+
+        first_execution = first["phase_execution"]["executions"][0]
+        second_execution = second["phase_execution"]["executions"][0]
+        self.assertEqual(first_execution["job"]["phase"], "implement")
+        self.assertTrue(first_execution["job"]["fresh_context"])
+        self.assertNotEqual(
+            first_execution["identity"]["execution_unit_id"],
+            second_execution["identity"]["execution_unit_id"],
+        )
+        self.assertNotIn("conversation_id", json.dumps(first["phase_execution"]))
+        self.assertEqual(
+            first_execution["attachment"]["identity"]["attempt_token"],
+            first["attempt_token"],
+        )
+        prompt = Path(first["paths"]["prompt"]).read_text(encoding="utf-8")
+        self.assertIn('"kind":"job"', prompt)
+        self.assertIn('"phase":"implement"', prompt)
+
+    def test_legacy_terminal_is_attributed_to_protocol_execution(self) -> None:
+        job = self.dispatcher.launch("99", "PNP-1", phase="implement")
+        self.write_result(job, self.envelope(job))
+        applied = self.dispatcher.apply_terminal(job)
+
+        self.assertTrue(applied["applied"])
+        self.assertEqual(job["phase_execution"]["status"], "terminal")
+        phase_terminal = job["phase_execution"]["terminal"]["envelope"]
+        self.assertEqual(phase_terminal["outcome"], "completed")
+        self.assertEqual(
+            phase_terminal["execution_unit_id"],
+            job["phase_execution"]["executions"][0]["identity"][
+                "execution_unit_id"
+            ],
+        )
+
+    def test_pre_phase_runtime_job_remains_terminal_compatible(self) -> None:
+        job = self.dispatcher.launch("99", "PNP-1")
+        job.pop("phase_execution")
+        self.write_result(job, self.envelope(job))
+
+        applied = self.dispatcher.apply_terminal(job)
+
+        self.assertTrue(applied["applied"])
+        self.assertEqual(applied["terminal"]["outcome"], "completed")
+
+    def test_takeover_attributes_terminal_to_the_persisted_dispatch_fence(self) -> None:
+        first_dispatcher = SupervisorDispatcher(
+            self.repo,
+            self.runtime,
+            ROOT / "contracts/supervisor-lifecycle-v1.json",
+            self.adapter,
+            supervisor_fence="lease:1",
+        )
+        job = first_dispatcher.launch("99", "PNP-1", phase="implement")
+        self.write_result(job, self.envelope(job))
+        successor = SupervisorDispatcher(
+            self.repo,
+            self.runtime,
+            ROOT / "contracts/supervisor-lifecycle-v1.json",
+            self.adapter,
+            supervisor_fence="lease:2",
+        )
+
+        applied = successor.apply_terminal(job)
+
+        self.assertTrue(applied["applied"])
+        self.assertEqual(
+            job["phase_execution"]["terminal"]["envelope"]["supervisor_fence"],
+            "lease:1",
+        )
+
     def test_conflicting_candidate_is_skipped_without_reservation_or_reordering(self) -> None:
         exclusive = {
             "kind": "migration",

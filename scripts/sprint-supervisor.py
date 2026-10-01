@@ -1286,6 +1286,9 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                 (state.get("planning") or {}).get("ticket_retry_seconds") or 30
             ),
             breaker_contract_path=BREAKER_CONTRACT_PATH,
+            supervisor_fence=(
+                f"{state['lease']['id']}:{state['lease']['generation']}"
+            ),
         )
         while not should_stop:
             if signal_number:
