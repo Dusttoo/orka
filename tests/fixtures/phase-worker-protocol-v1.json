@@ -1,0 +1,231 @@
+{
+  "schema_version": 1,
+  "contract_id": "orka.phase-worker-protocol",
+  "identity": {
+    "job_id": "job-42",
+    "ticket_id": "PROJ-42",
+    "phase": "implement",
+    "attempt_token": "attempt-2",
+    "supervisor_fence": "lease-7:3",
+    "repository_id": "repo-sha256",
+    "worktree_id": "worktree-sha256",
+    "dispatch_id": "dispatch-9",
+    "execution_unit_id": "unit-11"
+  },
+  "cases": [
+    {
+      "name": "codex advertises a fresh desktop context",
+      "valid": true,
+      "envelope": {
+        "kind": "capability_offer",
+        "protocol_version": 1,
+        "adapter": "codex-desktop",
+        "adapter_version": "1.0",
+        "supported_capabilities": [
+          "attempt-fencing",
+          "cancellation-ack-or-fence",
+          "desktop-subscription",
+          "fresh-context-per-dispatch",
+          "immutable-job-identity",
+          "structured-progress",
+          "structured-terminal-result"
+        ],
+        "fresh_context_per_dispatch": true
+      }
+    },
+    {
+      "name": "claude advertises a fresh desktop context",
+      "valid": true,
+      "envelope": {
+        "kind": "capability_offer",
+        "protocol_version": 1,
+        "adapter": "claude-desktop",
+        "adapter_version": "1.0",
+        "supported_capabilities": [
+          "attempt-fencing",
+          "cancellation-ack-or-fence",
+          "desktop-subscription",
+          "fresh-context-per-dispatch",
+          "immutable-job-identity",
+          "structured-progress",
+          "structured-terminal-result"
+        ],
+        "fresh_context_per_dispatch": true
+      }
+    },
+    {
+      "name": "api advertises provider receipts",
+      "valid": true,
+      "envelope": {
+        "kind": "capability_offer",
+        "protocol_version": 1,
+        "adapter": "api",
+        "adapter_version": "1.0",
+        "supported_capabilities": [
+          "attempt-fencing",
+          "cancellation-ack-or-fence",
+          "fresh-context-per-dispatch",
+          "immutable-job-identity",
+          "provider-receipts",
+          "structured-progress",
+          "structured-terminal-result"
+        ],
+        "fresh_context_per_dispatch": true
+      }
+    },
+    {
+      "name": "job is bound and starts fresh",
+      "valid": true,
+      "use_identity": true,
+      "envelope": {
+        "kind": "job",
+        "protocol_version": 1,
+        "sanitized_input": {"objective": "Implement the accepted slice"},
+        "required_capabilities": [
+          "attempt-fencing",
+          "cancellation-ack-or-fence",
+          "fresh-context-per-dispatch",
+          "immutable-job-identity",
+          "structured-progress",
+          "structured-terminal-result"
+        ],
+        "fresh_context": true
+      }
+    },
+    {
+      "name": "progress is attempt and fence bound",
+      "valid": true,
+      "use_identity": true,
+      "envelope": {
+        "kind": "progress",
+        "protocol_version": 1,
+        "sequence": 1,
+        "milestone": "implementation",
+        "evidence": {"commit": "abc123"}
+      }
+    },
+    {
+      "name": "cancellation acknowledgement is terminal evidence",
+      "valid": true,
+      "use_identity": true,
+      "envelope": {
+        "kind": "cancellation_ack",
+        "protocol_version": 1,
+        "cancellation_id": "cancel-3",
+        "status": "acknowledged",
+        "terminal_receipt": {"exit_code": 143}
+      }
+    },
+    {
+      "name": "terminal result is fully attributed",
+      "valid": true,
+      "use_identity": true,
+      "envelope": {
+        "kind": "terminal",
+        "protocol_version": 1,
+        "outcome": "needs_repair",
+        "summary": "PR requires one bounded repair",
+        "artifacts": {"pr": "42", "branch": "42-example"},
+        "evidence": {"review_ledger_digest": "sha256"}
+      }
+    },
+    {
+      "name": "missing mandatory capability fails closed",
+      "valid": false,
+      "error": "missing mandatory capabilities",
+      "envelope": {
+        "kind": "capability_offer",
+        "protocol_version": 1,
+        "adapter": "api",
+        "adapter_version": "1.0",
+        "supported_capabilities": ["provider-receipts"],
+        "fresh_context_per_dispatch": true
+      }
+    },
+    {
+      "name": "conversation resumption is forbidden",
+      "valid": false,
+      "error": "forbidden field resume_session",
+      "use_identity": true,
+      "envelope": {
+        "kind": "job",
+        "protocol_version": 1,
+        "sanitized_input": {"objective": "Continue"},
+        "required_capabilities": [
+          "attempt-fencing",
+          "cancellation-ack-or-fence",
+          "fresh-context-per-dispatch",
+          "immutable-job-identity",
+          "structured-progress",
+          "structured-terminal-result"
+        ],
+        "fresh_context": true,
+        "resume_session": "opaque-session"
+      }
+    },
+    {
+      "name": "stale supervisor fence is rejected",
+      "valid": false,
+      "error": "identity field supervisor_fence does not match",
+      "use_identity": true,
+      "envelope": {
+        "kind": "terminal",
+        "protocol_version": 1,
+        "supervisor_fence": "lease-6:9",
+        "outcome": "completed",
+        "summary": "stale worker claims completion",
+        "artifacts": {"pr": "42"},
+        "evidence": {"merge_receipt": "receipt"}
+      }
+    },
+    {
+      "name": "unknown terminal outcome is rejected",
+      "valid": false,
+      "error": "unsupported terminal outcome",
+      "use_identity": true,
+      "envelope": {
+        "kind": "terminal",
+        "protocol_version": 1,
+        "outcome": "looks_good",
+        "summary": "unrecognized",
+        "artifacts": {},
+        "evidence": {}
+      }
+    },
+    {
+      "name": "malformed artifact binding is rejected",
+      "valid": false,
+      "error": "artifact bindings must be nonempty strings",
+      "use_identity": true,
+      "envelope": {
+        "kind": "terminal",
+        "protocol_version": 1,
+        "outcome": "needs_repair",
+        "summary": "artifact identity is malformed",
+        "artifacts": {"pr": 42},
+        "evidence": {}
+      }
+    },
+    {
+      "name": "unsupported protocol version is rejected",
+      "valid": false,
+      "error": "must equal 1",
+      "envelope": {
+        "kind": "capability_offer",
+        "protocol_version": 2,
+        "adapter": "api",
+        "adapter_version": "2.0",
+        "supported_capabilities": [
+          "attempt-fencing",
+          "cancellation-ack-or-fence",
+          "fresh-context-per-dispatch",
+          "immutable-job-identity",
+          "provider-receipts",
+          "structured-progress",
+          "structured-terminal-result"
+        ],
+        "fresh_context_per_dispatch": true
+      }
+    }
+  ]
+}

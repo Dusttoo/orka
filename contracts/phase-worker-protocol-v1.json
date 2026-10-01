@@ -1,0 +1,384 @@
+{
+  "schema_version": 1,
+  "contract_id": "orka.phase-worker-protocol",
+  "protocol_version": 1,
+  "description": "Provider-neutral envelopes for one disposable AI phase execution under the durable supervisor.",
+  "context_lifecycle": {
+    "scope": "one-phase-dispatch",
+    "fresh_context_required": true,
+    "conversation_reuse_across_dispatches": false,
+    "host_process_reuse_allowed": true,
+    "host_retained_model_state_allowed": false
+  },
+  "identity_fields": [
+    "job_id",
+    "ticket_id",
+    "phase",
+    "attempt_token",
+    "supervisor_fence",
+    "repository_id",
+    "worktree_id",
+    "dispatch_id",
+    "execution_unit_id"
+  ],
+  "capabilities": {
+    "mandatory": [
+      "attempt-fencing",
+      "cancellation-ack-or-fence",
+      "fresh-context-per-dispatch",
+      "immutable-job-identity",
+      "structured-progress",
+      "structured-terminal-result"
+    ],
+    "optional": [
+      "artifact-binding",
+      "desktop-subscription",
+      "provider-receipts",
+      "streaming-progress"
+    ]
+  },
+  "adapter_profiles": {
+    "codex-desktop": {
+      "required_capabilities": ["desktop-subscription"]
+    },
+    "claude-desktop": {
+      "required_capabilities": ["desktop-subscription"]
+    },
+    "api": {
+      "required_capabilities": ["provider-receipts"]
+    }
+  },
+  "envelopes": {
+    "capability_offer": {
+      "required_fields": [
+        "kind",
+        "protocol_version",
+        "adapter",
+        "adapter_version",
+        "supported_capabilities",
+        "fresh_context_per_dispatch"
+      ],
+      "types": {
+        "kind": "string",
+        "protocol_version": "integer",
+        "adapter": "string",
+        "adapter_version": "string",
+        "supported_capabilities": "array",
+        "fresh_context_per_dispatch": "boolean"
+      },
+      "constants": {
+        "kind": "capability_offer",
+        "protocol_version": 1,
+        "fresh_context_per_dispatch": true
+      },
+      "identity_fields": [],
+      "forbidden_fields": ["conversation_id", "resume_session"]
+    },
+    "job": {
+      "required_fields": [
+        "kind",
+        "protocol_version",
+        "job_id",
+        "ticket_id",
+        "phase",
+        "attempt_token",
+        "supervisor_fence",
+        "repository_id",
+        "worktree_id",
+        "dispatch_id",
+        "execution_unit_id",
+        "sanitized_input",
+        "required_capabilities",
+        "fresh_context"
+      ],
+      "types": {
+        "kind": "string",
+        "protocol_version": "integer",
+        "job_id": "string",
+        "ticket_id": "string",
+        "phase": "string",
+        "attempt_token": "string",
+        "supervisor_fence": "string",
+        "repository_id": "string",
+        "worktree_id": "string",
+        "dispatch_id": "string",
+        "execution_unit_id": "string",
+        "sanitized_input": "object",
+        "required_capabilities": "array",
+        "fresh_context": "boolean"
+      },
+      "constants": {
+        "kind": "job",
+        "protocol_version": 1,
+        "fresh_context": true
+      },
+      "identity_fields": [
+        "job_id",
+        "ticket_id",
+        "phase",
+        "attempt_token",
+        "supervisor_fence",
+        "repository_id",
+        "worktree_id",
+        "dispatch_id",
+        "execution_unit_id"
+      ],
+      "forbidden_fields": [
+        "conversation_id",
+        "previous_conversation_id",
+        "provider_session_id",
+        "resume_session"
+      ]
+    },
+    "progress": {
+      "required_fields": [
+        "kind",
+        "protocol_version",
+        "job_id",
+        "ticket_id",
+        "phase",
+        "attempt_token",
+        "supervisor_fence",
+        "dispatch_id",
+        "execution_unit_id",
+        "sequence",
+        "milestone",
+        "evidence"
+      ],
+      "types": {
+        "kind": "string",
+        "protocol_version": "integer",
+        "job_id": "string",
+        "ticket_id": "string",
+        "phase": "string",
+        "attempt_token": "string",
+        "supervisor_fence": "string",
+        "dispatch_id": "string",
+        "execution_unit_id": "string",
+        "sequence": "integer",
+        "milestone": "string",
+        "evidence": "object"
+      },
+      "constants": {"kind": "progress", "protocol_version": 1},
+      "identity_fields": [
+        "job_id",
+        "ticket_id",
+        "phase",
+        "attempt_token",
+        "supervisor_fence",
+        "dispatch_id",
+        "execution_unit_id"
+      ],
+      "forbidden_fields": ["conversation_id", "resume_session"]
+    },
+    "heartbeat": {
+      "required_fields": [
+        "kind",
+        "protocol_version",
+        "job_id",
+        "ticket_id",
+        "phase",
+        "attempt_token",
+        "supervisor_fence",
+        "dispatch_id",
+        "execution_unit_id",
+        "observed_at"
+      ],
+      "types": {
+        "kind": "string",
+        "protocol_version": "integer",
+        "job_id": "string",
+        "ticket_id": "string",
+        "phase": "string",
+        "attempt_token": "string",
+        "supervisor_fence": "string",
+        "dispatch_id": "string",
+        "execution_unit_id": "string",
+        "observed_at": "string"
+      },
+      "constants": {"kind": "heartbeat", "protocol_version": 1},
+      "identity_fields": [
+        "job_id",
+        "ticket_id",
+        "phase",
+        "attempt_token",
+        "supervisor_fence",
+        "dispatch_id",
+        "execution_unit_id"
+      ],
+      "forbidden_fields": ["conversation_id", "resume_session"]
+    },
+    "cancellation": {
+      "required_fields": [
+        "kind",
+        "protocol_version",
+        "job_id",
+        "ticket_id",
+        "phase",
+        "attempt_token",
+        "supervisor_fence",
+        "dispatch_id",
+        "execution_unit_id",
+        "cancellation_id",
+        "reason",
+        "deadline"
+      ],
+      "types": {
+        "kind": "string",
+        "protocol_version": "integer",
+        "job_id": "string",
+        "ticket_id": "string",
+        "phase": "string",
+        "attempt_token": "string",
+        "supervisor_fence": "string",
+        "dispatch_id": "string",
+        "execution_unit_id": "string",
+        "cancellation_id": "string",
+        "reason": "string",
+        "deadline": "string"
+      },
+      "constants": {"kind": "cancellation", "protocol_version": 1},
+      "identity_fields": [
+        "job_id",
+        "ticket_id",
+        "phase",
+        "attempt_token",
+        "supervisor_fence",
+        "dispatch_id",
+        "execution_unit_id"
+      ],
+      "forbidden_fields": ["conversation_id", "resume_session"]
+    },
+    "cancellation_ack": {
+      "required_fields": [
+        "kind",
+        "protocol_version",
+        "job_id",
+        "ticket_id",
+        "phase",
+        "attempt_token",
+        "supervisor_fence",
+        "dispatch_id",
+        "execution_unit_id",
+        "cancellation_id",
+        "status",
+        "terminal_receipt"
+      ],
+      "types": {
+        "kind": "string",
+        "protocol_version": "integer",
+        "job_id": "string",
+        "ticket_id": "string",
+        "phase": "string",
+        "attempt_token": "string",
+        "supervisor_fence": "string",
+        "dispatch_id": "string",
+        "execution_unit_id": "string",
+        "cancellation_id": "string",
+        "status": "string",
+        "terminal_receipt": "object"
+      },
+      "constants": {
+        "kind": "cancellation_ack",
+        "protocol_version": 1,
+        "status": "acknowledged"
+      },
+      "identity_fields": [
+        "job_id",
+        "ticket_id",
+        "phase",
+        "attempt_token",
+        "supervisor_fence",
+        "dispatch_id",
+        "execution_unit_id"
+      ],
+      "forbidden_fields": ["conversation_id", "resume_session"]
+    },
+    "terminal": {
+      "required_fields": [
+        "kind",
+        "protocol_version",
+        "job_id",
+        "ticket_id",
+        "phase",
+        "attempt_token",
+        "supervisor_fence",
+        "repository_id",
+        "worktree_id",
+        "dispatch_id",
+        "execution_unit_id",
+        "outcome",
+        "summary",
+        "artifacts",
+        "evidence"
+      ],
+      "types": {
+        "kind": "string",
+        "protocol_version": "integer",
+        "job_id": "string",
+        "ticket_id": "string",
+        "phase": "string",
+        "attempt_token": "string",
+        "supervisor_fence": "string",
+        "repository_id": "string",
+        "worktree_id": "string",
+        "dispatch_id": "string",
+        "execution_unit_id": "string",
+        "outcome": "string",
+        "summary": "string",
+        "artifacts": "object",
+        "evidence": "object"
+      },
+      "constants": {"kind": "terminal", "protocol_version": 1},
+      "identity_fields": [
+        "job_id",
+        "ticket_id",
+        "phase",
+        "attempt_token",
+        "supervisor_fence",
+        "repository_id",
+        "worktree_id",
+        "dispatch_id",
+        "execution_unit_id"
+      ],
+      "forbidden_fields": [
+        "conversation_id",
+        "previous_conversation_id",
+        "provider_session_id",
+        "resume_session"
+      ]
+    }
+  },
+  "terminal_outcomes": [
+    "blocked",
+    "cancelled_attempt",
+    "completed",
+    "external_blocked",
+    "malformed_result",
+    "needs_decomposition",
+    "needs_repair",
+    "operator_decision",
+    "recoverable",
+    "timeout_with_progress",
+    "timeout_without_progress"
+  ],
+  "artifact_bindings": {
+    "terminal_fields": ["artifact_id", "branch", "head", "pr", "tree"],
+    "value_type": "string",
+    "external_verification_required": true
+  },
+  "failure_classes": {
+    "unsupported_protocol": "launch_rejected_permanent",
+    "missing_capability": "launch_rejected_permanent",
+    "identity_mismatch": "worker_result_invalid",
+    "malformed_envelope": "worker_result_invalid",
+    "cancellation_unacknowledged": "worker_cancelled"
+  },
+  "current_evidence_compatibility": {
+    "attempt_token": "attempt_token",
+    "controller_invocation_id": "dispatch_id",
+    "execution_unit_identity": "execution_unit_id",
+    "repository_identity": "repository_id",
+    "worker_cwd": "worktree_id"
+  }
+}

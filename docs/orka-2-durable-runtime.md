@@ -1,7 +1,7 @@
 # Orka 2: durable supervisor runtime
 
 Status: accepted architectural direction; implementation in independently
-releasable slices. Orka 1.8.16 provides the detached supervisor, repository
+releasable slices. Orka 1.8.18 provides the detached supervisor, repository
 lease lifecycle, deterministic synchronization/planning loop, controller-owned
 desktop/API worker dispatch, versioned terminal-result transitions, ticket-local
 parking, durable retry wakeups, classified operator-decision resolution, and
@@ -10,7 +10,8 @@ capacity-aware durable resource admission, starvation-bounded fair lane
 allocation, a versioned recovery eligibility contract, automatic recovery of
 exact mechanically proven-dead worker attempts and authenticated preserved PRs,
 recovery-specific crash/replay proofs, contract-driven ticket/route breaker
-transitions, and generation-bound sprint pressure/global breakers.
+transitions, generation-bound sprint pressure/global breakers, and the
+provider-neutral disposable phase-worker protocol with shared adapter fixtures.
 
 Orka's controller has durable checkpoints and mechanical gates, but a
 model-driven captain still performs the outer `plan -> launch -> wait -> finish
@@ -45,6 +46,10 @@ disposable phase workers with fresh model context
 The supervisor never implements tickets or reviews its own workers. It owns
 only deterministic lifecycle operations. AI workers remain disposable and
 receive fresh context for each ticket or phase.
+
+The versioned boundary is defined by the
+[disposable phase-worker protocol](phase-worker-protocol.md). Host processes may
+remain warm, but model conversation state may not survive a phase dispatch.
 
 ## Required properties
 
@@ -126,10 +131,12 @@ concerns.
    pressure and hard global breakers are complete in 1.8.16. Deterministic
    migration, stable status categories, and restart/reclassification proof are
    complete in 1.8.17.**
-7. Introduce a transactional event store with checkpoint import/export.
-8. Add supervisor lease takeover and crash recovery.
-9. Expose stable status, pause, resume, and decision CLI commands.
-10. Prove the design with restart, timeout, provider-loss, and malformed-output
+7. Specify the disposable phase-worker protocol and shared adapter fixtures.
+   **Complete in 1.8.18.**
+8. Introduce a transactional event store with checkpoint import/export.
+9. Add supervisor lease takeover and crash recovery.
+10. Expose stable status, pause, resume, and decision CLI commands.
+11. Prove the design with restart, timeout, provider-loss, and malformed-output
    chaos tests.
 
 Each step must be independently releasable and keep existing Orka 1.x
