@@ -449,6 +449,12 @@ contains the documented reset fix; otherwise the store reports its rollback
 journal fallback. This API is not yet the production controller authority. See
 [Transactional event-store core](docs/transactional-event-store.md).
 
+Orka 1.8.23 adds the offline, content-addressed legacy state importer and
+deterministic redacted JSON export used to prove a shadow migration before
+cutover. See [Legacy state migration](docs/legacy-state-migration.md). The
+existing JSON controller remains authoritative until the separate cutover
+slice ships.
+
 Multi-lane supervisors allocate work through durable queue classes rather than
 globally pausing for the oldest repair. Repair and recovery retain greater
 weight, one lane is reserved for dependency-unlocking work when eligible, and a

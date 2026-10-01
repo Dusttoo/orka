@@ -317,7 +317,7 @@ Costs and constraints:
    event and projection invariants, idempotency, timers, and concurrent
    completion tests. **Implemented in Orka 1.8.21.**
 3. Issue #117: deterministic export, legacy JSON importer, migration receipts,
-   ambiguity handling, and shadow comparison.
+   ambiguity handling, and shadow comparison. **Implemented in Orka 1.8.23.**
 4. Issue #118: controller/supervisor integration, socket-owned mutations,
    minimum-version marker, and no-dual-writer activation.
 5. Issue #119: backup, corruption detection, replay validation,

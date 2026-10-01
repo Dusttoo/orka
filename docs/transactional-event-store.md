@@ -42,9 +42,11 @@ without another mutation; changing its operation material fails closed.
 
 ## Schema and durability
 
-The version-1 schema is `contracts/event-store-v1.sql`. Initialization records
-the migration identifier and SHA-256 source digest. Reopening is idempotent;
-unknown, missing, or changed migration history is rejected rather than inferred.
+The version-1 schema is `contracts/event-store-v1.sql`; the additive legacy
+import schema is `contracts/event-store-v2-legacy-import.sql`. Initialization
+records each migration identifier and SHA-256 source digest. Reopening is
+idempotent; unknown, missing, or changed migration history is rejected rather
+than inferred.
 
 Connections enable foreign keys, `synchronous=FULL`, and a bounded busy
 timeout. WAL is requested only when the caller explicitly proves a local
@@ -65,6 +67,7 @@ exclusive-claim rollback, timer generations, external-operation receipts, and
 12 concurrent terminal completions without losing jobs, events, claims,
 timers, or receipts.
 
-The later tracked slices still own deterministic export and legacy import
-(#117), controller/supervisor cutover (#118), and backup, replay validation,
-cross-platform behavior, and injected crash recovery (#119).
+Orka 1.8.23 adds the explicit offline importer and deterministic export. See
+[Legacy state migration](legacy-state-migration.md). The later tracked slices
+still own controller/supervisor cutover (#118), and backup, replay validation,
+cross-platform behavior, and broader injected crash recovery (#119).
