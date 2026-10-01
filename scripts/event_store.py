@@ -22,11 +22,14 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 SCHEMA_PATH = Path(__file__).resolve().parents[1] / "contracts/event-store-v1.sql"
 LEGACY_IMPORT_SCHEMA_PATH = (
     Path(__file__).resolve().parents[1] / "contracts/event-store-v2-legacy-import.sql"
+)
+RUNTIME_CUTOVER_SCHEMA_PATH = (
+    Path(__file__).resolve().parents[1] / "contracts/event-store-v3-runtime-cutover.sql"
 )
 
 
@@ -82,6 +85,23 @@ class ImportResult:
     replayed: bool
     source_count: int
     record_count: int
+
+
+@dataclass(frozen=True)
+class CutoverResult:
+    activation_id: str
+    replayed: bool
+    state: str
+    seeded_documents: int
+    first_authoritative_sequence: int | None
+
+
+@dataclass(frozen=True)
+class RuntimeDocumentResult:
+    sequence: int
+    replayed: bool
+    generation: int
+    payload_digest: str
 
 
 def canonical_json(value: Any) -> str:
@@ -240,6 +260,7 @@ class TransactionalEventStore:
         specifications = (
             (1, "0001-initial-event-store", schema_path),
             (2, "0002-legacy-import", LEGACY_IMPORT_SCHEMA_PATH),
+            (3, "0003-runtime-cutover", RUNTIME_CUTOVER_SCHEMA_PATH),
         )
         migrations: list[tuple[int, str, str, str]] = []
         for version, migration_id, path in specifications:
@@ -994,6 +1015,474 @@ class TransactionalEventStore:
                 raise StaleWriteError("timer was concurrently changed")
             return event
 
+    @staticmethod
+    def _next_aggregate_version(
+        database: sqlite3.Connection,
+        repository_id: str,
+        aggregate_type: str,
+        aggregate_id: str,
+    ) -> int:
+        row = database.execute(
+            """
+            SELECT max(aggregate_version) FROM events
+            WHERE repository_id = ? AND aggregate_type = ? AND aggregate_id = ?
+            """,
+            (repository_id, aggregate_type, aggregate_id),
+        ).fetchone()
+        return int(row[0] or 0) + 1
+
+    def activate_runtime_cutover(
+        self,
+        *,
+        repository_id: str,
+        activation_id: str,
+        marker_digest: str,
+        minimum_version: str,
+        legacy_snapshot_digest: str,
+        seed_documents: Sequence[Mapping[str, Any]],
+        idempotency_key: str,
+        writer_identity: str,
+        occurred_at: str | None = None,
+    ) -> CutoverResult:
+        """Activate one no-dual-writer boundary without starting runtime writes."""
+
+        at = occurred_at or utc_now()
+        ordered = sorted(
+            (dict(item) for item in seed_documents),
+            key=lambda item: (str(item["document_type"]), str(item["document_id"])),
+        )
+        identities = [
+            (str(item["document_type"]), str(item["document_id"])) for item in ordered
+        ]
+        if len(identities) != len(set(identities)):
+            raise IdempotencyConflict("cutover seed contains duplicate runtime documents")
+        seed_manifest = []
+        for item in ordered:
+            payload_json = canonical_json(item["payload"])
+            payload_digest = _digest(payload_json)
+            if payload_digest != item["payload_digest"]:
+                raise IdempotencyConflict(
+                    "cutover runtime-document digest does not match its payload"
+                )
+            seed_manifest.append(
+                {
+                    "document_id": str(item["document_id"]),
+                    "document_type": str(item["document_type"]),
+                    "payload_digest": payload_digest,
+                }
+            )
+        payload = {
+            "activation_id": activation_id,
+            "legacy_snapshot_digest": legacy_snapshot_digest,
+            "marker_digest": marker_digest,
+            "minimum_version": minimum_version,
+            "seed_documents": seed_manifest,
+        }
+        with self._transaction(writer_identity) as database:
+            receipt = database.execute(
+                """
+                SELECT normalized_export_digest FROM migration_receipts
+                WHERE repository_id = ? AND source_kind = 'legacy-runtime-v1'
+                """,
+                (repository_id,),
+            ).fetchone()
+            if receipt is None or str(receipt[0]) != legacy_snapshot_digest:
+                raise IdempotencyConflict(
+                    "cutover legacy snapshot does not match the imported migration receipt"
+                )
+            existing = database.execute(
+                """
+                SELECT activation_id, marker_digest, minimum_version,
+                       legacy_snapshot_digest, state, activation_generation,
+                       first_authoritative_sequence
+                FROM runtime_cutovers WHERE repository_id = ?
+                """,
+                (repository_id,),
+            ).fetchone()
+            expected = (
+                activation_id,
+                marker_digest,
+                minimum_version,
+                legacy_snapshot_digest,
+            )
+            if existing is not None and str(existing[4]) == "active":
+                if tuple(map(str, existing[:4])) != expected:
+                    raise IdempotencyConflict(
+                        "repository already has a different active runtime cutover"
+                    )
+                replay = self._existing_event(
+                    database,
+                    repository_id=repository_id,
+                    aggregate_type="runtime_cutover",
+                    aggregate_id=repository_id,
+                    event_type="runtime_cutover_activated",
+                    idempotency_key=idempotency_key,
+                    payload=payload,
+                )
+                if replay is None:
+                    raise IdempotencyConflict(
+                        "active runtime cutover belongs to another activation receipt"
+                    )
+                return CutoverResult(
+                    activation_id,
+                    True,
+                    "active",
+                    len(ordered),
+                    int(existing[6]) if existing[6] is not None else None,
+                )
+            event_version = self._next_aggregate_version(
+                database, repository_id, "runtime_cutover", repository_id
+            )
+            event = self._append_event(
+                database,
+                repository_id=repository_id,
+                aggregate_type="runtime_cutover",
+                aggregate_id=repository_id,
+                aggregate_version=event_version,
+                event_type="runtime_cutover_activated",
+                idempotency_key=idempotency_key,
+                payload=payload,
+                occurred_at=at,
+            )
+            if event.replayed:
+                raise IdempotencyConflict(
+                    "cutover activation event exists without an active projection"
+                )
+            activation_generation = (
+                int(existing[5]) + 1 if existing is not None else 1
+            )
+            database.execute(
+                "DELETE FROM runtime_documents WHERE repository_id = ?",
+                (repository_id,),
+            )
+            if existing is None:
+                database.execute(
+                    """
+                    INSERT INTO runtime_cutovers(
+                        repository_id, activation_id, marker_digest,
+                        minimum_version, legacy_snapshot_digest, state,
+                        activation_generation, activated_at,
+                        first_authoritative_sequence, rolled_back_at
+                    ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, NULL, NULL)
+                    """,
+                    (
+                        repository_id,
+                        activation_id,
+                        marker_digest,
+                        minimum_version,
+                        legacy_snapshot_digest,
+                        activation_generation,
+                        at,
+                    ),
+                )
+            else:
+                database.execute(
+                    """
+                    UPDATE runtime_cutovers
+                    SET activation_id = ?, marker_digest = ?, minimum_version = ?,
+                        legacy_snapshot_digest = ?, state = 'active',
+                        activation_generation = ?, activated_at = ?,
+                        first_authoritative_sequence = NULL, rolled_back_at = NULL
+                    WHERE repository_id = ? AND state = 'rolled_back'
+                    """,
+                    (
+                        activation_id,
+                        marker_digest,
+                        minimum_version,
+                        legacy_snapshot_digest,
+                        activation_generation,
+                        at,
+                        repository_id,
+                    ),
+                )
+            for item in ordered:
+                database.execute(
+                    """
+                    INSERT INTO runtime_documents(
+                        repository_id, document_type, document_id, generation,
+                        payload_json, payload_digest, supervisor_fence,
+                        last_event_sequence, updated_at
+                    ) VALUES (?, ?, ?, 0, ?, ?, '', NULL, ?)
+                    """,
+                    (
+                        repository_id,
+                        item["document_type"],
+                        item["document_id"],
+                        canonical_json(item["payload"]),
+                        item["payload_digest"],
+                        at,
+                    ),
+                )
+            return CutoverResult(activation_id, False, "active", len(ordered), None)
+
+    def write_runtime_document(
+        self,
+        *,
+        repository_id: str,
+        activation_id: str,
+        document_type: str,
+        document_id: str,
+        expected_generation: int,
+        payload: Mapping[str, Any],
+        supervisor_fence: str,
+        idempotency_key: str,
+        writer_identity: str,
+        occurred_at: str | None = None,
+    ) -> RuntimeDocumentResult:
+        """Commit one authoritative runtime generation under the active fence."""
+
+        if not supervisor_fence:
+            raise WriterAuthorityError("runtime document write requires a supervisor fence")
+        at = occurred_at or utc_now()
+        payload_json = canonical_json(payload)
+        payload_digest = _digest(payload_json)
+        aggregate_id = f"{document_type}:{document_id}"
+        event_payload = {
+            "activation_id": activation_id,
+            "document_id": document_id,
+            "document_type": document_type,
+            "payload_digest": payload_digest,
+            "supervisor_fence": supervisor_fence,
+        }
+        with self._transaction(writer_identity) as database:
+            replay = self._existing_event(
+                database,
+                repository_id=repository_id,
+                aggregate_type="runtime_document",
+                aggregate_id=aggregate_id,
+                event_type="runtime_document_written",
+                idempotency_key=idempotency_key,
+                payload=event_payload,
+                aggregate_version=expected_generation + 1,
+            )
+            if replay is not None:
+                return RuntimeDocumentResult(
+                    replay.sequence, True, replay.aggregate_version, payload_digest
+                )
+            cutover = database.execute(
+                """
+                SELECT activation_id, state FROM runtime_cutovers
+                WHERE repository_id = ?
+                """,
+                (repository_id,),
+            ).fetchone()
+            if cutover is None or tuple(map(str, cutover)) != (activation_id, "active"):
+                raise StaleWriteError("runtime cutover activation is missing or stale")
+            current = database.execute(
+                """
+                SELECT generation FROM runtime_documents
+                WHERE repository_id = ? AND document_type = ? AND document_id = ?
+                """,
+                (repository_id, document_type, document_id),
+            ).fetchone()
+            current_generation = int(current[0]) if current is not None else 0
+            if current_generation != expected_generation:
+                raise StaleWriteError(
+                    "runtime document generation is stale: "
+                    f"expected {expected_generation}, current {current_generation}"
+                )
+            event = self._append_event(
+                database,
+                repository_id=repository_id,
+                aggregate_type="runtime_document",
+                aggregate_id=aggregate_id,
+                aggregate_version=expected_generation + 1,
+                event_type="runtime_document_written",
+                idempotency_key=idempotency_key,
+                payload=event_payload,
+                occurred_at=at,
+            )
+            if current is None:
+                database.execute(
+                    """
+                    INSERT INTO runtime_documents(
+                        repository_id, document_type, document_id, generation,
+                        payload_json, payload_digest, supervisor_fence,
+                        last_event_sequence, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        repository_id,
+                        document_type,
+                        document_id,
+                        event.aggregate_version,
+                        payload_json,
+                        payload_digest,
+                        supervisor_fence,
+                        event.sequence,
+                        at,
+                    ),
+                )
+            else:
+                updated = database.execute(
+                    """
+                    UPDATE runtime_documents
+                    SET generation = ?, payload_json = ?, payload_digest = ?,
+                        supervisor_fence = ?, last_event_sequence = ?, updated_at = ?
+                    WHERE repository_id = ? AND document_type = ?
+                        AND document_id = ? AND generation = ?
+                    """,
+                    (
+                        event.aggregate_version,
+                        payload_json,
+                        payload_digest,
+                        supervisor_fence,
+                        event.sequence,
+                        at,
+                        repository_id,
+                        document_type,
+                        document_id,
+                        expected_generation,
+                    ),
+                ).rowcount
+                if updated != 1:
+                    raise StaleWriteError("runtime document changed concurrently")
+            database.execute(
+                """
+                UPDATE runtime_cutovers SET first_authoritative_sequence = ?
+                WHERE repository_id = ? AND first_authoritative_sequence IS NULL
+                """,
+                (event.sequence, repository_id),
+            )
+            return RuntimeDocumentResult(
+                event.sequence,
+                False,
+                event.aggregate_version,
+                payload_digest,
+            )
+
+    def rollback_runtime_cutover(
+        self,
+        *,
+        repository_id: str,
+        activation_id: str,
+        marker_digest: str,
+        reason: str,
+        idempotency_key: str,
+        writer_identity: str,
+        occurred_at: str | None = None,
+    ) -> CutoverResult:
+        """Rollback activation only while no authoritative runtime write exists."""
+
+        if not reason.strip():
+            raise EventStoreError("cutover rollback requires a reason")
+        at = occurred_at or utc_now()
+        payload = {
+            "activation_id": activation_id,
+            "marker_digest": marker_digest,
+            "reason": reason.strip(),
+        }
+        with self._transaction(writer_identity) as database:
+            replay = self._existing_event(
+                database,
+                repository_id=repository_id,
+                aggregate_type="runtime_cutover",
+                aggregate_id=repository_id,
+                event_type="runtime_cutover_rolled_back",
+                idempotency_key=idempotency_key,
+                payload=payload,
+            )
+            current = database.execute(
+                """
+                SELECT activation_id, marker_digest, state,
+                       first_authoritative_sequence
+                FROM runtime_cutovers WHERE repository_id = ?
+                """,
+                (repository_id,),
+            ).fetchone()
+            if current is None:
+                raise StaleWriteError("runtime cutover is not activated")
+            if tuple(map(str, current[:2])) != (activation_id, marker_digest):
+                raise IdempotencyConflict("cutover rollback identity changed")
+            if str(current[2]) == "rolled_back":
+                if replay is None:
+                    raise IdempotencyConflict(
+                        "runtime cutover was rolled back by another receipt"
+                    )
+                return CutoverResult(activation_id, True, "rolled_back", 0, None)
+            if current[3] is not None:
+                raise WriterAuthorityError(
+                    "runtime cutover cannot roll back after its first authoritative write"
+                )
+            if replay is not None:
+                raise StaleWriteError(
+                    "cutover rollback event exists without a rolled-back projection"
+                )
+            event = self._append_event(
+                database,
+                repository_id=repository_id,
+                aggregate_type="runtime_cutover",
+                aggregate_id=repository_id,
+                aggregate_version=self._next_aggregate_version(
+                    database, repository_id, "runtime_cutover", repository_id
+                ),
+                event_type="runtime_cutover_rolled_back",
+                idempotency_key=idempotency_key,
+                payload=payload,
+                occurred_at=at,
+            )
+            database.execute(
+                "DELETE FROM runtime_documents WHERE repository_id = ?",
+                (repository_id,),
+            )
+            database.execute(
+                """
+                UPDATE runtime_cutovers
+                SET state = 'rolled_back', rolled_back_at = ?
+                WHERE repository_id = ? AND state = 'active'
+                """,
+                (at, repository_id),
+            )
+            return CutoverResult(activation_id, event.replayed, "rolled_back", 0, None)
+
+    def runtime_snapshot(self, *, repository_id: str) -> dict[str, Any]:
+        """Read cutover and all runtime documents from one SQLite transaction."""
+
+        with self._write_lock:
+            self._database.execute("BEGIN")
+            try:
+                cutover = self._database.execute(
+                    "SELECT * FROM runtime_cutovers WHERE repository_id = ?",
+                    (repository_id,),
+                ).fetchone()
+                columns = [
+                    item[1]
+                    for item in self._database.execute(
+                        "PRAGMA table_info(runtime_cutovers)"
+                    ).fetchall()
+                ]
+                document_rows = self._database.execute(
+                    """
+                    SELECT document_type, document_id, generation, payload_json,
+                           payload_digest, supervisor_fence,
+                           last_event_sequence, updated_at
+                    FROM runtime_documents WHERE repository_id = ?
+                    ORDER BY document_type, document_id
+                    """,
+                    (repository_id,),
+                ).fetchall()
+                result = {
+                    "cutover": dict(zip(columns, cutover)) if cutover else None,
+                    "documents": [
+                        {
+                            "document_type": row[0],
+                            "document_id": row[1],
+                            "generation": int(row[2]),
+                            "payload": json.loads(row[3]),
+                            "payload_digest": row[4],
+                            "supervisor_fence": row[5],
+                            "last_event_sequence": row[6],
+                            "updated_at": row[7],
+                        }
+                        for row in document_rows
+                    ],
+                }
+                self._database.commit()
+                return result
+            except BaseException:
+                self._database.rollback()
+                raise
+
     def import_legacy_snapshot(
         self,
         *,
@@ -1146,6 +1635,8 @@ class TransactionalEventStore:
             "migration_receipts",
             "migration_sources",
             "resource_claims",
+            "runtime_cutovers",
+            "runtime_documents",
             "schema_migrations",
             "timers",
         }

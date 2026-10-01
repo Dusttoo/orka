@@ -128,6 +128,79 @@ class TransactionalEventStoreTests(unittest.TestCase):
         self.reserve_job(ticket)
         self.launch_job(ticket)
 
+    def imported_legacy_snapshot(self) -> tuple[str, list[dict[str, object]]]:
+        payload = {
+            "schema_version": 2,
+            "sprint": {"id": "65", "name": "Sprint 65"},
+            "tickets": {"PROJ-1": {"state": "pending"}},
+        }
+        payload_digest = hashlib.sha256(
+            event_store.canonical_json(payload).encode()
+        ).hexdigest()
+        sources: list[dict[str, object]] = [
+            {
+                "category": "controller",
+                "normalized_digest": payload_digest,
+                "payload": payload,
+                "record_key": "registered:.sprint-state/65.json",
+                "source_digest": "raw-source-digest",
+                "source_kind": "json",
+                "source_path": "registered:.sprint-state/65.json",
+            }
+        ]
+        manifest = {
+            "repository_id": REPOSITORY_ID,
+            "sources": [
+                {key: source[key] for key in (
+                    "category",
+                    "normalized_digest",
+                    "record_key",
+                    "source_digest",
+                    "source_kind",
+                    "source_path",
+                )}
+                for source in sources
+            ],
+        }
+        manifest_digest = hashlib.sha256(
+            event_store.canonical_json(manifest).encode()
+        ).hexdigest()
+        legacy_snapshot = {"repository_id": REPOSITORY_ID, "sources": sources}
+        legacy_digest = hashlib.sha256(
+            event_store.canonical_json(legacy_snapshot).encode()
+        ).hexdigest()
+        self.store.import_legacy_snapshot(
+            repository_id=REPOSITORY_ID,
+            receipt_id="legacy-receipt",
+            manifest_digest=manifest_digest,
+            normalized_export_digest=legacy_digest,
+            sources=sources,
+            writer_identity=WRITER,
+            imported_at=NOW,
+        )
+        return legacy_digest, [
+            {
+                "document_type": "controller",
+                "document_id": "65",
+                "payload": payload,
+                "payload_digest": payload_digest,
+            }
+        ]
+
+    def activate_cutover(self) -> event_store.CutoverResult:
+        legacy_digest, documents = self.imported_legacy_snapshot()
+        return self.store.activate_runtime_cutover(
+            repository_id=REPOSITORY_ID,
+            activation_id="cutover-1",
+            marker_digest="marker-digest",
+            minimum_version="1.8.24",
+            legacy_snapshot_digest=legacy_digest,
+            seed_documents=documents,
+            idempotency_key="activate:cutover-1",
+            writer_identity=WRITER,
+            occurred_at=NOW,
+        )
+
     def test_migration_is_idempotent_and_binding_is_fail_closed(self) -> None:
         first = self.store.rows("schema_migrations")
         self.store.close()
@@ -156,9 +229,10 @@ class TransactionalEventStoreTests(unittest.TestCase):
                 "INSERT INTO metadata(key, value) VALUES ('schema_version', '1')"
             )
         self.store = TransactionalEventStore(self.path, writer_identity=WRITER)
-        self.assertEqual(self.store.status().schema_version, 2)
-        self.assertEqual(len(self.store.rows("schema_migrations")), 2)
+        self.assertEqual(self.store.status().schema_version, 3)
+        self.assertEqual(len(self.store.rows("schema_migrations")), 3)
         self.assertEqual(self.store.rows("migration_sources"), [])
+        self.assertEqual(self.store.rows("runtime_cutovers"), [])
 
     def test_unknown_or_modified_migration_ledger_fails_closed(self) -> None:
         self.store.close()
@@ -168,6 +242,129 @@ class TransactionalEventStoreTests(unittest.TestCase):
             )
         with self.assertRaisesRegex(EventStoreError, "migration ledger mismatch"):
             TransactionalEventStore(self.path, writer_identity=WRITER)
+
+    def test_cutover_activation_seeds_documents_and_exact_replay_is_noop(self) -> None:
+        first = self.activate_cutover()
+        self.assertFalse(first.replayed)
+        self.assertEqual(first.seeded_documents, 1)
+        snapshot = self.store.runtime_snapshot(repository_id=REPOSITORY_ID)
+        self.assertEqual(snapshot["cutover"]["state"], "active")
+        self.assertEqual(snapshot["documents"][0]["generation"], 0)
+        self.assertEqual(snapshot["documents"][0]["payload"]["sprint"]["id"], "65")
+
+        legacy_digest = snapshot["cutover"]["legacy_snapshot_digest"]
+        payload = snapshot["documents"][0]["payload"]
+        replay = self.store.activate_runtime_cutover(
+            repository_id=REPOSITORY_ID,
+            activation_id="cutover-1",
+            marker_digest="marker-digest",
+            minimum_version="1.8.24",
+            legacy_snapshot_digest=legacy_digest,
+            seed_documents=[
+                {
+                    "document_type": "controller",
+                    "document_id": "65",
+                    "payload": payload,
+                    "payload_digest": hashlib.sha256(
+                        event_store.canonical_json(payload).encode()
+                    ).hexdigest(),
+                }
+            ],
+            idempotency_key="activate:cutover-1",
+            writer_identity=WRITER,
+            occurred_at=NOW,
+        )
+        self.assertTrue(replay.replayed)
+        self.assertEqual(len(self.store.rows("runtime_cutovers")), 1)
+        changed_payload = {**payload, "unexpected": True}
+        with self.assertRaisesRegex(IdempotencyConflict, "reused with different"):
+            self.store.activate_runtime_cutover(
+                repository_id=REPOSITORY_ID,
+                activation_id="cutover-1",
+                marker_digest="marker-digest",
+                minimum_version="1.8.24",
+                legacy_snapshot_digest=legacy_digest,
+                seed_documents=[
+                    {
+                        "document_type": "controller",
+                        "document_id": "65",
+                        "payload": changed_payload,
+                        "payload_digest": hashlib.sha256(
+                            event_store.canonical_json(changed_payload).encode()
+                        ).hexdigest(),
+                    }
+                ],
+                idempotency_key="activate:cutover-1",
+                writer_identity=WRITER,
+                occurred_at=NOW,
+            )
+
+    def test_runtime_document_write_is_generation_and_fence_bound(self) -> None:
+        self.activate_cutover()
+        payload = {"sprint": {"id": "65"}, "tickets": {}}
+        result = self.store.write_runtime_document(
+            repository_id=REPOSITORY_ID,
+            activation_id="cutover-1",
+            document_type="controller",
+            document_id="65",
+            expected_generation=0,
+            payload=payload,
+            supervisor_fence="supervisor:2",
+            idempotency_key="controller:65:generation:1",
+            writer_identity=WRITER,
+            occurred_at=NOW,
+        )
+        self.assertEqual(result.generation, 1)
+        self.assertFalse(result.replayed)
+        self.assertTrue(
+            self.store.write_runtime_document(
+                repository_id=REPOSITORY_ID,
+                activation_id="cutover-1",
+                document_type="controller",
+                document_id="65",
+                expected_generation=0,
+                payload=payload,
+                supervisor_fence="supervisor:2",
+                idempotency_key="controller:65:generation:1",
+                writer_identity=WRITER,
+                occurred_at=NOW,
+            ).replayed
+        )
+        with self.assertRaisesRegex(StaleWriteError, "generation is stale"):
+            self.store.write_runtime_document(
+                repository_id=REPOSITORY_ID,
+                activation_id="cutover-1",
+                document_type="controller",
+                document_id="65",
+                expected_generation=0,
+                payload={"changed": True},
+                supervisor_fence="supervisor:2",
+                idempotency_key="controller:65:stale",
+                writer_identity=WRITER,
+            )
+        with self.assertRaisesRegex(WriterAuthorityError, "first authoritative write"):
+            self.store.rollback_runtime_cutover(
+                repository_id=REPOSITORY_ID,
+                activation_id="cutover-1",
+                marker_digest="marker-digest",
+                reason="operator rollback",
+                idempotency_key="rollback:cutover-1",
+                writer_identity=WRITER,
+            )
+
+    def test_cutover_rolls_back_only_before_authoritative_write(self) -> None:
+        self.activate_cutover()
+        result = self.store.rollback_runtime_cutover(
+            repository_id=REPOSITORY_ID,
+            activation_id="cutover-1",
+            marker_digest="marker-digest",
+            reason="pre-write validation failed",
+            idempotency_key="rollback:cutover-1",
+            writer_identity=WRITER,
+            occurred_at=NOW,
+        )
+        self.assertEqual(result.state, "rolled_back")
+        self.assertEqual(self.store.rows("runtime_documents"), [])
 
     def test_writer_identity_is_required_for_every_mutation(self) -> None:
         with self.assertRaisesRegex(WriterAuthorityError, "already owns"):

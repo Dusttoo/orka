@@ -455,6 +455,13 @@ cutover. See [Legacy state migration](docs/legacy-state-migration.md). The
 existing JSON controller remains authoritative until the separate cutover
 slice ships.
 
+Orka 1.8.24 adds the next guarded cutover foundation: a repository-bound
+minimum-version marker, generation-fenced transactional runtime documents, and
+rollback that is permitted only before the first authoritative database write.
+It does not silently activate SQLite or run dual writers; explicit activation
+places the legacy runtime into a maintenance hold until the remaining
+controller/supervisor integration slices are installed.
+
 Multi-lane supervisors allocate work through durable queue classes rather than
 globally pausing for the oldest repair. Repair and recovery retain greater
 weight, one lane is reserved for dependency-unlocking work when eligible, and a

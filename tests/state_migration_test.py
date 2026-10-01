@@ -15,14 +15,24 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from runtime_state import initialize_repository_identity, repository_identity  # noqa: E402
+from event_store import TransactionalEventStore  # noqa: E402
+from runtime_state import (  # noqa: E402
+    RuntimeStateError,
+    assert_legacy_runtime_writable,
+    initialize_repository_identity,
+    repository_identity,
+    runtime_cutover_marker,
+)
 from state_migration import (  # noqa: E402
     DATABASE_NAME,
     MigrationError,
+    activate_runtime_cutover,
     export_bytes,
     export_state,
     import_legacy_state,
     inventory_legacy_state,
+    rollback_runtime_cutover,
+    runtime_cutover_status,
 )
 
 
@@ -70,6 +80,7 @@ class LegacyStateMigrationTests(unittest.TestCase):
             runtime / ".sprint-state/65.json",
             {
                 "repository": str(repository),
+                "sprint": {"id": "65", "name": "Sprint 65"},
                 "tickets": {
                     "PROJ-1": {
                         "attempt_token": "attempt-PROJ-1-1",
@@ -176,7 +187,7 @@ class LegacyStateMigrationTests(unittest.TestCase):
             exported["digests"]["legacy_snapshot"],
             inventory["normalized_export_digest"],
         )
-        self.assertEqual(exported["schema_version"], 2)
+        self.assertEqual(exported["schema_version"], 3)
         self.assertNotIn("must not enter", first_export.decode())
         self.assertNotIn("sk-ant", first_export.decode())
         self.assertIn("attempt-PROJ-1-1", first_export.decode())
@@ -238,6 +249,149 @@ class LegacyStateMigrationTests(unittest.TestCase):
                     self.assertFalse(destination.exists())
                 self.assertEqual(
                     list(destination.parent.glob(f".{DATABASE_NAME}.*.tmp")), []
+                )
+
+    def test_cutover_activation_is_idempotent_and_blocks_legacy_writers(self) -> None:
+        import_legacy_state(self.repo)
+        first = activate_runtime_cutover(self.repo)
+        self.assertFalse(first["replayed"])
+        self.assertEqual(first["seeded_documents"], 2)
+        marker = runtime_cutover_marker(self.repo)
+        self.assertEqual(marker["activation_id"], first["activation_id"])
+        status = runtime_cutover_status(self.repo)
+        self.assertTrue(status["active"])
+        with self.assertRaisesRegex(RuntimeStateError, "legacy JSON runtime is read-only"):
+            assert_legacy_runtime_writable(self.repo)
+        older_plugin = self.base / "older-orka"
+        self.write_json(
+            older_plugin / ".claude-plugin/plugin.json", {"version": "1.8.23"}
+        )
+        self.write_json(
+            older_plugin / ".codex-plugin/plugin.json", {"version": "1.8.23"}
+        )
+        with self.assertRaisesRegex(
+            RuntimeStateError, "below transactional cutover minimum"
+        ):
+            assert_legacy_runtime_writable(self.repo, plugin_root=older_plugin)
+        controller = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts/sprint-controller.py"),
+                "summary",
+                "--sprint",
+                "65",
+            ],
+            cwd=self.repo,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(controller.returncode, 2, controller.stderr)
+        self.assertIn("legacy JSON runtime is read-only", controller.stderr)
+        handshake = self.base / "cutover-supervisor-handshake.json"
+        supervisor = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts/sprint-supervisor.py"),
+                "_run",
+                "--repo",
+                str(self.repo),
+                "--handshake",
+                str(handshake),
+            ],
+            cwd=self.repo,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        self.assertEqual(supervisor.returncode, 2)
+        self.assertIn(
+            "legacy JSON runtime is read-only",
+            json.loads(handshake.read_text(encoding="utf-8"))["error"],
+        )
+
+        second = activate_runtime_cutover(self.repo)
+        self.assertTrue(second["replayed"])
+        self.assertEqual(first["activation_id"], second["activation_id"])
+
+    def test_cutover_rollback_is_replay_safe_before_first_write(self) -> None:
+        for boundary in ("after_store_rollback", "after_marker_removal"):
+            with self.subTest(boundary=boundary):
+                repository = self.make_repository(self.base / f"rollback-{boundary}")
+                self.write_legacy_state(repository)
+                import_legacy_state(repository)
+                activate_runtime_cutover(repository)
+
+                def crash(current: str) -> None:
+                    if current == boundary:
+                        raise RuntimeError(f"crash:{boundary}")
+
+                with self.assertRaisesRegex(RuntimeError, f"crash:{boundary}"):
+                    rollback_runtime_cutover(
+                        repository,
+                        reason="pre-write validation failed",
+                        crash_hook=crash,
+                    )
+                replay = rollback_runtime_cutover(
+                    repository, reason="pre-write validation failed"
+                )
+                self.assertTrue(replay["replayed"])
+                self.assertIsNone(runtime_cutover_marker(repository))
+                self.assertFalse(runtime_cutover_status(repository)["active"])
+                assert_legacy_runtime_writable(repository)
+                with self.assertRaisesRegex(
+                    MigrationError, "rolled back by another receipt"
+                ):
+                    rollback_runtime_cutover(
+                        repository, reason="a different rollback receipt"
+                    )
+
+    def test_cutover_cannot_roll_back_after_authoritative_write(self) -> None:
+        import_legacy_state(self.repo)
+        activation = activate_runtime_cutover(self.repo)
+        identity = repository_identity(self.repo)
+        writer = "supervisor:test:fence"
+        with TransactionalEventStore(
+            self.database_path(), writer_identity=writer
+        ) as store:
+            snapshot = store.runtime_snapshot(
+                repository_id=identity["repository_uuid"]
+            )
+            controller = next(
+                item
+                for item in snapshot["documents"]
+                if item["document_type"] == "controller"
+            )
+            store.write_runtime_document(
+                repository_id=identity["repository_uuid"],
+                activation_id=activation["activation_id"],
+                document_type="controller",
+                document_id=controller["document_id"],
+                expected_generation=controller["generation"],
+                payload=controller["payload"],
+                supervisor_fence="lease:1",
+                idempotency_key="controller:first-authoritative-write",
+                writer_identity=writer,
+            )
+        with self.assertRaisesRegex(MigrationError, "first authoritative write"):
+            rollback_runtime_cutover(self.repo, reason="too late")
+
+    def test_cutover_activation_crash_boundaries_replay(self) -> None:
+        for boundary in ("after_marker_install", "after_store_activation"):
+            with self.subTest(boundary=boundary):
+                repository = self.make_repository(self.base / f"cutover-{boundary}")
+                self.write_legacy_state(repository)
+                import_legacy_state(repository)
+
+                def crash(current: str) -> None:
+                    if current == boundary:
+                        raise RuntimeError(f"crash:{boundary}")
+
+                with self.assertRaisesRegex(RuntimeError, f"crash:{boundary}"):
+                    activate_runtime_cutover(repository, crash_hook=crash)
+                resumed = activate_runtime_cutover(repository)
+                self.assertTrue(runtime_cutover_status(repository)["active"])
+                self.assertEqual(
+                    resumed["replayed"], boundary == "after_store_activation"
                 )
 
     def test_ambiguous_parent_state_requires_exact_identity_proof(self) -> None:

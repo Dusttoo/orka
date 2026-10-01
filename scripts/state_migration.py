@@ -14,6 +14,7 @@ import sqlite3
 import stat
 import sys
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
@@ -24,13 +25,16 @@ from event_store import (
     canonical_json,
 )
 from runtime_state import (
+    CUTOVER_FILE,
     RuntimeStateError,
     legacy_state_inventory,
     repository_identity,
     repository_initialization_authority,
     repository_layout,
     resolve_canonical_policy,
+    runtime_cutover_marker,
 )
+from version_policy import manifest_version, release_version
 
 
 DATABASE_NAME = "orka-state.sqlite3"
@@ -366,6 +370,12 @@ def export_state(database_path: Path) -> dict[str, Any]:
             "migration_receipts": _rows(database, "migration_receipts", "receipt_id"),
             "migration_sources": _rows(database, "migration_sources", "receipt_id, source_path"),
             "legacy_records": _rows(database, "legacy_records", "repository_id, category, record_key"),
+            "runtime_cutovers": _rows(database, "runtime_cutovers", "repository_id"),
+            "runtime_documents": _rows(
+                database,
+                "runtime_documents",
+                "repository_id, document_type, document_id",
+            ),
         }
     except (sqlite3.Error, TypeError, IndexError) as exc:
         raise MigrationError(f"event store export failed: {exc}") from exc
@@ -380,6 +390,8 @@ def export_state(database_path: Path) -> dict[str, Any]:
     for record in sections["legacy_records"]:
         record["payload_json"] = _sanitize(json.loads(record["payload_json"]))
         records_by_path[record["source_path"]] = record["payload_json"]
+    for document in sections["runtime_documents"]:
+        document["payload_json"] = _sanitize(json.loads(document["payload_json"]))
     sources = []
     for source in sections["migration_sources"]:
         record = next(
@@ -487,6 +499,233 @@ def import_legacy_state(
         return {**asdict(result), "database_path": str(destination)}
 
 
+def _cutover_seed_documents(exported: Mapping[str, Any]) -> list[dict[str, Any]]:
+    documents: dict[tuple[str, str], dict[str, Any]] = {}
+    sources = (exported.get("legacy_snapshot") or {}).get("sources") or []
+    for source in sources:
+        payload = source.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        identity: tuple[str, str] | None = None
+        if (
+            source.get("category") == "controller"
+            and isinstance(payload.get("sprint"), dict)
+            and isinstance(payload.get("tickets"), dict)
+            and str(payload["sprint"].get("id") or "").strip()
+        ):
+            identity = ("controller", str(payload["sprint"]["id"]).strip())
+        elif (
+            source.get("category") == "supervisor"
+            and str(source.get("source_path") or "").endswith("/.supervisor/state.json")
+            and str(payload.get("lifecycle_state") or "").strip()
+        ):
+            identity = ("supervisor", "primary")
+        if identity is None:
+            continue
+        candidate = {
+            "document_type": identity[0],
+            "document_id": identity[1],
+            "payload": payload,
+            "payload_digest": digest_json(payload),
+        }
+        existing = documents.get(identity)
+        if existing is not None and existing["payload_digest"] != candidate["payload_digest"]:
+            raise MigrationError(
+                "legacy state contains conflicting authoritative runtime documents: "
+                f"{identity[0]}:{identity[1]}"
+            )
+        documents[identity] = candidate
+    if not documents:
+        raise MigrationError(
+            "legacy import contains no controller or supervisor checkpoint to seed"
+        )
+    return [documents[key] for key in sorted(documents)]
+
+
+def _write_cutover_marker(path: Path, marker: Mapping[str, Any]) -> None:
+    encoded = (canonical_json(marker) + "\n").encode("utf-8")
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        view = memoryview(encoded)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise MigrationError("short write while persisting cutover marker")
+            view = view[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def activate_runtime_cutover(
+    repository: Path,
+    *,
+    crash_hook: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    """Activate the explicit no-dual-writer boundary after a shadow import."""
+
+    hook = crash_hook or (lambda _boundary: None)
+    layout = repository_layout(repository)
+    database = layout.state_root / DATABASE_NAME
+    marker_path = layout.state_root / CUTOVER_FILE
+    with exclusive_migration_authority(repository):
+        if not database.is_file() or database.is_symlink():
+            raise MigrationError("transactional event store must be imported before cutover")
+        inventory = inventory_legacy_state(repository)
+        writer = f"cutover:{inventory['receipt_id']}"
+        # Opening with the offline writer applies only reviewed schema migrations.
+        with TransactionalEventStore(database, writer_identity=writer):
+            pass
+        exported = export_state(database)
+        if exported["digests"]["legacy_snapshot"] != inventory["normalized_export_digest"]:
+            raise MigrationError("cutover shadow export no longer matches legacy state")
+        current_version = manifest_version(Path(__file__).resolve().parent.parent)
+        release_version(current_version)
+        existing_marker = runtime_cutover_marker(repository)
+        if existing_marker is None:
+            material = {
+                "activated_at": datetime.now(timezone.utc).isoformat(),
+                "legacy_snapshot_digest": inventory["normalized_export_digest"],
+                "minimum_orka_version": current_version,
+                "repository_id": inventory["repository_id"],
+                "schema_version": 1,
+            }
+            marker = {
+                **material,
+                "activation_id": f"cutover-{digest_json(material)}",
+            }
+            _write_cutover_marker(marker_path, marker)
+        else:
+            marker = existing_marker
+            if (
+                marker["legacy_snapshot_digest"]
+                != inventory["normalized_export_digest"]
+                or marker["minimum_orka_version"] != current_version
+            ):
+                raise MigrationError("existing cutover marker conflicts with current state")
+        hook("after_marker_install")
+        marker_digest = digest_json(marker)
+        writer = f"cutover:{marker['activation_id']}"
+        with TransactionalEventStore(database, writer_identity=writer) as store:
+            try:
+                result = store.activate_runtime_cutover(
+                    repository_id=inventory["repository_id"],
+                    activation_id=marker["activation_id"],
+                    marker_digest=marker_digest,
+                    minimum_version=current_version,
+                    legacy_snapshot_digest=inventory["normalized_export_digest"],
+                    seed_documents=_cutover_seed_documents(exported),
+                    idempotency_key=f"activate:{marker['activation_id']}",
+                    writer_identity=writer,
+                    occurred_at=marker["activated_at"],
+                )
+            except EventStoreError as exc:
+                raise MigrationError(str(exc)) from exc
+        hook("after_store_activation")
+        return {
+            **asdict(result),
+            "database_path": str(database),
+            "marker_path": str(marker_path),
+            "marker_digest": marker_digest,
+            "minimum_orka_version": current_version,
+        }
+
+
+def rollback_runtime_cutover(
+    repository: Path,
+    *,
+    reason: str,
+    crash_hook: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    """Rollback activation only before the first authoritative runtime write."""
+
+    hook = crash_hook or (lambda _boundary: None)
+    layout = repository_layout(repository)
+    database = layout.state_root / DATABASE_NAME
+    marker_path = layout.state_root / CUTOVER_FILE
+    with exclusive_migration_authority(repository):
+        marker = runtime_cutover_marker(repository)
+        if marker is None:
+            if database.is_file():
+                writer = "cutover-rollback:status-replay"
+                with TransactionalEventStore(database, writer_identity=writer) as store:
+                    snapshot = store.runtime_snapshot(
+                        repository_id=repository_identity(repository)[
+                            "repository_uuid"
+                        ]
+                    )
+                    cutover = snapshot.get("cutover") or {}
+                    if cutover.get("state") == "rolled_back":
+                        try:
+                            result = store.rollback_runtime_cutover(
+                                repository_id=cutover["repository_id"],
+                                activation_id=cutover["activation_id"],
+                                marker_digest=cutover["marker_digest"],
+                                reason=reason,
+                                idempotency_key=(
+                                    f"rollback:{cutover['activation_id']}:"
+                                    f"{digest_json(reason)}"
+                                ),
+                                writer_identity=writer,
+                            )
+                        except EventStoreError as exc:
+                            raise MigrationError(str(exc)) from exc
+                        return {**asdict(result), "marker_path": str(marker_path)}
+            raise MigrationError("runtime cutover marker is not active")
+        marker_digest = digest_json(marker)
+        writer = f"cutover-rollback:{marker['activation_id']}"
+        with TransactionalEventStore(database, writer_identity=writer) as store:
+            try:
+                result = store.rollback_runtime_cutover(
+                    repository_id=marker["repository_id"],
+                    activation_id=marker["activation_id"],
+                    marker_digest=marker_digest,
+                    reason=reason,
+                    idempotency_key=f"rollback:{marker['activation_id']}:{digest_json(reason)}",
+                    writer_identity=writer,
+                )
+            except EventStoreError as exc:
+                raise MigrationError(str(exc)) from exc
+        hook("after_store_rollback")
+        marker_path.unlink(missing_ok=True)
+        directory = os.open(layout.state_root, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+        hook("after_marker_removal")
+        return {**asdict(result), "marker_path": str(marker_path)}
+
+
+def runtime_cutover_status(repository: Path) -> dict[str, Any]:
+    layout = repository_layout(repository)
+    marker = runtime_cutover_marker(repository)
+    database = layout.state_root / DATABASE_NAME
+    if not database.is_file():
+        return {"active": False, "marker": marker, "store_cutover": None}
+    exported = export_state(database)
+    cutovers = exported["sections"].get("runtime_cutovers") or []
+    return {
+        "active": bool(marker and cutovers and cutovers[0].get("state") == "active"),
+        "marker": marker,
+        "store_cutover": cutovers[0] if cutovers else None,
+    }
+
+
 def _repository(raw: str) -> Path:
     return Path(raw).expanduser().resolve()
 
@@ -501,6 +740,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     export_parser = subparsers.add_parser("export")
     export_parser.add_argument("--repo", required=True)
     export_parser.add_argument("--output")
+    activate_parser = subparsers.add_parser("activate")
+    activate_parser.add_argument("--repo", required=True)
+    rollback_parser = subparsers.add_parser("rollback")
+    rollback_parser.add_argument("--repo", required=True)
+    rollback_parser.add_argument("--reason", required=True)
+    status_parser = subparsers.add_parser("status")
+    status_parser.add_argument("--repo", required=True)
     args = parser.parse_args(argv)
     try:
         repository = _repository(args.repo)
@@ -512,7 +758,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(canonical_json(value))
         elif args.command == "import":
             print(canonical_json(import_legacy_state(repository)))
-        else:
+        elif args.command == "export":
             database = repository_layout(repository).state_root / DATABASE_NAME
             encoded = export_bytes(database)
             if args.output:
@@ -520,6 +766,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 output.write_bytes(encoded)
             else:
                 sys.stdout.buffer.write(encoded)
+        elif args.command == "activate":
+            print(canonical_json(activate_runtime_cutover(repository)))
+        elif args.command == "rollback":
+            print(
+                canonical_json(
+                    rollback_runtime_cutover(repository, reason=args.reason)
+                )
+            )
+        else:
+            print(canonical_json(runtime_cutover_status(repository)))
     except (EventStoreError, MigrationError, RuntimeStateError, sqlite3.Error) as exc:
         parser.error(str(exc))
     return 0
