@@ -44,6 +44,11 @@ are published. Orka 2.0 is still in development; the
 [durable runtime roadmap](docs/orka-2-durable-runtime.md) distinguishes shipped
 slices from the remaining cutover work.
 
+The [one-year product vision](docs/product-vision-2027.md) describes the
+founder-first future state: a durable supervisor, stable CLI and browser
+surfaces, provider-independent workers, and capacity-aware local or ephemeral
+execution without making adoption or a hosted service the goal.
+
 ## What Orka adds
 
 Orka 1.0 is designed to keep a long-running sprint moving without choosing
