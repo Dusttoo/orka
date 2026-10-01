@@ -286,7 +286,7 @@ class LegacyStateMigrationTests(unittest.TestCase):
             text=True,
         )
         self.assertEqual(controller.returncode, 2, controller.stderr)
-        self.assertIn("legacy JSON runtime is read-only", controller.stderr)
+        self.assertIn("active supervisor has no valid lease fence", controller.stderr)
         handshake = self.base / "cutover-supervisor-handshake.json"
         supervisor = subprocess.run(
             [
@@ -305,7 +305,7 @@ class LegacyStateMigrationTests(unittest.TestCase):
         )
         self.assertEqual(supervisor.returncode, 2)
         self.assertIn(
-            "legacy JSON runtime is read-only",
+            "unsupported supervisor state schema",
             json.loads(handshake.read_text(encoding="utf-8"))["error"],
         )
 

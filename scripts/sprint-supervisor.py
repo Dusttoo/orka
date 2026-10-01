@@ -30,8 +30,9 @@ from typing import Any
 
 from runtime_state import (
     RuntimeStateError,
-    assert_legacy_runtime_writable,
+    assert_cutover_runtime_compatible,
     canonical_config_path,
+    runtime_cutover_marker,
     shared_repository_root,
     shared_runtime_path,
     working_repository_root,
@@ -41,8 +42,13 @@ from breaker_runtime import BreakerRuntime
 from supervisor_planning import (
     ControllerAdapter,
     PlanningError,
+    TransactionalControllerAdapter,
     canonical_digest,
     planning_cycle,
+)
+from controller_runtime import (
+    ControllerRuntimeError,
+    execute_request as execute_controller_request,
 )
 from supervisor_dispatch import DispatchError, StaleResultError, SupervisorDispatcher
 from supervisor_admission import AdmissionError, validate_persisted_jobs
@@ -65,7 +71,7 @@ BREAKER_CONTRACT_PATH = PLUGIN_ROOT / "contracts/breaker-classification-v1.json"
 RUNTIME_RELATIVE = Path(".orchestration/.supervisor")
 REQUEST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
 MAX_REASON = 2000
-MAX_REQUEST = 16 * 1024
+MAX_REQUEST = 1024 * 1024
 SUPERVISOR_STATES = {
     "starting",
     "active",
@@ -665,10 +671,22 @@ def verify_state_digest(state_path: Path, digest_path: Path, *, required: bool) 
     return observed
 
 
-def validate_request(value: Any) -> dict[str, str]:
+def validate_request(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise SupervisorError("control request must be an object")
     command = value.get("command")
+    if command == "controller":
+        required = {
+            "activation_id",
+            "argv",
+            "command_id",
+            "expected_controller_generations",
+            "repository_id",
+            "supervisor_fence",
+        }
+        if required - value.keys():
+            raise SupervisorError("controller request is missing authenticated bindings")
+        return dict(value)
     if command not in {"pause", "resume", "drain", "stop", "status"}:
         raise SupervisorError("unsupported supervisor command")
     request_id = value.get("request_id")
@@ -1035,7 +1053,7 @@ def write_handshake(path: Path, value: dict[str, Any]) -> None:
 def run_daemon(repository: Path, handshake: Path) -> int:
     paths = runtime_paths(repository)
     try:
-        assert_legacy_runtime_writable(repository)
+        assert_cutover_runtime_compatible(repository)
         ensure_private_directory(paths["directory"])
         contract_value, lifecycle, contract_digest = contract()
         del contract_value
@@ -1464,7 +1482,21 @@ def run_daemon(repository: Path, handshake: Path) -> int:
             if planning_due:
                 try:
                     snapshot = planning_cycle(
-                        ControllerAdapter(repository, paths["directory"]),
+                        (
+                            TransactionalControllerAdapter(
+                                repository,
+                                paths["directory"],
+                                supervisor_fence=(
+                                    f"{state['lease']['id']}:{state['lease']['generation']}"
+                                ),
+                                writer_identity=(
+                                    f"supervisor:{state['lease']['id']}:"
+                                    f"{state['lease']['generation']}"
+                                ),
+                            )
+                            if runtime_cutover_marker(repository) is not None
+                            else ControllerAdapter(repository, paths["directory"])
+                        ),
                         repository,
                         planning,
                         current_time=current_time,
@@ -1841,6 +1873,22 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                 connection.setblocking(True)
                 try:
                     request = read_request(connection)
+                    if request["command"] == "controller":
+                        fence = f"{state['lease']['id']}:{state['lease']['generation']}"
+                        response = execute_controller_request(
+                            repository,
+                            request,
+                            supervisor_fence=fence,
+                            writer_identity=(
+                                f"supervisor:{state['lease']['id']}:"
+                                f"{state['lease']['generation']}"
+                            ),
+                            private_root=paths["directory"] / "controller-materializations",
+                            controller_path=Path(__file__).with_name("sprint-controller.py"),
+                        )
+                        request_stop = False
+                        send_response(connection, response)
+                        continue
                     response, request_stop = apply_control(state, lifecycle, request)
                     if request["command"] == "resume" and state.get("planning", {}).get(
                         "enabled"
@@ -1850,7 +1898,7 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                     persist_state()
                     send_response(connection, response)
                     should_stop = should_stop or request_stop
-                except SupervisorError as exc:
+                except (ControllerRuntimeError, SupervisorError) as exc:
                     send_response(connection, {"status": "error", "error": str(exc)})
         return 0
     except Exception as exc:  # fail closed and leave a diagnostic handshake

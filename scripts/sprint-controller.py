@@ -83,8 +83,15 @@ from runtime_state import (
     assert_legacy_runtime_writable,
     canonical_config_path,
     migrate_legacy_runtime_dir,
+    runtime_cutover_marker,
     shared_repository_root,
     working_repository_root,
+)
+from controller_runtime import (
+    ControllerRuntimeError,
+    INTERNAL_CAPABILITY_ENV,
+    direct_request as route_cutover_request,
+    validate_internal_capability,
 )
 
 
@@ -6669,11 +6676,28 @@ def parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = parser().parse_args()
     try:
-        assert_legacy_runtime_writable(project_root())
+        repository = project_root()
+        if runtime_cutover_marker(repository) is not None:
+            if os.environ.get(INTERNAL_CAPABILITY_ENV):
+                if not args.state_dir:
+                    raise ControllerRuntimeError(
+                        "supervisor controller execution requires a private state directory"
+                    )
+                validate_internal_capability(Path(args.state_dir))
+            else:
+                return route_cutover_request(repository, sys.argv[1:])
+        else:
+            assert_legacy_runtime_writable(repository)
         cfg = settings(args)
         args.func(args, cfg)
         return 0
-    except (SprintError, AgentError, HealthError, RuntimeStateError) as exc:
+    except (
+        SprintError,
+        AgentError,
+        HealthError,
+        RuntimeStateError,
+        ControllerRuntimeError,
+    ) as exc:
         print(f"sprint-controller: {exc}", file=sys.stderr)
         return 2
 
