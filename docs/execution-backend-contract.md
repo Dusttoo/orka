@@ -47,7 +47,9 @@ Claude, API, PID, shell, container, or remote-process behavior.
    fresh `orka.phase-worker-protocol/v1` job envelope. Conversation or provider
    session resumption fields are forbidden. The canonical phase-worker
    validator—not a backend-specific subset—validates required identity,
-   capabilities, and sanitized input before the backend runs.
+   capabilities, and sanitized input before the backend runs. It recursively
+   rejects exact forbidden session-state keys in nested objects and arrays;
+   ordinary string values may still discuss those field names.
 4. **Attach.** The backend returns a handle, backend-instance identity, process
    birth identity, and launch receipt mechanically bound to the exact
    execution and job-envelope digest. A missing or mismatched receipt is an

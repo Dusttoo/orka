@@ -146,6 +146,37 @@ class ExecutionBackendContractTests(unittest.TestCase):
                     coordinator.launch(self.binding, envelope)
                 self.assertEqual(backend.launch_count, 0)
 
+    def test_launch_rejects_nested_session_state_before_backend_dispatch(self) -> None:
+        invalid_inputs = (
+            {"metadata": {"conversation_id": "conversation-1"}},
+            {"metadata": [{"previous_conversation_id": "conversation-0"}]},
+            {"steps": [{"provider": {"provider_session_id": "session-1"}}]},
+            {"steps": ["ordinary", {"resume_session": "session-0"}]},
+        )
+        for sanitized_input in invalid_inputs:
+            with self.subTest(sanitized_input=sanitized_input):
+                coordinator, backend = self.coordinator()
+                envelope = {**self.envelope, "sanitized_input": sanitized_input}
+                with self.assertRaisesRegex(BackendContractError, "forbidden field"):
+                    coordinator.launch(self.binding, envelope)
+                self.assertEqual(backend.launch_count, 0)
+
+    def test_session_field_names_inside_string_values_are_allowed(self) -> None:
+        coordinator, backend = self.coordinator()
+        envelope = {
+            **self.envelope,
+            "sanitized_input": {
+                "objective": (
+                    "Document conversation_id, previous_conversation_id, "
+                    "provider_session_id, and resume_session without resuming state"
+                )
+            },
+        }
+
+        coordinator.launch(self.binding, envelope)
+
+        self.assertEqual(backend.launch_count, 1)
+
     def test_launch_receipt_is_mechanically_bound_to_envelope_and_process(self) -> None:
         for mode in ("missing", "mismatched", "envelope-mismatch"):
             with self.subTest(mode=mode):

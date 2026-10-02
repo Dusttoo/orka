@@ -70,6 +70,39 @@ def string_list(value: Any, label: str, *, nonempty: bool = True) -> list[str]:
     return value
 
 
+def reject_forbidden_fields(
+    value: Any,
+    forbidden_fields: list[str],
+    *,
+    label: str,
+    path: str = "$",
+) -> None:
+    """Reject exact forbidden keys recursively without inspecting string values."""
+
+    forbidden = set(forbidden_fields)
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            child_path = f"{path}.{key}"
+            if key in forbidden:
+                raise ContractError(
+                    f"{label} contains forbidden field {key} at {child_path}"
+                )
+            reject_forbidden_fields(
+                nested,
+                forbidden_fields,
+                label=label,
+                path=child_path,
+            )
+    elif isinstance(value, list):
+        for index, nested in enumerate(value):
+            reject_forbidden_fields(
+                nested,
+                forbidden_fields,
+                label=label,
+                path=f"{path}[{index}]",
+            )
+
+
 def validate_contract(contract: dict[str, Any]) -> dict[str, Any]:
     if contract.get("schema_version") != 1:
         raise ContractError("schema_version must be 1")
@@ -273,9 +306,16 @@ def validate_envelope(
     for field, expected in schema["constants"].items():
         if envelope[field] != expected:
             raise ContractError(f"{kind}.{field} must equal {expected!r}")
-    for field in schema["forbidden_fields"]:
-        if field in envelope:
-            raise ContractError(f"{kind} contains forbidden field {field}")
+    if kind == "job":
+        reject_forbidden_fields(
+            envelope,
+            schema["forbidden_fields"],
+            label=kind,
+        )
+    else:
+        for field in schema["forbidden_fields"]:
+            if field in envelope:
+                raise ContractError(f"{kind} contains forbidden field {field}")
     if expected_identity is not None:
         for field in schema["identity_fields"]:
             if envelope[field] != expected_identity[field]:
