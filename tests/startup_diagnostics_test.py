@@ -414,6 +414,58 @@ class StartupDiagnosticTests(unittest.TestCase):
                 expected_database_identity=(identity.device, identity.inode),
             )
 
+    def test_writer_owned_revalidation_rejects_same_inode_authority_tampering(
+        self,
+    ) -> None:
+        cases = [
+            (
+                "policy-row",
+                "UPDATE repositories SET policy_digest = 'tampered'",
+            ),
+            (
+                "cutover-row",
+                "UPDATE runtime_cutovers SET marker_digest = 'tampered'",
+            ),
+            (
+                "schema",
+                "DROP INDEX events_aggregate_version",
+            ),
+            (
+                "migration-ledger",
+                "UPDATE schema_migrations SET source_digest = 'tampered' WHERE version = 2",
+            ),
+        ]
+        for name, sql in cases:
+            with self.subTest(name=name):
+                repository = self.repository(f"writer-revalidation-{name}")
+                admission = prepare_startup_admission(repository, plugin_root=ROOT)
+                self.assertTrue(admission.receipt["healthy"])
+                identity = admission.database_identity
+                assert identity is not None
+                database_path = self.database(repository)
+                inode = database_path.stat().st_ino
+                self.update_database(repository, sql)
+                self.assertEqual(database_path.stat().st_ino, inode)
+
+                def dump() -> str:
+                    connection = sqlite3.connect(
+                        f"file:{database_path}?mode=ro", uri=True
+                    )
+                    try:
+                        return "\n".join(connection.iterdump())
+                    finally:
+                        connection.close()
+
+                before = dump()
+                with self.assertRaisesRegex(EventStoreError, "authority changed"):
+                    TransactionalEventStore(
+                        database_path,
+                        writer_identity="supervisor:test",
+                        expected_database_identity=(identity.device, identity.inode),
+                        startup_validator=admission.validate_writer_connection,
+                    )
+                self.assertEqual(dump(), before)
+
     def test_checked_policy_blob_survives_policy_ref_advance(self) -> None:
         repository = self.repository("policy-race")
         admission = prepare_startup_admission(repository, plugin_root=ROOT)

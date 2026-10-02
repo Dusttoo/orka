@@ -1209,6 +1209,7 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                     startup_admission.database_identity.device,
                     startup_admission.database_identity.inode,
                 ),
+                startup_validator=startup_admission.validate_writer_connection,
             )
             authoritative_state = AuthoritativeSupervisorState(
                 repository,

@@ -10,6 +10,7 @@ startup uses bounded ``quick_check(1)`` instead.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import sqlite3
 import stat
@@ -85,6 +86,17 @@ class StartupAdmission:
     policy: PolicySnapshot | None = None
     database_path: Path | None = None
     database_identity: DatabaseIdentity | None = None
+    repository: Path | None = None
+    plugin_root: Path | None = None
+    identity_document: str = ""
+    cutover_document: str = ""
+
+    def validate_writer_connection(
+        self, database: sqlite3.Connection, database_path: Path
+    ) -> None:
+        """Revalidate retained authority on the writer-owned connection."""
+
+        _validate_writer_admission(self, database, database_path)
 
 
 def _digest(value: Any) -> str:
@@ -157,6 +169,119 @@ def _active_cutover_in_existing_store(path: Path) -> bool | None:
         return None
     finally:
         database.close()
+
+
+def _validate_writer_admission(
+    admission: StartupAdmission,
+    database: sqlite3.Connection,
+    database_path: Path,
+) -> None:
+    """Fail when checked authority changed before writer admission.
+
+    The caller owns the event-store writer lock and supplies the exact opened
+    SQLite connection. This function is query-only and rolls back its snapshot.
+    """
+
+    if (
+        not admission.receipt.get("healthy")
+        or admission.receipt.get("mode") != "transactional"
+        or admission.repository is None
+        or admission.plugin_root is None
+        or admission.policy is None
+        or admission.database_path is None
+        or admission.database_identity is None
+        or not admission.identity_document
+        or not admission.cutover_document
+        or database_path != admission.database_path
+    ):
+        raise RuntimeStateError("startup admission authority is incomplete")
+    identity = json.loads(admission.identity_document)
+    marker = json.loads(admission.cutover_document)
+    layout = repository_layout(admission.repository)
+    if _permission_check(layout, database_path)["status"] != "pass":
+        raise RuntimeStateError("runtime permissions changed after startup diagnostics")
+    if canonical_json(repository_identity(admission.repository)) != admission.identity_document:
+        raise RuntimeStateError("repository identity changed after startup diagnostics")
+    current_marker = runtime_cutover_marker(admission.repository)
+    if current_marker is None or canonical_json(current_marker) != admission.cutover_document:
+        raise RuntimeStateError("cutover marker changed after startup diagnostics")
+    if hashlib.sha256(admission.policy.content).hexdigest() != admission.policy.digest:
+        raise RuntimeStateError("retained canonical policy content is invalid")
+    try:
+        active_version = manifest_version(admission.plugin_root)
+        minimum_version = str(marker["minimum_orka_version"])
+        if release_version(active_version) < release_version(minimum_version):
+            raise RuntimeStateError("minimum Orka version changed after startup diagnostics")
+    except (KeyError, OSError, TypeError, ValueError) as exc:
+        raise RuntimeStateError("minimum Orka version is invalid") from exc
+
+    database.execute("BEGIN")
+    try:
+        if [str(row[0]) for row in database.execute("PRAGMA quick_check(1)")] != [
+            "ok"
+        ]:
+            raise RuntimeStateError("SQLite quick check changed after startup diagnostics")
+        if list(database.execute("PRAGMA foreign_key_check")):
+            raise RuntimeStateError("foreign keys changed after startup diagnostics")
+        if _schema_digest(database) != _expected_schema_digest():
+            raise RuntimeStateError("schema changed after startup diagnostics")
+        migrations = [
+            [int(row[0]), str(row[1]), str(row[2])]
+            for row in database.execute(
+                "SELECT version, migration_id, source_digest FROM schema_migrations ORDER BY version"
+            )
+        ]
+        metadata = database.execute(
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        ).fetchone()
+        if migrations != _expected_migrations() or metadata != (str(SCHEMA_VERSION),):
+            raise RuntimeStateError("migration ledger changed after startup diagnostics")
+        repositories = database.execute(
+            """
+            SELECT repository_id, common_directory, object_directory_id,
+                   policy_ref, policy_path, policy_commit, policy_blob,
+                   policy_digest, created_at
+            FROM repositories
+            """
+        ).fetchall()
+        expected_repository = [
+            identity["repository_uuid"],
+            identity["common_directory"],
+            identity["object_directory_identity"],
+            identity["policy_ref"],
+            identity["policy_path"],
+            admission.policy.commit,
+            admission.policy.blob,
+            admission.policy.digest,
+            identity["created_at"],
+        ]
+        if len(repositories) != 1 or list(map(str, repositories[0])) != list(
+            map(str, expected_repository)
+        ):
+            raise RuntimeStateError("repository authority changed after startup diagnostics")
+        cutovers = database.execute(
+            """
+            SELECT repository_id, activation_id, marker_digest,
+                   minimum_version, legacy_snapshot_digest, state
+            FROM runtime_cutovers
+            """
+        ).fetchall()
+        expected_cutover = [
+            identity["repository_uuid"],
+            marker["activation_id"],
+            _digest(marker),
+            marker["minimum_orka_version"],
+            marker["legacy_snapshot_digest"],
+            "active",
+        ]
+        if len(cutovers) != 1 or list(map(str, cutovers[0])) != list(
+            map(str, expected_cutover)
+        ):
+            raise RuntimeStateError("cutover authority changed after startup diagnostics")
+    except (KeyError, sqlite3.Error) as exc:
+        raise RuntimeStateError("startup authority cannot be revalidated") from exc
+    finally:
+        database.rollback()
 
 
 def _expected_schema_digest() -> str:
@@ -595,6 +720,14 @@ def prepare_startup_admission(
         policy=policy,
         database_path=database_path if receipt["healthy"] else None,
         database_identity=checked_database_identity if receipt["healthy"] else None,
+        repository=repository if receipt["healthy"] else None,
+        plugin_root=root if receipt["healthy"] else None,
+        identity_document=(
+            canonical_json(identity) if receipt["healthy"] and identity is not None else ""
+        ),
+        cutover_document=(
+            canonical_json(marker) if receipt["healthy"] and marker is not None else ""
+        ),
     )
 
 

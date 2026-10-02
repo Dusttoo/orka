@@ -19,7 +19,7 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 
 SCHEMA_VERSION = 3
@@ -162,6 +162,7 @@ class TransactionalEventStore:
         busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
         schema_path: Path = SCHEMA_PATH,
         expected_database_identity: tuple[int, int] | None = None,
+        startup_validator: Callable[[sqlite3.Connection, Path], None] | None = None,
     ) -> None:
         if not writer_identity.strip():
             raise WriterAuthorityError("writer identity must be non-empty")
@@ -184,6 +185,13 @@ class TransactionalEventStore:
                 check_same_thread=False,
             )
             self._verify_expected_database_identity()
+            if startup_validator is not None:
+                try:
+                    startup_validator(self._database, self.database_path)
+                except Exception as exc:
+                    raise EventStoreError(
+                        "event-store startup authority changed after diagnostics"
+                    ) from exc
             os.chmod(self.database_path, 0o600)
             self._database.execute("PRAGMA foreign_keys = ON")
             self._database.execute("PRAGMA synchronous = FULL")

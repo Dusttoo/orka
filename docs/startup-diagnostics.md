@@ -28,10 +28,13 @@ diagnostic; it is intentionally not part of bounded startup.
 
 The supervisor retains the checked database device/inode identity and immutable
 policy commit, blob, digest, and content outside the sanitized receipt. Under
-its exclusive lease it opens the writer only when the database identity still
-matches, and materializes the retained policy blob without resolving the moving
-policy ref again. Deleting or corrupting `cutover.json` cannot downgrade an
-event store whose `runtime_cutovers` ledger already records active cutover.
+its exclusive lease and event-store writer lock, it opens the writer only when
+the database identity still matches and revalidates the complete startup
+authority on that same SQLite connection before permissions, journal mode,
+migrations, planning, or admission can change state. It then materializes the
+retained policy blob without resolving the moving policy ref again. Deleting or
+corrupting `cutover.json` cannot downgrade an event store whose
+`runtime_cutovers` ledger already records active cutover.
 
 Legacy repositories retain their 1.x behavior. Their event-store-only checks
 are reported as `legacy_not_applicable`, while the compatible repository policy
