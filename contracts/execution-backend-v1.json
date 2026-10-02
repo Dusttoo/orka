@@ -74,6 +74,7 @@
     "timeout_status": "unknown",
     "permission_denied_status": "unknown",
     "replacement_safe_statuses": ["absent", "terminal"],
+    "terminal_requires_canonical_phase_envelope": true,
     "absence_requires": [
       "backend_instance_id",
       "backend_handle",
@@ -84,10 +85,36 @@
     "process_identity_reuse": "original_absent_with_receipt"
   },
   "cancellation": {
-    "safe_results": ["acknowledged", "fenced"],
+    "safe_results": ["acknowledged"],
     "unsafe_results": ["requested", "timeout", "unknown"],
-    "acknowledgement_requires": ["cancellation_id", "cancellation_receipt"],
+    "acknowledgement_requires": [
+      "canonical_cancellation_ack",
+      "exact_launch_identity",
+      "exact_request_identity",
+      "backend_mechanical_verification"
+    ],
+    "backend_may_assert_fence": false,
     "unacknowledged_requires_supervisor_fence": true
+  },
+  "launch_receipt": {
+    "required_bindings": [
+      "binding",
+      "backend_instance_id",
+      "backend_handle",
+      "process_identity",
+      "envelope_digest"
+    ],
+    "mechanical_digest_required": true
+  },
+  "execution_tombstones": {
+    "full_execution_key_reuse_allowed": false,
+    "persist_before_production_integration": true,
+    "retained_after_fence": true,
+    "retained_after_uncertain_launch": true
+  },
+  "test_backends": {
+    "explicit_conformance_mode_required": true,
+    "production_selection_allowed": false
   },
   "authority_boundary": {
     "allowed": [

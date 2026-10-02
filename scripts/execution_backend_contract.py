@@ -117,14 +117,61 @@ def validate_contract(contract: dict[str, Any]) -> dict[str, Any]:
         raise ContractError("PID-only inspection cannot prove absence")
     if inspection.get("process_identity_reuse") != "original_absent_with_receipt":
         raise ContractError("process identity reuse needs an explicit receipt")
+    if inspection.get("terminal_requires_canonical_phase_envelope") is not True:
+        raise ContractError("terminal inspection must require canonical terminal evidence")
 
     cancellation = contract.get("cancellation")
     if not isinstance(cancellation, dict):
         raise ContractError("cancellation policy is required")
-    if set(_unique_strings(cancellation.get("safe_results"), "cancellation.safe_results")) != {"acknowledged", "fenced"}:
-        raise ContractError("only acknowledged or fenced cancellation is safe")
+    if set(_unique_strings(cancellation.get("safe_results"), "cancellation.safe_results")) != {"acknowledged"}:
+        raise ContractError("only mechanically acknowledged cancellation is backend-safe")
+    if cancellation.get("backend_may_assert_fence") is not False:
+        raise ContractError("only the supervisor may assert an execution fence")
     if cancellation.get("unacknowledged_requires_supervisor_fence") is not True:
         raise ContractError("unacknowledged cancellation must require a fence")
+    acknowledgement = set(
+        _unique_strings(
+            cancellation.get("acknowledgement_requires"),
+            "cancellation.acknowledgement_requires",
+        )
+    )
+    if acknowledgement != {
+        "canonical_cancellation_ack",
+        "exact_launch_identity",
+        "exact_request_identity",
+        "backend_mechanical_verification",
+    }:
+        raise ContractError("cancellation acknowledgement trust rules are incomplete")
+
+    launch_receipt = contract.get("launch_receipt")
+    if not isinstance(launch_receipt, dict):
+        raise ContractError("launch receipt rules are required")
+    if set(
+        _unique_strings(
+            launch_receipt.get("required_bindings"),
+            "launch_receipt.required_bindings",
+        )
+    ) != {
+        "binding", "backend_instance_id", "backend_handle", "process_identity",
+        "envelope_digest",
+    } or launch_receipt.get("mechanical_digest_required") is not True:
+        raise ContractError("launch receipt must mechanically bind the execution")
+
+    tombstones = contract.get("execution_tombstones")
+    if tombstones != {
+        "full_execution_key_reuse_allowed": False,
+        "persist_before_production_integration": True,
+        "retained_after_fence": True,
+        "retained_after_uncertain_launch": True,
+    }:
+        raise ContractError("execution tombstones must permanently prevent key reuse")
+
+    test_backends = contract.get("test_backends")
+    if test_backends != {
+        "explicit_conformance_mode_required": True,
+        "production_selection_allowed": False,
+    }:
+        raise ContractError("test backends must be unavailable to production selection")
 
     authority = contract.get("authority_boundary")
     if not isinstance(authority, dict):

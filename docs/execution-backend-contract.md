@@ -45,9 +45,13 @@ Claude, API, PID, shell, container, or remote-process behavior.
    consuming a worker attempt.
 3. **Launch.** The supervisor supplies the complete immutable binding and a
    fresh `orka.phase-worker-protocol/v1` job envelope. Conversation or provider
-   session resumption fields are forbidden.
+   session resumption fields are forbidden. The canonical phase-worker
+   validator—not a backend-specific subset—validates required identity,
+   capabilities, and sanitized input before the backend runs.
 4. **Attach.** The backend returns a handle, backend-instance identity, process
-   birth identity, and launch receipt bound to the exact execution.
+   birth identity, and launch receipt mechanically bound to the exact
+   execution and job-envelope digest. A missing or mismatched receipt is an
+   uncertain launch and its execution identity cannot be reused.
 5. **Heartbeat and progress.** Observations retain the full binding. They prove
    neither completion nor authority to extend budgets or bypass gates.
 6. **Cancel.** Replacement is safe only after an authenticated acknowledgement
@@ -56,8 +60,11 @@ Claude, API, PID, shell, container, or remote-process behavior.
 7. **Inspect.** The backend reports `live`, `absent`, `terminal`, or `unknown`.
    Timeout and permission failure normalize to `unknown` and remain unsafe for
    replacement.
-8. **Terminal.** Terminal evidence keeps the immutable binding and is validated
-   through the phase-worker protocol before the supervisor applies it.
+8. **Terminal.** A terminal status is insufficient. The backend must return a
+   canonical phase-worker terminal envelope with the exact immutable identity,
+   and the supervisor validates it before applying any lifecycle transition.
+   An inspection that claims `terminal` without valid canonical evidence
+   normalizes to `unknown` and is not replacement-safe.
 
 All operations after discovery are execution-bound. A replaced dispatch or
 execution unit cannot report progress, cancellation, or terminal state for its
@@ -82,6 +89,13 @@ The logical job may survive replacement, but a replacement receives new
 `dispatch_id` and `execution_unit_id` values. Backends cannot synthesize a
 missing value or reuse a stale value. Host process reuse is allowed only when
 the backend starts a fresh phase context and retains no model-session state.
+
+Every full execution key is single-use. Launch consumes the key even if the
+transport fails after starting work or the launch receipt is malformed. A
+fence leaves a permanent tombstone; it never makes that key launchable again.
+The reference coordinator keeps tombstones in memory for conformance testing.
+Production integration must persist them in authoritative supervisor state so
+restart cannot erase the single-use guarantee.
 
 ## Capability negotiation
 
@@ -123,11 +137,17 @@ process and does not authorize the backend to launch another worker.
 There are two replacement-safe cancellation outcomes:
 
 - `acknowledged`: the exact execution returns a cancellation identifier and an
-  authenticated cancellation receipt;
-- `fenced`: the supervisor records a new fence that makes all later evidence
-  from the old execution stale.
+  authenticated cancellation receipt. The acknowledgement must be a canonical
+  phase-worker envelope bound to the exact cancellation request, launch
+  receipt, backend handle, process identity, and execution identity. The
+  backend adapter must mechanically verify it using its trusted host primitive
+  (for example, an exact process wait receipt or a verified remote signature);
+- **supervisor fence**: separately, the supervisor may record a new fence that
+  makes all later evidence from the old execution stale. A backend cannot
+  claim or return this outcome itself.
 
-`requested`, `timeout`, and `unknown` remain unsafe. The scheduler may wait,
+`requested`, `timeout`, `unknown`, and a backend-asserted `fenced` result remain
+unsafe. The scheduler may wait,
 inspect again, or fence according to its own policy, but the backend cannot
 convert uncertainty into acknowledgement.
 
@@ -147,14 +167,22 @@ of the backend contract.
 ## Conformance kit
 
 `DeterministicFakeBackend` implements every operation without model credentials,
-network access, sleeping, or real processes. The focused suite proves:
+network access, sleeping, or real processes. It advertises `test_only: true`
+and the coordinator rejects it unless the caller explicitly enables conformance
+mode, so repository or production configuration cannot select it. The focused
+suite proves:
 
 - mandatory capability rejection happens before launch;
 - each launch consumes a fresh #112 job envelope;
+- malformed canonical jobs and mechanically mismatched launch receipts fail;
 - stale or fenced executions cannot report progress or terminal evidence;
+- fenced and uncertain launches leave non-reusable execution tombstones;
 - inspection timeouts remain unknown;
+- terminal inspection requires exact canonical terminal evidence;
 - process identity reuse produces a bound absence receipt;
-- cancellation requires acknowledgement or a supervisor fence;
+- cancellation acknowledgement is bound to its exact request and launch and
+  passes a backend-specific mechanical verification hook;
+- only the supervisor may assert a fence;
 - containment and provider capabilities remain separate;
 - the backend exposes no scheduling or merge-authority operation.
 
@@ -164,7 +192,8 @@ Run it with:
 bash tests/execution-backend.test.sh
 ```
 
-The fake backend is a conformance reference, not a production execution host.
+The fake backend is a conformance reference, not a production execution host,
+and cannot be selected outside explicit conformance mode.
 Production backends must pass the same suite with backend-specific fixtures.
 
 ## Delivery boundary
@@ -174,6 +203,11 @@ runtime cutover. Integrating the local Codex, Claude, and API implementations
 behind this interface is the next implementation step. Until that integration
 lands, the existing 1.x launcher remains authoritative and the scheduler still
 contains compatibility code for current route processes.
+
+That production integration must persist launched-key tombstones, launch and
+cancellation receipts, and backend inspection evidence in the authoritative
+transactional supervisor store. The in-memory reference coordinator is not a
+restart-safe production state store.
 
 Container, microVM, Kubernetes, and remote-worker implementations remain
 explicit non-goals for this slice.

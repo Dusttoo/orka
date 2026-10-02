@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import sys
 import unittest
@@ -16,7 +17,11 @@ from execution_backend import (  # noqa: E402
     BackendCoordinator,
     DeterministicFakeBackend,
 )
-from execution_backend_contract import load_contract, validate_contract  # noqa: E402
+from execution_backend_contract import (  # noqa: E402
+    ContractError as BackendDefinitionError,
+    load_contract,
+    validate_contract,
+)
 
 
 class ExecutionBackendContractTests(unittest.TestCase):
@@ -38,13 +43,22 @@ class ExecutionBackendContractTests(unittest.TestCase):
             **self.binding,
             "ticket_id": "PROJ-1",
             "sanitized_input": {"objective": "Implement the accepted slice"},
-            "required_capabilities": ["structured-terminal-result"],
+            "required_capabilities": [
+                "attempt-fencing",
+                "cancellation-ack-or-fence",
+                "fresh-context-per-dispatch",
+                "immutable-job-identity",
+                "structured-progress",
+                "structured-terminal-result",
+            ],
             "fresh_context": True,
         }
 
     def coordinator(self, **backend_options: object) -> tuple[BackendCoordinator, DeterministicFakeBackend]:
         backend = DeterministicFakeBackend(**backend_options)
-        coordinator = BackendCoordinator(self.contract, backend)
+        coordinator = BackendCoordinator(
+            self.contract, backend, allow_test_backend=True
+        )
         coordinator.negotiate(
             required={
                 "containment": {"filesystem": "worktree"},
@@ -71,6 +85,19 @@ class ExecutionBackendContractTests(unittest.TestCase):
         self.assertEqual(fixture["contract_id"], summary["contract_id"])
         self.assertEqual(fixture["binding"], self.binding)
 
+    def test_contract_rejects_weakened_tombstone_fence_and_terminal_rules(self) -> None:
+        mutations = (
+            ("tombstone", lambda value: value["execution_tombstones"].update(full_execution_key_reuse_allowed=True)),
+            ("fence", lambda value: value["cancellation"].update(backend_may_assert_fence=True)),
+            ("terminal", lambda value: value["inspection"].update(terminal_requires_canonical_phase_envelope=False)),
+        )
+        for label, mutate in mutations:
+            with self.subTest(label=label):
+                changed = copy.deepcopy(self.contract)
+                mutate(changed)
+                with self.assertRaises(BackendDefinitionError):
+                    validate_contract(changed)
+
     def test_missing_mandatory_capability_fails_before_launch(self) -> None:
         backend = DeterministicFakeBackend(
             containment={
@@ -81,7 +108,9 @@ class ExecutionBackendContractTests(unittest.TestCase):
                 "process_control": "inspect-cancel-fence",
             }
         )
-        coordinator = BackendCoordinator(self.contract, backend)
+        coordinator = BackendCoordinator(
+            self.contract, backend, allow_test_backend=True
+        )
         with self.assertRaisesRegex(BackendContractError, "filesystem"):
             coordinator.negotiate(
                 required={"containment": {"filesystem": "worktree"}}
@@ -98,11 +127,35 @@ class ExecutionBackendContractTests(unittest.TestCase):
         self.assertNotIn("conversation_id", json.dumps(backend.last_envelope))
 
         reused = {**self.envelope, "resume_session": "old-session"}
-        with self.assertRaisesRegex(BackendContractError, "fresh phase context"):
+        with self.assertRaisesRegex(BackendContractError, "resume_session"):
             coordinator.launch(
                 {**self.binding, "dispatch_id": "dispatch-2", "execution_unit_id": "execution-2"},
                 reused,
             )
+
+    def test_launch_delegates_to_canonical_phase_worker_validation(self) -> None:
+        invalid_cases = (
+            ({key: value for key, value in self.envelope.items() if key != "ticket_id"}, "ticket_id"),
+            ({**self.envelope, "required_capabilities": ["structured-terminal-result"]}, "mandatory capability"),
+            ({**self.envelope, "sanitized_input": "not-an-object"}, "sanitized_input"),
+        )
+        for envelope, message in invalid_cases:
+            with self.subTest(message=message):
+                coordinator, backend = self.coordinator()
+                with self.assertRaisesRegex(BackendContractError, message):
+                    coordinator.launch(self.binding, envelope)
+                self.assertEqual(backend.launch_count, 0)
+
+    def test_launch_receipt_is_mechanically_bound_to_envelope_and_process(self) -> None:
+        for mode in ("missing", "mismatched", "envelope-mismatch"):
+            with self.subTest(mode=mode):
+                coordinator, backend = self.coordinator(launch_receipt_mode=mode)
+                with self.assertRaisesRegex(BackendContractError, "launch receipt"):
+                    coordinator.launch(self.binding, self.envelope)
+                self.assertEqual(backend.launch_count, 1)
+                with self.assertRaisesRegex(BackendContractError, "previously launched"):
+                    coordinator.launch(self.binding, self.envelope)
+                self.assertEqual(backend.launch_count, 1)
 
     def test_stale_or_replaced_execution_cannot_report_progress_or_terminal(self) -> None:
         coordinator, _backend = self.coordinator()
@@ -120,6 +173,15 @@ class ExecutionBackendContractTests(unittest.TestCase):
         with self.assertRaisesRegex(BackendContractError, "stale or fenced"):
             coordinator.terminal(self.binding)
         self.assertEqual(coordinator.progress(replacement)["status"], "progress")
+
+    def test_fenced_execution_key_is_a_permanent_tombstone(self) -> None:
+        coordinator, backend = self.coordinator()
+        coordinator.launch(self.binding, self.envelope)
+        coordinator.fence(self.binding, reason="replacement admitted")
+
+        with self.assertRaisesRegex(BackendContractError, "previously launched"):
+            coordinator.launch(self.binding, self.envelope)
+        self.assertEqual(backend.launch_count, 1)
 
     def test_unknown_inspection_never_becomes_absence(self) -> None:
         coordinator, backend = self.coordinator(inspect_status="unknown")
@@ -171,6 +233,52 @@ class ExecutionBackendContractTests(unittest.TestCase):
         self.assertTrue(acknowledged["replacement_safe"])
         self.assertIn("cancellation_receipt", acknowledged)
 
+    def test_false_or_mismatched_cancellation_acknowledgement_is_rejected(self) -> None:
+        for mode in ("mismatched", "false-verification"):
+            with self.subTest(mode=mode):
+                coordinator, _backend = self.coordinator(cancel_mode=mode)
+                coordinator.launch(self.binding, self.envelope)
+                with self.assertRaisesRegex(
+                    BackendContractError, "cancellation acknowledgement"
+                ):
+                    coordinator.cancel(self.binding, reason="operator drain")
+                self.assertEqual(
+                    coordinator.inspect(self.binding)["status"], "live"
+                )
+
+    def test_backend_cannot_assert_a_supervisor_fence(self) -> None:
+        coordinator, _backend = self.coordinator(cancel_mode="fenced")
+        coordinator.launch(self.binding, self.envelope)
+        with self.assertRaisesRegex(BackendContractError, "unsupported status"):
+            coordinator.cancel(self.binding, reason="operator drain")
+
+    def test_terminal_requires_canonical_exact_identity_envelope(self) -> None:
+        coordinator, backend = self.coordinator()
+        coordinator.launch(self.binding, self.envelope)
+        backend.terminal_mode = "mismatched"
+        with self.assertRaisesRegex(BackendContractError, "terminal evidence"):
+            coordinator.terminal(self.binding)
+
+    def test_valid_canonical_terminal_is_accepted_directly_and_by_inspection(self) -> None:
+        coordinator, backend = self.coordinator()
+        coordinator.launch(self.binding, self.envelope)
+        terminal = coordinator.terminal(self.binding)
+        self.assertEqual(terminal["terminal_envelope"]["outcome"], "recoverable")
+
+        backend.inspect_status = "terminal"
+        observed = coordinator.inspect(self.binding)
+        self.assertEqual(observed["status"], "terminal")
+        self.assertTrue(observed["replacement_safe"])
+
+    def test_terminal_inspection_without_valid_evidence_fails_closed(self) -> None:
+        coordinator, backend = self.coordinator(inspect_status="terminal")
+        coordinator.launch(self.binding, self.envelope)
+        backend.inspect_terminal_evidence = False
+        observation = coordinator.inspect(self.binding)
+        self.assertEqual(observation["status"], "unknown")
+        self.assertFalse(observation["replacement_safe"])
+        self.assertEqual(observation["reason"], "terminal_evidence_invalid")
+
     def test_containment_and_provider_capabilities_are_independent(self) -> None:
         coordinator, backend = self.coordinator()
         offer = coordinator.offer
@@ -179,6 +287,12 @@ class ExecutionBackendContractTests(unittest.TestCase):
         self.assertNotIn("provider", offer["containment"])
         self.assertFalse(hasattr(backend, "schedule"))
         self.assertFalse(hasattr(backend, "authorize_merge"))
+
+    def test_fake_backend_is_rejected_outside_explicit_conformance_mode(self) -> None:
+        backend = DeterministicFakeBackend()
+        coordinator = BackendCoordinator(self.contract, backend)
+        with self.assertRaisesRegex(BackendContractError, "test-only"):
+            coordinator.negotiate()
 
 
 if __name__ == "__main__":

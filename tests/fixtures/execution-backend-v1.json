@@ -15,6 +15,7 @@
     "backend_id": "deterministic-fake",
     "backend_version": "1",
     "protocol_version": 1,
+    "test_only": true,
     "lifecycle": [
       "launch",
       "attach",
