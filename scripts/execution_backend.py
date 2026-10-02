@@ -317,6 +317,16 @@ class BackendCoordinator:
             raise BackendContractError(
                 "launch receipt is missing or mechanically mismatched"
             )
+        validator = getattr(self.backend, "validate_launch_receipt", None)
+        if callable(validator):
+            try:
+                validator(receipt)
+            except BackendContractError:
+                raise
+            except Exception as exc:
+                raise BackendContractError(
+                    f"backend launch metadata validation failed: {exc}"
+                ) from exc
         return receipt
 
     def launch(

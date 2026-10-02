@@ -8,6 +8,7 @@ Those bindings come from the controller reservation and launch evidence.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -72,6 +73,10 @@ class StaleResultError(DispatchError):
     """A result is well-formed enough to prove it belongs to another execution."""
 
 
+class TerminalAuthorityError(DispatchError):
+    """Persisted backend terminal authority disagrees with replay evidence."""
+
+
 CONTROLLER = Path(__file__).with_name("sprint-controller.py")
 API_AGENT = Path(__file__).with_name("api_agent.py")
 CONTEXT_PIPELINE = Path(__file__).with_name("context_pipeline.py")
@@ -123,6 +128,69 @@ def _private_write(path: Path, value: str) -> None:
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _execution_unit_mechanically_absent(
+    identity: dict[str, Any], tombstone: dict[str, Any]
+) -> bool:
+    """Require terminal evidence plus host proof that the exact unit is gone."""
+
+    if (
+        identity.get("kind") != "execution_unit"
+        or tombstone.get("spawned") is not True
+        or tombstone.get("invocation_id") != identity.get("invocation_id")
+    ):
+        return False
+    containment = identity.get("containment")
+    if containment == "cgroup-v2-systemd-scope":
+        raw_cgroup = str(identity.get("cgroup") or "")
+        if not raw_cgroup.startswith("/") or ".." in Path(raw_cgroup).parts:
+            return False
+        cgroup = Path("/sys/fs/cgroup") / raw_cgroup.lstrip("/")
+        try:
+            if not cgroup.exists():
+                return True
+            populated = (cgroup / "cgroup.events").read_text(encoding="utf-8")
+        except (OSError, PermissionError):
+            return False
+        return not bool(re.search(r"^populated\s+1$", populated, re.MULTILINE))
+
+    if containment not in {"cooperative-session", "test-supervisor"}:
+        return False
+    try:
+        pid = int(identity.get("pid"))
+    except (TypeError, ValueError):
+        return False
+    if pid < 1:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        process_absent = True
+    except (PermissionError, OSError):
+        return False
+    else:
+        process_absent = False
+    if not process_absent:
+        return False
+    if containment == "cooperative-session":
+        cleanup = tombstone.get("cooperative_cleanup") or {}
+        pgid = cleanup.get("worker_pgid")
+        if (
+            cleanup.get("gateway_closed") is not True
+            or not isinstance(pgid, int)
+            or pgid <= 1
+        ):
+            return False
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            return False
+        else:
+            return False
+    return True
 
 
 def _regular_private_file(
@@ -695,6 +763,7 @@ class CurrentRouteExecutionBackend:
         self.phase_contract = phase_contract
         self.profile = ""
         self.material: dict[str, Any] = {}
+        self.validated_terminal_result: dict[str, Any] | None = None
 
     def bind_launch(
         self,
@@ -820,10 +889,22 @@ class CurrentRouteExecutionBackend:
     @staticmethod
     def _identity(launch: dict[str, Any]) -> dict[str, Any]:
         metadata = launch.get("backend_metadata") or {}
+        if set(metadata) != {"worker_identity"}:
+            raise BackendContractError("launch receipt has unbound backend metadata")
         identity = metadata.get("worker_identity")
         if not isinstance(identity, dict) or not identity.get("invocation_id"):
             raise BackendContractError("launch receipt has no worker identity")
+        if backend_digest(identity) != launch.get("process_identity"):
+            raise BackendContractError(
+                "launch worker identity does not match its process identity digest"
+            )
         return identity
+
+    def validate_launch_receipt(self, launch: dict[str, Any]) -> None:
+        self._identity(launch)
+
+    def bind_terminal_result(self, result: dict[str, Any]) -> None:
+        self.validated_terminal_result = copy.deepcopy(result)
 
     def attach(self, binding: dict[str, str], launch: dict[str, Any]) -> dict[str, Any]:
         return self._event(
@@ -862,9 +943,13 @@ class CurrentRouteExecutionBackend:
     def _terminal_result(
         self, binding: dict[str, str], launch: dict[str, Any]
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        if not self.material or not Path(self.material["result_path"]).is_file():
-            raise BackendContractError("execution has no structured terminal result")
-        result, _digest_value = extract_terminal_result(self.material["result_path"])
+        if not self.material:
+            raise BackendContractError("execution backend material is missing")
+        result = self.validated_terminal_result
+        if result is None:
+            if not Path(self.material["result_path"]).is_file():
+                raise BackendContractError("execution has no structured terminal result")
+            result, _digest_value = extract_terminal_result(self.material["result_path"])
         identity = self._identity(launch)
         validated = validate_terminal_result(
             result,
@@ -924,6 +1009,10 @@ class CurrentRouteExecutionBackend:
             or tombstone.get("invocation_id") != identity.get("invocation_id")
         ):
             return self._event(binding, launch, "unknown")
+        if not _execution_unit_mechanically_absent(identity, tombstone):
+            return self._event(
+                binding, launch, "unknown", reason="mechanical_absence_unverified"
+            )
         if self.material and Path(self.material["result_path"]).is_file():
             try:
                 return self.terminal(binding, launch)
@@ -1117,6 +1206,29 @@ class SupervisorDispatcher:
         """
 
         if "execution_backend" in job:
+            return False
+        provenance = job.get("legacy_execution_backend_provenance")
+        if not isinstance(provenance, dict):
+            return False
+        source_digest = canonical_digest(
+            {
+                field: job.get(field)
+                for field in (
+                    "ticket",
+                    "sprint",
+                    "run_ref",
+                    "attempt_token",
+                    "phase_execution",
+                    "execution_identity",
+                )
+            }
+        )
+        if provenance != {
+            "schema_version": 1,
+            "migration_id": f"execution-backend-v1:{source_digest}",
+            "source_schema_version": 2,
+            "source_job_digest": source_digest,
+        }:
             return False
         state = job.get("phase_execution")
         execution_identity = job.get("execution_identity")
@@ -1530,8 +1642,6 @@ class SupervisorDispatcher:
                 result["evidence"]["merge_receipt"] = self.adapter.verify_completion(
                     result
                 )
-            event, target = self._worker_transition(result["outcome"])
-            contract_evidence = self._contract_evidence(event, result, digest)
             phase_state = job.get("phase_execution")
             if isinstance(phase_state, dict):
                 try:
@@ -1541,38 +1651,39 @@ class SupervisorDispatcher:
                             self._phase_terminal_envelope(job, result),
                         )
                     else:
-                        _backend, backend_coordinator, binding = (
+                        backend, backend_coordinator, binding = (
                             self._restore_execution_backend(job)
                         )
+                        backend.bind_terminal_result(result)
                         backend_terminal = backend_coordinator.terminal(binding)
                         backend_result = backend_terminal.get("terminal_result")
-                        if not isinstance(backend_result, dict) or any(
-                            backend_result.get(field) != result.get(field)
-                            for field in (
-                                "schema_version",
-                                "ticket",
-                                "sprint",
-                                "attempt_token",
-                                "invocation_id",
-                                "outcome",
-                                "summary",
-                                "branch",
-                                "worktree",
-                                "pr",
-                            )
-                        ):
-                            raise DispatchError(
+                        if not isinstance(backend_result, dict) or backend_result != result:
+                            raise TerminalAuthorityError(
                                 "execution backend terminal result differs from supervisor evidence"
                             )
+                        expected_envelope = self._phase_terminal_envelope(
+                            job, backend_result
+                        )
+                        if backend_terminal.get("terminal_envelope") != expected_envelope:
+                            raise TerminalAuthorityError(
+                                "execution backend terminal envelope differs from persisted result"
+                            )
+                        result = copy.deepcopy(backend_result)
                         self._phase_runtime_for_state(phase_state).ingest(
                             phase_state,
                             backend_terminal["terminal_envelope"],
                         )
-                except (PhaseExecutionError, BackendContractError) as exc:
-                    raise DispatchError(f"phase terminal rejected: {exc}") from exc
+                except TerminalAuthorityError:
+                    raise
+                except (PhaseExecutionError, BackendContractError, DispatchError) as exc:
+                    raise TerminalAuthorityError(
+                        f"persisted terminal authority rejected: {exc}"
+                    ) from exc
+            event, target = self._worker_transition(result["outcome"])
+            contract_evidence = self._contract_evidence(event, result, digest)
             controller = self.adapter.finish(job["sprint"], job["ticket"], result)
             validation_error = ""
-        except StaleResultError:
+        except (StaleResultError, TerminalAuthorityError):
             raise
         except DispatchError as exc:
             digest = raw_digest

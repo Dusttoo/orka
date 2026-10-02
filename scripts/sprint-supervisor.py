@@ -442,6 +442,8 @@ def runtime_fingerprint() -> str:
     return digest_bytes(
         Path(__file__).read_bytes()
         + (PLUGIN_ROOT / "scripts/supervisor_dispatch.py").read_bytes()
+        + (PLUGIN_ROOT / "scripts/execution_backend.py").read_bytes()
+        + (PLUGIN_ROOT / "contracts/execution-backend-v1.json").read_bytes()
         + (PLUGIN_ROOT / "scripts/supervisor_admission.py").read_bytes()
         + CONTRACT_PATH.read_bytes()
         + BREAKER_CONTRACT_PATH.read_bytes()
@@ -648,7 +650,11 @@ def state_snapshot(
             raise SupervisorError(str(exc)) from exc
     if (
         value.get("schema_version")
-        not in ({CURRENT_SCHEMA_VERSION} if migrate else {1, CURRENT_SCHEMA_VERSION})
+        not in (
+            {CURRENT_SCHEMA_VERSION}
+            if migrate
+            else {1, 2, CURRENT_SCHEMA_VERSION}
+        )
         or value.get("contract_id") != "orka.supervisor-lifecycle"
         or value.get("lifecycle_state") not in SUPERVISOR_STATES
         or not isinstance(value.get("process"), dict)

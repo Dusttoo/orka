@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import json
+import copy
+import os
 import shutil
 import tempfile
 import unittest
@@ -18,7 +20,9 @@ from supervisor_dispatch import (  # noqa: E402
     RESULT_SCHEMA,
     StaleResultError,
     SupervisorDispatcher,
+    TerminalAuthorityError,
 )
+from supervisor_planning import canonical_digest  # noqa: E402
 from event_store import RepositoryBinding, TransactionalEventStore  # noqa: E402
 
 
@@ -29,6 +33,7 @@ class FakeAdapter:
         self.count = 0
         self.finished: list[dict] = []
         self.requeued: list[dict] = []
+        self.identity_pid = 99999999
 
     def phase_capability_offer(self, contract: dict) -> dict:
         profile = (
@@ -72,6 +77,8 @@ class FakeAdapter:
                 "invocation_id": invocation,
                 "tombstone_path": str(tombstone),
                 "origin": self.origin,
+                "containment": "test-supervisor",
+                "pid": self.identity_pid,
             }
         }
 
@@ -173,6 +180,7 @@ class DispatchTests(unittest.TestCase):
                 {
                     "phase": "terminal",
                     "invocation_id": identity["invocation_id"],
+                    "spawned": True,
                     "returncode": 0,
                 }
             ),
@@ -325,6 +333,25 @@ class DispatchTests(unittest.TestCase):
     ) -> None:
         job = self.dispatcher.launch("99", "PNP-1", phase="implement")
         job.pop("execution_backend")
+        source_digest = canonical_digest(
+            {
+                field: job.get(field)
+                for field in (
+                    "ticket",
+                    "sprint",
+                    "run_ref",
+                    "attempt_token",
+                    "phase_execution",
+                    "execution_identity",
+                )
+            }
+        )
+        job["legacy_execution_backend_provenance"] = {
+            "schema_version": 1,
+            "migration_id": f"execution-backend-v1:{source_digest}",
+            "source_schema_version": 2,
+            "source_job_digest": source_digest,
+        }
         self.write_result(job, self.envelope(job))
 
         restarted = SupervisorDispatcher(
@@ -345,6 +372,17 @@ class DispatchTests(unittest.TestCase):
         fresh = restarted.launch("99", "PNP-2", phase="implement")
         self.assertEqual(fresh["state"], "running")
         self.assertEqual(fresh["execution_backend"]["offer"]["protocol_version"], 1)
+
+    def test_missing_backend_without_migration_provenance_fails_closed(self) -> None:
+        job = self.dispatcher.launch("99", "PNP-1", phase="implement")
+        job.pop("execution_backend")
+        self.write_result(job, self.envelope(job))
+
+        with self.assertRaisesRegex(DispatchError, "binding"):
+            self.dispatcher.apply_terminal(job)
+
+        self.assertEqual(self.adapter.finished, [])
+        self.assertEqual(job["terminal"], {})
 
     def test_persisted_backend_terminal_replays_after_controller_finish_crash(
         self,
@@ -383,7 +421,13 @@ class DispatchTests(unittest.TestCase):
         self.write_result(job, self.envelope(job))
         self.write_tombstone(job)
 
-        _backend, coordinator, binding = first._restore_execution_backend(job)
+        backend, coordinator, binding = first._restore_execution_backend(job)
+        verified = self.envelope(job)
+        verified["evidence"]["preserved_work_identity"] = (
+            self.adapter.verify_work_identity(verified)
+        )
+        verified["evidence"]["merge_receipt"] = self.adapter.verify_completion(verified)
+        backend.bind_terminal_result(verified)
         persisted_terminal = coordinator.terminal(binding)
         self.assertEqual(persisted_terminal["status"], "terminal")
         self.assertEqual(store.execution_record(binding_value)["state"], "terminal")
@@ -405,6 +449,108 @@ class DispatchTests(unittest.TestCase):
         self.assertTrue(duplicate["duplicate"])
         self.assertEqual(len(self.adapter.finished), 1)
         self.assertEqual(store.execution_record(binding_value)["state"], "terminal")
+
+    def test_terminal_replay_rejects_changed_material_without_controller_mutation(
+        self,
+    ) -> None:
+        repository_id = "repository:terminal-authority-fixture"
+        store = TransactionalEventStore(
+            self.temp / "orka-terminal-authority.sqlite3",
+            writer_identity="supervisor:test",
+        )
+        self.addCleanup(store.close)
+        store.bind_repository(
+            RepositoryBinding(
+                repository_id=repository_id,
+                common_directory=str(self.repo / ".git"),
+                object_directory_id="objects",
+                policy_ref="refs/heads/main",
+                policy_path="orchestration.yml",
+                policy_commit="a" * 40,
+                policy_blob="b" * 40,
+                policy_digest="policy",
+                created_at="2026-10-02T00:00:00Z",
+            ),
+            writer_identity="supervisor:test",
+        )
+        for index, mutation in enumerate(("evidence", "summary"), start=1):
+            with self.subTest(mutation=mutation):
+                dispatcher = SupervisorDispatcher(
+                    self.repo,
+                    self.runtime,
+                    ROOT / "contracts/supervisor-lifecycle-v1.json",
+                    self.adapter,
+                    event_store=store,
+                    writer_identity="supervisor:test",
+                    repository_id=repository_id,
+                )
+                job = dispatcher.launch("99", f"PNP-{index}", phase="implement")
+                original = self.envelope(job)
+                self.write_result(job, original)
+                self.write_tombstone(job)
+                backend, coordinator, binding = dispatcher._restore_execution_backend(job)
+                verified = copy.deepcopy(original)
+                verified["evidence"]["preserved_work_identity"] = (
+                    self.adapter.verify_work_identity(verified)
+                )
+                verified["evidence"]["merge_receipt"] = (
+                    self.adapter.verify_completion(verified)
+                )
+                backend.bind_terminal_result(verified)
+                coordinator.terminal(binding)
+                receipt_before = copy.deepcopy(store.execution_record(binding))
+
+                changed = copy.deepcopy(original)
+                if mutation == "evidence":
+                    changed["evidence"]["unexpected"] = "different"
+                else:
+                    changed["summary"] = "changed after terminal persistence"
+                self.write_result(job, changed)
+                restarted = SupervisorDispatcher(
+                    self.repo,
+                    self.runtime,
+                    ROOT / "contracts/supervisor-lifecycle-v1.json",
+                    self.adapter,
+                    event_store=store,
+                    writer_identity="supervisor:test",
+                    repository_id=repository_id,
+                )
+
+                with self.assertRaisesRegex(
+                    TerminalAuthorityError, "differs from supervisor evidence"
+                ):
+                    restarted.apply_process_exit(job)
+
+                self.assertEqual(self.adapter.finished, [])
+                self.assertEqual(job["terminal"], {})
+                self.assertEqual(job["phase_execution"]["status"], "running")
+                self.assertEqual(store.execution_record(binding), receipt_before)
+
+    def test_mutated_backend_metadata_is_rejected_on_restore(self) -> None:
+        job = self.dispatcher.launch("99", "PNP-1", phase="implement")
+        job["execution_backend"]["launch_receipt"]["backend_metadata"][
+            "worker_identity"
+        ]["invocation_id"] = "replacement-invocation"
+        self.write_result(job, self.envelope(job))
+
+        with self.assertRaisesRegex(
+            TerminalAuthorityError, "process identity digest"
+        ):
+            self.dispatcher.apply_terminal(job)
+        self.assertEqual(self.adapter.finished, [])
+        self.assertEqual(job["terminal"], {})
+        self.assertEqual(job["phase_execution"]["status"], "running")
+
+    def test_terminal_tombstone_without_mechanical_death_is_not_absence(self) -> None:
+        self.adapter.identity_pid = os.getpid()
+        job = self.dispatcher.launch("99", "PNP-1", phase="implement")
+        self.write_tombstone(job)
+
+        observation = self.dispatcher.observe_execution(job)
+
+        self.assertEqual(observation["status"], "unknown")
+        self.assertEqual(observation["reason"], "mechanical_absence_unverified")
+        self.assertFalse(observation["replacement_safe"])
 
     def test_transactional_process_exit_without_result_fences_execution(self) -> None:
         repository_id = "repository:dispatch-exit-fixture"
