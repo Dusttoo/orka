@@ -83,6 +83,12 @@ fault recovery remain in #119.
 
 ## Authoritative supervisor generations
 
+Before opening an authoritative generation, the elected supervisor runs the
+versioned [startup diagnostic](startup-diagnostics.md). Planning and admission
+remain unavailable unless its deterministic, read-only receipt is healthy.
+This bounded startup path uses `quick_check(1)`; the existing full integrity
+check remains an explicit deeper operator diagnostic.
+
 Once cutover is active, the elected supervisor opens the event store once and
 holds its writer lock until lease release. Controller commands share that
 connection instead of opening a second production writer. Each supervisor

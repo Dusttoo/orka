@@ -134,6 +134,16 @@ def _sql_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def migration_specifications() -> tuple[tuple[int, str, Path], ...]:
+    """Return the one authoritative ordered event-store migration manifest."""
+
+    return (
+        (1, "0001-initial-event-store", SCHEMA_PATH),
+        (2, "0002-legacy-import", LEGACY_IMPORT_SCHEMA_PATH),
+        (3, "0003-runtime-cutover", RUNTIME_CUTOVER_SCHEMA_PATH),
+    )
+
+
 class TransactionalEventStore:
     """One supervisor-owned SQLite writer with serialized transactions.
 
@@ -257,10 +267,9 @@ class TransactionalEventStore:
         return selected, reason
 
     def _apply_migrations(self, schema_path: Path) -> None:
-        specifications = (
-            (1, "0001-initial-event-store", schema_path),
-            (2, "0002-legacy-import", LEGACY_IMPORT_SCHEMA_PATH),
-            (3, "0003-runtime-cutover", RUNTIME_CUTOVER_SCHEMA_PATH),
+        specifications = tuple(
+            (version, migration_id, schema_path if version == 1 else path)
+            for version, migration_id, path in migration_specifications()
         )
         migrations: list[tuple[int, str, str, str]] = []
         for version, migration_id, path in specifications:
