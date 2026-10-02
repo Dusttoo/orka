@@ -36,6 +36,14 @@ from runtime_state import (
     shared_repository_root,
     shared_runtime_path,
     working_repository_root,
+    repository_identity,
+    repository_layout,
+)
+from event_store import TransactionalEventStore, canonical_json
+from authoritative_supervisor_state import (
+    AuthoritativeStateError,
+    AuthoritativeSupervisorState,
+    read_authoritative_state,
 )
 from api_agent import AgentError, load_yaml
 from breaker_runtime import BreakerRuntime
@@ -649,6 +657,36 @@ def state_snapshot(
     return value
 
 
+def durable_state_snapshot(
+    repository: Path,
+    path: Path,
+    *,
+    migrate: bool = True,
+) -> dict[str, Any] | None:
+    """Select the authoritative state source without mixing generations."""
+
+    if runtime_cutover_marker(repository) is not None:
+        try:
+            value = read_authoritative_state(repository)
+        except AuthoritativeStateError as exc:
+            raise SupervisorError(str(exc)) from exc
+        if value is None:
+            return None
+        if migrate:
+            try:
+                value, _changed = migrate_supervisor_state(
+                    value,
+                    target_runtime_fingerprint=runtime_fingerprint(),
+                    target_contract_digest=contract()[2],
+                )
+            except SupervisorStateError as exc:
+                raise SupervisorError(str(exc)) from exc
+        if value.get("repository") != str(repository):
+            raise SupervisorError("supervisor state belongs to another repository")
+        return value
+    return state_snapshot(path, repository, migrate=migrate)
+
+
 def verify_state_digest(state_path: Path, digest_path: Path, *, required: bool) -> str:
     """Authenticate the last fully persisted state before restart."""
 
@@ -1052,6 +1090,7 @@ def write_handshake(path: Path, value: dict[str, Any]) -> None:
 
 def run_daemon(repository: Path, handshake: Path) -> int:
     paths = runtime_paths(repository)
+    cutover_active = runtime_cutover_marker(repository) is not None
     try:
         assert_cutover_runtime_compatible(repository)
         ensure_private_directory(paths["directory"])
@@ -1066,17 +1105,23 @@ def run_daemon(repository: Path, handshake: Path) -> int:
     server: socket.socket | None = None
     state: dict[str, Any] | None = None
     expected_state_digest = ""
+    event_store: TransactionalEventStore | None = None
+    authoritative_state: AuthoritativeSupervisorState | None = None
+    writer_identity = ""
 
     def persist_state() -> None:
         nonlocal expected_state_digest
         if state is None:
             raise SupervisorError("supervisor state is not initialized")
-        atomic_write(paths["state"], state)
-        expected_state_digest = digest_bytes(paths["state"].read_bytes())
-        atomic_write(
-            paths["state_digest"],
-            {"sha256": expected_state_digest, "recorded_at": now()},
-        )
+        if authoritative_state is not None:
+            expected_state_digest = authoritative_state.persist(state)
+        else:
+            atomic_write(paths["state"], state)
+            expected_state_digest = digest_bytes(paths["state"].read_bytes())
+            atomic_write(
+                paths["state_digest"],
+                {"sha256": expected_state_digest, "recorded_at": now()},
+            )
 
     try:
         try:
@@ -1088,7 +1133,11 @@ def run_daemon(repository: Path, handshake: Path) -> int:
             )
             return 2
 
-        previous = state_snapshot(paths["state"], repository, migrate=False)
+        previous = (
+            read_authoritative_state(repository)
+            if cutover_active
+            else state_snapshot(paths["state"], repository, migrate=False)
+        )
         previous_lease = (previous or {}).get("lease") or {}
         previous_clean = bool(
             previous
@@ -1097,11 +1146,12 @@ def run_daemon(repository: Path, handshake: Path) -> int:
             and previous_lease.get("release_count") == 1
         )
         if previous:
-            verify_state_digest(
-                paths["state"],
-                paths["state_digest"],
-                required=not previous_clean,
-            )
+            if not cutover_active:
+                verify_state_digest(
+                    paths["state"],
+                    paths["state_digest"],
+                    required=not previous_clean,
+                )
             try:
                 previous, _migrated = migrate_supervisor_state(
                     previous,
@@ -1116,6 +1166,19 @@ def run_daemon(repository: Path, handshake: Path) -> int:
         identity = process_identity(os.getpid())
         lease = new_lease(lock_handle, paths, generation)
         lease_id = lease["id"]
+        if cutover_active:
+            repository_binding = repository_identity(repository)
+            writer_identity = f"supervisor:{repository_binding['repository_uuid']}"
+            event_store = TransactionalEventStore(
+                repository_layout(repository).state_root / "orka-state.sqlite3",
+                writer_identity=writer_identity,
+            )
+            authoritative_state = AuthoritativeSupervisorState(
+                repository,
+                event_store,
+                writer_identity=writer_identity,
+                supervisor_fence=f"{lease_id}:{generation}",
+            )
         try:
             config_path = canonical_config_path(repository)
         except RuntimeStateError as exc:
@@ -1305,10 +1368,18 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                 continue
             current_time = time.time()
             if current_time >= integrity_due:
-                try:
-                    observed_state_digest = digest_bytes(paths["state"].read_bytes())
-                except OSError:
-                    observed_state_digest = "missing"
+                if authoritative_state is not None:
+                    observed = authoritative_state.load()
+                    observed_state_digest = (
+                        digest_bytes(canonical_json(observed).encode("utf-8"))
+                        if observed is not None
+                        else "missing"
+                    )
+                else:
+                    try:
+                        observed_state_digest = digest_bytes(paths["state"].read_bytes())
+                    except OSError:
+                        observed_state_digest = "missing"
                 if observed_state_digest != expected_state_digest:
                     breaker_evidence = {
                         "state_digest": observed_state_digest,
@@ -1492,10 +1563,8 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                                 supervisor_fence=(
                                     f"{state['lease']['id']}:{state['lease']['generation']}"
                                 ),
-                                writer_identity=(
-                                    f"supervisor:{state['lease']['id']}:"
-                                    f"{state['lease']['generation']}"
-                                ),
+                                writer_identity=writer_identity,
+                                store=event_store,
                             )
                             if runtime_cutover_marker(repository) is not None
                             else ControllerAdapter(repository, paths["directory"])
@@ -1882,12 +1951,10 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                             repository,
                             request,
                             supervisor_fence=fence,
-                            writer_identity=(
-                                f"supervisor:{state['lease']['id']}:"
-                                f"{state['lease']['generation']}"
-                            ),
+                            writer_identity=writer_identity,
                             private_root=paths["directory"] / "controller-materializations",
                             controller_path=Path(__file__).with_name("sprint-controller.py"),
+                            store=event_store,
                         )
                         request_stop = False
                         send_response(connection, response)
@@ -1955,6 +2022,8 @@ def run_daemon(repository: Path, handshake: Path) -> int:
             # pathname. A duplicate starter must never unlink the active
             # supervisor's control channel when lease acquisition fails.
             paths["socket"].unlink(missing_ok=True)
+        if event_store is not None:
+            event_store.close()
         try:
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
         finally:
@@ -2013,7 +2082,7 @@ def start(args: argparse.Namespace) -> None:
 def status(args: argparse.Namespace) -> None:
     repository = resolve_repository(args.repo)
     paths = runtime_paths(repository)
-    snapshot = state_snapshot(paths["state"], repository)
+    snapshot = durable_state_snapshot(repository, paths["state"])
     if snapshot is None:
         emit({"status": "not_started", "repository": str(repository)})
         return
@@ -2023,7 +2092,7 @@ def status(args: argparse.Namespace) -> None:
 def control(args: argparse.Namespace) -> None:
     repository = resolve_repository(args.repo)
     paths = runtime_paths(repository)
-    snapshot = state_snapshot(paths["state"], repository)
+    snapshot = durable_state_snapshot(repository, paths["state"])
     if snapshot is None:
         raise SupervisorError("supervisor has not been started")
     if snapshot.get("lifecycle_state") == "stopped":
@@ -2064,7 +2133,7 @@ def control(args: argparse.Namespace) -> None:
     if args.command == "stop":
         deadline = time.monotonic() + args.timeout
         while time.monotonic() < deadline:
-            stopped = state_snapshot(paths["state"], repository)
+            stopped = durable_state_snapshot(repository, paths["state"])
             if (
                 stopped
                 and stopped.get("lifecycle_state") == "stopped"
