@@ -548,7 +548,7 @@ class BreakerStateMigrationTests(unittest.TestCase):
         legacy = self.legacy()
         migrated, changed = self.migrate(legacy)
         self.assertTrue(changed)
-        self.assertEqual(migrated["schema_version"], 2)
+        self.assertEqual(migrated["schema_version"], 3)
         self.assertEqual(migrated["dispatch"], legacy["dispatch"])
         self.assertEqual(migrated["requests"], legacy["requests"])
         self.assertEqual(migrated["history"], legacy["history"])
@@ -572,6 +572,31 @@ class BreakerStateMigrationTests(unittest.TestCase):
         repeated, changed_again = self.migrate(copy.deepcopy(migrated))
         self.assertFalse(changed_again)
         self.assertEqual(repeated, migrated)
+
+    def test_schema_two_migration_proves_adjacent_backendless_execution(self) -> None:
+        schema_three, _changed = self.migrate(self.legacy())
+        schema_two = copy.deepcopy(schema_three)
+        schema_two["schema_version"] = 2
+        schema_two.pop("execution_backend_migration", None)
+        schema_two["dispatch"]["jobs"] = {
+            "run-old": {
+                "ticket": "PNP-2",
+                "state": "running",
+                "phase_execution": {"schema_version": "orka.phase-execution-state/v1"},
+                "execution_identity": {"invocation_id": "invocation-old"},
+            }
+        }
+
+        migrated, changed = self.migrate(schema_two)
+
+        self.assertTrue(changed)
+        provenance = migrated["dispatch"]["jobs"]["run-old"][
+            "legacy_execution_backend_provenance"
+        ]
+        self.assertEqual(provenance["source_schema_version"], 2)
+        self.assertEqual(
+            migrated["execution_backend_migration"]["imported_runs"], ["run-old"]
+        )
 
     def test_unknown_or_ambiguous_legacy_stop_fails_closed(self) -> None:
         unknown = self.legacy()
@@ -1236,7 +1261,7 @@ class SupervisorProcessTests(unittest.TestCase):
         restarted = self.output(self.run_cli("start", repository))
         self.assertEqual(restarted["lifecycle_state"], "active")
         migrated = self.read_state(repository)
-        self.assertEqual(migrated["schema_version"], 2)
+        self.assertEqual(migrated["schema_version"], 3)
         self.assertEqual(
             migrated["breaker_migration"]["prior_runtime_fingerprint"],
             "legacy-runtime-fingerprint",

@@ -442,6 +442,8 @@ def runtime_fingerprint() -> str:
     return digest_bytes(
         Path(__file__).read_bytes()
         + (PLUGIN_ROOT / "scripts/supervisor_dispatch.py").read_bytes()
+        + (PLUGIN_ROOT / "scripts/execution_backend.py").read_bytes()
+        + (PLUGIN_ROOT / "contracts/execution-backend-v1.json").read_bytes()
         + (PLUGIN_ROOT / "scripts/supervisor_admission.py").read_bytes()
         + CONTRACT_PATH.read_bytes()
         + BREAKER_CONTRACT_PATH.read_bytes()
@@ -648,7 +650,11 @@ def state_snapshot(
             raise SupervisorError(str(exc)) from exc
     if (
         value.get("schema_version")
-        not in ({CURRENT_SCHEMA_VERSION} if migrate else {1, CURRENT_SCHEMA_VERSION})
+        not in (
+            {CURRENT_SCHEMA_VERSION}
+            if migrate
+            else {1, 2, CURRENT_SCHEMA_VERSION}
+        )
         or value.get("contract_id") != "orka.supervisor-lifecycle"
         or value.get("lifecycle_state") not in SUPERVISOR_STATES
         or not isinstance(value.get("process"), dict)
@@ -730,7 +736,9 @@ def validate_request(value: Any) -> dict[str, Any]:
             "supervisor_fence",
         }
         if required - value.keys():
-            raise SupervisorError("controller request is missing authenticated bindings")
+            raise SupervisorError(
+                "controller request is missing authenticated bindings"
+            )
         return dict(value)
     if command not in {"pause", "resume", "drain", "stop", "status"}:
         raise SupervisorError("unsupported supervisor command")
@@ -1147,7 +1155,9 @@ def run_daemon(repository: Path, handshake: Path) -> int:
             repository, plugin_root=PLUGIN_ROOT
         )
         startup_diagnostic = startup_admission.receipt
-        if not startup_diagnostic["healthy"]:
+        if not (
+            startup_diagnostic["healthy"] or startup_diagnostic.get("upgrade_required")
+        ):
             write_handshake(
                 handshake,
                 {
@@ -1210,8 +1220,16 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                     startup_admission.database_identity.inode,
                 ),
                 startup_validator=startup_admission.validate_writer_connection,
+                post_migration_validator=(
+                    startup_admission.validate_final_writer_connection
+                ),
                 require_existing_lock=True,
             )
+            startup_diagnostic = startup_admission.finalized_receipt()
+            if not startup_diagnostic["healthy"]:
+                raise SupervisorError(
+                    "event-store upgrade did not produce healthy startup authority"
+                )
             authoritative_state = AuthoritativeSupervisorState(
                 repository,
                 event_store,
@@ -1398,8 +1416,13 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                 (state.get("planning") or {}).get("ticket_retry_seconds") or 30
             ),
             breaker_contract_path=BREAKER_CONTRACT_PATH,
-            supervisor_fence=(
-                f"{state['lease']['id']}:{state['lease']['generation']}"
+            supervisor_fence=(f"{state['lease']['id']}:{state['lease']['generation']}"),
+            event_store=event_store,
+            writer_identity=writer_identity,
+            repository_id=(
+                authoritative_state.repository_id
+                if authoritative_state is not None
+                else None
             ),
         )
         while not should_stop:
@@ -1426,7 +1449,9 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                     )
                 else:
                     try:
-                        observed_state_digest = digest_bytes(paths["state"].read_bytes())
+                        observed_state_digest = digest_bytes(
+                            paths["state"].read_bytes()
+                        )
                     except OSError:
                         observed_state_digest = "missing"
                 if observed_state_digest != expected_state_digest:
@@ -2001,8 +2026,11 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                             request,
                             supervisor_fence=fence,
                             writer_identity=writer_identity,
-                            private_root=paths["directory"] / "controller-materializations",
-                            controller_path=Path(__file__).with_name("sprint-controller.py"),
+                            private_root=paths["directory"]
+                            / "controller-materializations",
+                            controller_path=Path(__file__).with_name(
+                                "sprint-controller.py"
+                            ),
                             store=event_store,
                         )
                         request_stop = False

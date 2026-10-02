@@ -13,7 +13,7 @@ class SupervisorStateError(RuntimeError):
     pass
 
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 BREAKER_RUNTIME = BreakerRuntime()
 BREAKER_RECORD_FIELDS = (
     "source_id",
@@ -27,6 +27,22 @@ BREAKER_RECORD_FIELDS = (
     "subject",
     "evidence_digest",
 )
+
+
+def _legacy_execution_digest(job: dict[str, Any]) -> str:
+    return canonical_digest(
+        {
+            field: job.get(field)
+            for field in (
+                "ticket",
+                "sprint",
+                "run_ref",
+                "attempt_token",
+                "phase_execution",
+                "execution_identity",
+            )
+        }
+    )
 
 
 def _legacy_time(state: dict[str, Any]) -> str:
@@ -300,67 +316,118 @@ def migrate_supervisor_state(
     target_runtime_fingerprint: str,
     target_contract_digest: str,
 ) -> tuple[dict[str, Any], bool]:
-    """Upgrade schema v1 exactly once while retaining its complete payload."""
+    """Upgrade durable state exactly once while retaining its complete payload."""
 
     version = value.get("schema_version")
     if version == CURRENT_SCHEMA_VERSION:
         _validate_current_state(value)
         return value, False
-    if version != 1:
+    if version not in {1, 2}:
         raise SupervisorStateError(
             f"unsupported supervisor state schema {version!r}; restore a supported checkpoint"
         )
     source = copy.deepcopy(value)
     source_digest = canonical_digest(source)
     migrated = copy.deepcopy(source)
-    planning = migrated.setdefault("planning", {})
-    if not isinstance(planning, dict):
-        raise SupervisorStateError("legacy supervisor planning state must be an object")
-    planning["ticket_breakers"] = _legacy_ticket_breakers(planning)
-    planning["route_breakers"] = _legacy_route_breakers(planning)
-    pressure_breakers = planning.get("pressure_breakers") or []
-    if not isinstance(pressure_breakers, list):
-        raise SupervisorStateError("legacy pressure_breakers must be an array")
-    planning["pressure_breakers"] = [
-        _upgrade_record(record, "sprint") for record in pressure_breakers
-    ]
-    if any(
-        record["class_id"] != "sprint_pressure"
-        for record in planning["pressure_breakers"]
-    ):
-        raise SupervisorStateError(
-            "legacy pressure list contains a non-pressure sprint breaker"
-        )
-    for field, default in (
-        ("global_breaker_history", []),
-        ("active_global_breaker", {}),
-    ):
-        planning.setdefault(field, default)
-    planning.setdefault("global_breaker_sequence", 0)
-    _bind_legacy_global(migrated, planning, source_digest)
-    migrated["schema_version"] = CURRENT_SCHEMA_VERSION
-    migrated["breaker_migration"] = {
-        "schema_version": 1,
-        "migration_id": f"breaker-taxonomy:{source_digest}",
-        "source_schema_version": 1,
-        "source_digest": source_digest,
-        "prior_runtime_fingerprint": str(source.get("runtime_fingerprint") or ""),
-        "target_runtime_fingerprint": target_runtime_fingerprint,
-        "prior_contract_digest": str(source.get("contract_digest") or ""),
-        "target_contract_digest": target_contract_digest,
-        "preserved_payload_digest": canonical_digest(
-            {
-                key: source.get(key)
-                for key in ("dispatch", "requests", "history", "takeover")
+    if version == 1:
+        planning = migrated.setdefault("planning", {})
+        if not isinstance(planning, dict):
+            raise SupervisorStateError(
+                "legacy supervisor planning state must be an object"
+            )
+        planning["ticket_breakers"] = _legacy_ticket_breakers(planning)
+        planning["route_breakers"] = _legacy_route_breakers(planning)
+        pressure_breakers = planning.get("pressure_breakers") or []
+        if not isinstance(pressure_breakers, list):
+            raise SupervisorStateError("legacy pressure_breakers must be an array")
+        planning["pressure_breakers"] = [
+            _upgrade_record(record, "sprint") for record in pressure_breakers
+        ]
+        if any(
+            record["class_id"] != "sprint_pressure"
+            for record in planning["pressure_breakers"]
+        ):
+            raise SupervisorStateError(
+                "legacy pressure list contains a non-pressure sprint breaker"
+            )
+        for field, default in (
+            ("global_breaker_history", []),
+            ("active_global_breaker", {}),
+        ):
+            planning.setdefault(field, default)
+        planning.setdefault("global_breaker_sequence", 0)
+        _bind_legacy_global(migrated, planning, source_digest)
+        migrated["schema_version"] = 2
+        migrated["breaker_migration"] = {
+            "schema_version": 1,
+            "migration_id": f"breaker-taxonomy:{source_digest}",
+            "source_schema_version": 1,
+            "source_digest": source_digest,
+            "prior_runtime_fingerprint": str(source.get("runtime_fingerprint") or ""),
+            "target_runtime_fingerprint": target_runtime_fingerprint,
+            "prior_contract_digest": str(source.get("contract_digest") or ""),
+            "target_contract_digest": target_contract_digest,
+            "preserved_payload_digest": canonical_digest(
+                {
+                    key: source.get(key)
+                    for key in ("dispatch", "requests", "history", "takeover")
+                }
+            ),
+        }
+
+    schema_two = copy.deepcopy(migrated)
+    schema_two_digest = canonical_digest(schema_two)
+    jobs = ((migrated.get("dispatch") or {}).get("jobs") or {})
+    if not isinstance(jobs, dict):
+        raise SupervisorStateError("supervisor dispatch jobs must be an object")
+    imported: list[str] = []
+    for run_ref, job in sorted(jobs.items()):
+        if not isinstance(job, dict):
+            raise SupervisorStateError(f"job {run_ref} must be an object")
+        if (
+            job.get("state") in {"running", "reserved", "launch_uncertain"}
+            and "execution_backend" not in job
+            and isinstance(job.get("phase_execution"), dict)
+            and isinstance(job.get("execution_identity"), dict)
+        ):
+            job_digest = _legacy_execution_digest(job)
+            job["legacy_execution_backend_provenance"] = {
+                "schema_version": 1,
+                "migration_id": f"execution-backend-v1:{job_digest}",
+                "source_schema_version": 2,
+                "source_job_digest": job_digest,
             }
-        ),
+            imported.append(str(run_ref))
+    migrated["schema_version"] = CURRENT_SCHEMA_VERSION
+    migrated["execution_backend_migration"] = {
+        "schema_version": 1,
+        "migration_id": f"execution-backend-v1:{schema_two_digest}",
+        "source_schema_version": 2,
+        "source_digest": schema_two_digest,
+        "prior_runtime_fingerprint": str(schema_two.get("runtime_fingerprint") or ""),
+        "target_runtime_fingerprint": target_runtime_fingerprint,
+        "prior_contract_digest": str(schema_two.get("contract_digest") or ""),
+        "target_contract_digest": target_contract_digest,
+        "imported_runs": imported,
     }
+    _validate_current_state(migrated)
     return migrated, True
 
 
 def migration_authorizes_runtime(
     state: dict[str, Any], *, runtime_fingerprint: str, contract_digest: str
 ) -> bool:
+    receipt = state.get("execution_backend_migration") or {}
+    if (
+        receipt.get("source_schema_version") == 2
+        and receipt.get("prior_runtime_fingerprint") == state.get("runtime_fingerprint")
+        and receipt.get("target_runtime_fingerprint") == runtime_fingerprint
+        and receipt.get("prior_contract_digest") == state.get("contract_digest")
+        and receipt.get("target_contract_digest") == contract_digest
+        and receipt.get("migration_id")
+        == f"execution-backend-v1:{receipt.get('source_digest')}"
+    ):
+        return True
     receipt = state.get("breaker_migration") or {}
     return bool(
         receipt.get("source_schema_version") == 1

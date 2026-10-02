@@ -6,6 +6,7 @@ from __future__ import annotations
 import copy
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -16,7 +17,9 @@ from execution_backend import (  # noqa: E402
     BackendContractError,
     BackendCoordinator,
     DeterministicFakeBackend,
+    TransactionalBackendState,
 )
+from event_store import RepositoryBinding, TransactionalEventStore  # noqa: E402
 from execution_backend_contract import (  # noqa: E402
     ContractError as BackendDefinitionError,
     load_contract,
@@ -324,6 +327,125 @@ class ExecutionBackendContractTests(unittest.TestCase):
         coordinator = BackendCoordinator(self.contract, backend)
         with self.assertRaisesRegex(BackendContractError, "test-only"):
             coordinator.negotiate()
+
+    def transactional_state(
+        self,
+    ) -> tuple[tempfile.TemporaryDirectory[str], TransactionalEventStore, TransactionalBackendState]:
+        temporary = tempfile.TemporaryDirectory()
+        store = TransactionalEventStore(
+            Path(temporary.name) / "state.sqlite3", writer_identity="supervisor:test"
+        )
+        store.bind_repository(
+            RepositoryBinding(
+                repository_id="repository:fixture",
+                common_directory="/repo/.git",
+                object_directory_id="objects",
+                policy_ref="refs/heads/main",
+                policy_path="orchestration.yml",
+                policy_commit="a" * 40,
+                policy_blob="b" * 40,
+                policy_digest="policy",
+                created_at="2026-10-02T00:00:00Z",
+            ),
+            writer_identity="supervisor:test",
+        )
+        return (
+            temporary,
+            store,
+            TransactionalBackendState(store, writer_identity="supervisor:test"),
+        )
+
+    def test_transactional_tombstone_survives_supervisor_restart(self) -> None:
+        temporary, store, state = self.transactional_state()
+        self.addCleanup(temporary.cleanup)
+        self.addCleanup(store.close)
+        backend = DeterministicFakeBackend()
+        first = BackendCoordinator(
+            self.contract, backend, allow_test_backend=True, state_store=state
+        )
+        first.negotiate()
+        launch = first.launch(self.binding, self.envelope)
+        first.attach(self.binding)
+
+        restarted = BackendCoordinator(
+            self.contract, backend, allow_test_backend=True, state_store=state
+        )
+        restarted.negotiate()
+        restored = restarted.restore(self.binding, self.envelope)
+        self.assertEqual(restored["launch_receipt"], launch["launch_receipt"])
+        self.assertEqual(restarted.progress(self.binding)["status"], "progress")
+        terminal = restarted.terminal(self.binding)
+        self.assertEqual(terminal["status"], "terminal")
+        record = store.execution_record(self.binding)
+        self.assertEqual(record["state"], "terminal")
+        after_terminal = BackendCoordinator(
+            self.contract, backend, allow_test_backend=True, state_store=state
+        )
+        after_terminal.negotiate()
+        after_terminal.restore(self.binding, self.envelope)
+        replay = after_terminal.terminal(self.binding)
+        self.assertEqual(replay, terminal)
+        self.assertEqual(store.execution_record(self.binding)["version"], record["version"])
+
+    def test_failed_launch_leaves_transactional_uncertain_tombstone(self) -> None:
+        temporary, store, state = self.transactional_state()
+        self.addCleanup(temporary.cleanup)
+        self.addCleanup(store.close)
+        backend = DeterministicFakeBackend(launch_receipt_mode="mismatched")
+        coordinator = BackendCoordinator(
+            self.contract, backend, allow_test_backend=True, state_store=state
+        )
+        coordinator.negotiate()
+        with self.assertRaisesRegex(BackendContractError, "launch receipt"):
+            coordinator.launch(self.binding, self.envelope)
+        self.assertEqual(store.execution_record(self.binding)["state"], "uncertain")
+        replacement = BackendCoordinator(
+            self.contract, backend, allow_test_backend=True, state_store=state
+        )
+        replacement.negotiate()
+        with self.assertRaisesRegex(BackendContractError, "already consumed"):
+            replacement.launch(self.binding, self.envelope)
+
+    def test_transactional_cancellation_acknowledgement_is_fenced(self) -> None:
+        temporary, store, state = self.transactional_state()
+        self.addCleanup(temporary.cleanup)
+        self.addCleanup(store.close)
+        backend = DeterministicFakeBackend(cancel_mode="acknowledged")
+        coordinator = BackendCoordinator(
+            self.contract, backend, allow_test_backend=True, state_store=state
+        )
+        coordinator.negotiate()
+        coordinator.launch(self.binding, self.envelope)
+        coordinator.attach(self.binding)
+        result = coordinator.cancel(self.binding, reason="operator drain")
+        self.assertTrue(result["replacement_safe"])
+        self.assertEqual(result["supervisor_fence"]["status"], "fenced")
+        record = store.execution_record(self.binding)
+        self.assertEqual(record["state"], "fenced")
+        self.assertEqual(
+            record["cancellation_receipt"]["status"], "acknowledged"
+        )
+        self.assertEqual(record["fence_receipt"]["status"], "fenced")
+        with self.assertRaisesRegex(BackendContractError, "stale or fenced"):
+            coordinator.progress(self.binding)
+
+    def test_transactional_activity_does_not_clear_pending_cancellation(self) -> None:
+        temporary, store, state = self.transactional_state()
+        self.addCleanup(temporary.cleanup)
+        self.addCleanup(store.close)
+        backend = DeterministicFakeBackend(cancel_mode="unknown")
+        coordinator = BackendCoordinator(
+            self.contract, backend, allow_test_backend=True, state_store=state
+        )
+        coordinator.negotiate()
+        coordinator.launch(self.binding, self.envelope)
+        coordinator.attach(self.binding)
+        coordinator.cancel(self.binding, reason="operator drain")
+        self.assertEqual(store.execution_record(self.binding)["state"], "cancelling")
+
+        coordinator.progress(self.binding)
+
+        self.assertEqual(store.execution_record(self.binding)["state"], "cancelling")
 
 
 if __name__ == "__main__":
