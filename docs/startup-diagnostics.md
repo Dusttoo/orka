@@ -36,6 +36,12 @@ retained policy blob without resolving the moving policy ref again. Deleting or
 corrupting `cutover.json` cannot downgrade an event store whose
 `runtime_cutovers` ledger already records active cutover.
 
+A pre-existing writer-lock sidecar must already be a private regular file; the
+constructor never repairs an unsafe mode. If admission needs to create the lock
+and later validation fails, it removes only the exact inode it created. A
+symlink or another process's replacement is never followed, changed, or
+removed.
+
 Legacy repositories retain their 1.x behavior. Their event-store-only checks
 are reported as `legacy_not_applicable`, while the compatible repository policy
 is still verified. An initialized pre-cutover repository also validates its

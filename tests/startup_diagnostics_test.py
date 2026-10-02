@@ -23,6 +23,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from event_store import (  # noqa: E402
     EventStoreError,
     TransactionalEventStore,
+    WriterAuthorityError,
     canonical_json,
 )
 from runtime_state import (  # noqa: E402
@@ -124,6 +125,22 @@ class StartupDiagnosticTests(unittest.TestCase):
             for path in sorted(root.rglob("*"))
             if path.is_file() and not path.is_symlink()
         }
+
+    @staticmethod
+    def runtime_artifact_snapshot(repository: Path) -> dict[str, tuple]:
+        root = repository_layout(repository).state_root
+        snapshot: dict[str, tuple] = {}
+        for path in sorted(root.rglob("*")):
+            metadata = path.lstat()
+            relative = str(path.relative_to(root))
+            mode = metadata.st_mode
+            if path.is_symlink():
+                snapshot[relative] = ("symlink", mode, os.readlink(path))
+            elif path.is_file():
+                snapshot[relative] = ("file", mode, path.read_bytes())
+            elif path.is_dir():
+                snapshot[relative] = ("directory", mode)
+        return snapshot
 
     @staticmethod
     def database(repository: Path) -> Path:
@@ -465,6 +482,100 @@ class StartupDiagnosticTests(unittest.TestCase):
                         startup_validator=admission.validate_writer_connection,
                     )
                 self.assertEqual(dump(), before)
+
+    def test_writer_lock_failures_do_not_repair_or_leave_runtime_sidecars(self) -> None:
+        repository = self.repository("unsafe-existing-writer-lock")
+        admission = prepare_startup_admission(repository, plugin_root=ROOT)
+        identity = admission.database_identity
+        assert identity is not None
+        lock = Path(f"{self.database(repository)}.writer.lock")
+        lock.write_text("existing-lock", encoding="utf-8")
+        os.chmod(lock, 0o644)
+        before = self.runtime_artifact_snapshot(repository)
+
+        with self.assertRaises(WriterAuthorityError):
+            TransactionalEventStore(
+                self.database(repository),
+                writer_identity="supervisor:test",
+                expected_database_identity=(identity.device, identity.inode),
+                startup_validator=admission.validate_writer_connection,
+            )
+
+        self.assertEqual(self.runtime_artifact_snapshot(repository), before)
+        self.assertEqual(lock.stat().st_mode & 0o777, 0o644)
+        self.assertEqual(lock.read_text(encoding="utf-8"), "existing-lock")
+
+        repository = self.repository("failed-new-writer-lock")
+        admission = prepare_startup_admission(repository, plugin_root=ROOT)
+        identity = admission.database_identity
+        assert identity is not None
+        lock = Path(f"{self.database(repository)}.writer.lock")
+        lock.unlink()
+        self.update_database(
+            repository, "UPDATE repositories SET policy_digest = 'tampered'"
+        )
+        before = self.runtime_artifact_snapshot(repository)
+
+        with self.assertRaisesRegex(EventStoreError, "authority changed"):
+            TransactionalEventStore(
+                self.database(repository),
+                writer_identity="supervisor:test",
+                expected_database_identity=(identity.device, identity.inode),
+                startup_validator=admission.validate_writer_connection,
+            )
+
+        self.assertFalse(lock.exists() or lock.is_symlink())
+        self.assertEqual(self.runtime_artifact_snapshot(repository), before)
+
+    def test_writer_lock_symlink_and_replacement_are_never_removed(self) -> None:
+        repository = self.repository("symlinked-writer-lock")
+        admission = prepare_startup_admission(repository, plugin_root=ROOT)
+        identity = admission.database_identity
+        assert identity is not None
+        lock = Path(f"{self.database(repository)}.writer.lock")
+        lock.unlink()
+        target = lock.with_name(lock.name + ".target")
+        target.write_text("target", encoding="utf-8")
+        os.chmod(target, 0o600)
+        lock.symlink_to(target.name)
+        before = self.runtime_artifact_snapshot(repository)
+
+        with self.assertRaises(WriterAuthorityError):
+            TransactionalEventStore(
+                self.database(repository),
+                writer_identity="supervisor:test",
+                expected_database_identity=(identity.device, identity.inode),
+                startup_validator=admission.validate_writer_connection,
+            )
+
+        self.assertEqual(self.runtime_artifact_snapshot(repository), before)
+
+        lock.unlink()
+        target.unlink()
+        replacement = lock.with_name(lock.name + ".replacement")
+
+        def replace_created_lock(
+            database: sqlite3.Connection, database_path: Path
+        ) -> None:
+            del database, database_path
+            created = lock.with_name(lock.name + ".created")
+            lock.rename(created)
+            replacement.write_text("replacement", encoding="utf-8")
+            os.chmod(replacement, 0o600)
+            os.replace(replacement, lock)
+            raise RuntimeError("injected validation failure")
+
+        with self.assertRaisesRegex(EventStoreError, "authority changed"):
+            TransactionalEventStore(
+                self.database(repository),
+                writer_identity="supervisor:test",
+                expected_database_identity=(identity.device, identity.inode),
+                startup_validator=replace_created_lock,
+            )
+
+        self.assertTrue(lock.is_file() and not lock.is_symlink())
+        self.assertEqual(lock.read_text(encoding="utf-8"), "replacement")
+        self.assertTrue(lock.with_name(lock.name + ".created").exists())
 
     def test_checked_policy_blob_survives_policy_ref_advance(self) -> None:
         repository = self.repository("policy-race")

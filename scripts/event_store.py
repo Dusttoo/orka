@@ -175,7 +175,10 @@ class TransactionalEventStore:
         self._write_lock = threading.RLock()
         self._closed = False
         self._validate_database_path()
-        self._writer_lock_handle = self._acquire_writer_lock()
+        (
+            self._writer_lock_handle,
+            self._writer_lock_created_identity,
+        ) = self._acquire_writer_lock()
         try:
             self._verify_expected_database_identity()
             self._database = sqlite3.connect(
@@ -204,7 +207,7 @@ class TransactionalEventStore:
         except BaseException:
             if hasattr(self, "_database"):
                 self._database.close()
-            self._release_writer_lock()
+            self._release_writer_lock(remove_created=True)
             raise
 
     def __enter__(self) -> "TransactionalEventStore":
@@ -246,32 +249,91 @@ class TransactionalEventStore:
                 "event-store database identity changed after startup diagnostics"
             )
 
-    def _acquire_writer_lock(self) -> Any:
+    @staticmethod
+    def _private_lock_metadata(metadata: os.stat_result) -> bool:
+        mode = stat.S_IMODE(metadata.st_mode)
+        return (
+            stat.S_ISREG(metadata.st_mode)
+            and not stat.S_ISLNK(metadata.st_mode)
+            and mode & 0o600 == 0o600
+            and not mode & 0o077
+        )
+
+    def _acquire_writer_lock(self) -> tuple[Any, tuple[int, int] | None]:
         lock_path = self.database_path.with_name(self.database_path.name + ".writer.lock")
-        flags = os.O_RDWR | os.O_CREAT
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
+        descriptor: int | None = None
+        handle: Any | None = None
+        created_identity: tuple[int, int] | None = None
         try:
-            descriptor = os.open(lock_path, flags, 0o600)
-            os.fchmod(descriptor, 0o600)
+            try:
+                existing = lock_path.lstat()
+            except FileNotFoundError:
+                flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+                if hasattr(os, "O_NOFOLLOW"):
+                    flags |= os.O_NOFOLLOW
+                descriptor = os.open(lock_path, flags, 0o600)
+                os.fchmod(descriptor, 0o600)
+                opened = os.fstat(descriptor)
+                if not self._private_lock_metadata(opened):
+                    raise OSError("new writer lock is not a private regular file")
+                created_identity = (opened.st_dev, opened.st_ino)
+            else:
+                if not self._private_lock_metadata(existing):
+                    raise OSError("existing writer lock is not a private regular file")
+                flags = os.O_RDWR
+                if hasattr(os, "O_NOFOLLOW"):
+                    flags |= os.O_NOFOLLOW
+                descriptor = os.open(lock_path, flags)
+                opened = os.fstat(descriptor)
+                if (
+                    not self._private_lock_metadata(opened)
+                    or (opened.st_dev, opened.st_ino)
+                    != (existing.st_dev, existing.st_ino)
+                ):
+                    raise OSError("writer lock changed while it was opened")
             handle = os.fdopen(descriptor, "a+", encoding="utf-8")
+            descriptor = None
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except (OSError, BlockingIOError) as exc:
-            with contextlib.suppress(UnboundLocalError, OSError):
+            with contextlib.suppress(OSError):
+                if created_identity is not None:
+                    current = lock_path.lstat()
+                    if (
+                        self._private_lock_metadata(current)
+                        and (current.st_dev, current.st_ino) == created_identity
+                    ):
+                        lock_path.unlink()
+            with contextlib.suppress(OSError, AttributeError):
                 handle.close()
-            with contextlib.suppress(UnboundLocalError, OSError):
-                os.close(descriptor)
+            with contextlib.suppress(OSError, TypeError):
+                if descriptor is not None:
+                    os.close(descriptor)
             raise WriterAuthorityError(
                 "another supervisor already owns the event-store writer lock"
             ) from exc
-        return handle
+        return handle, created_identity
 
-    def _release_writer_lock(self) -> None:
+    def _release_writer_lock(self, *, remove_created: bool = False) -> None:
         handle = getattr(self, "_writer_lock_handle", None)
         if handle is not None and not handle.closed:
             with contextlib.suppress(OSError):
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
             handle.close()
+        if not remove_created:
+            return
+        created_identity = getattr(self, "_writer_lock_created_identity", None)
+        if created_identity is None:
+            return
+        lock_path = self.database_path.with_name(self.database_path.name + ".writer.lock")
+        try:
+            current = lock_path.lstat()
+            if (
+                self._private_lock_metadata(current)
+                and (current.st_dev, current.st_ino) == created_identity
+            ):
+                lock_path.unlink()
+        except FileNotFoundError:
+            pass
 
     def _select_journal_mode(self, *, local_filesystem: bool) -> tuple[str, str]:
         fixed = wal_reset_fix_available(sqlite3.sqlite_version)
