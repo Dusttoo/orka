@@ -36,11 +36,13 @@ retained policy blob without resolving the moving policy ref again. Deleting or
 corrupting `cutover.json` cannot downgrade an event store whose
 `runtime_cutovers` ledger already records active cutover.
 
-A pre-existing writer-lock sidecar must already be a private regular file; the
-constructor never repairs an unsafe mode. If admission needs to create the lock
-and later validation fails, it removes only the exact inode it created. A
-symlink or another process's replacement is never followed, changed, or
-removed.
+The writer-lock sidecar is durable infrastructure. Offline bootstrap and
+cutover initialization may create it once with `O_EXCL` and mode `0600`, but
+normal supervisor admission requires it to exist already as a private regular
+file. Runtime startup only opens and locks that validated inode: it never
+creates, chmod-repairs, or unlinks a lock during admission or cleanup. This
+preserves one stable lock object for processes that already opened it or are
+waiting to acquire it, including when a constructor fails.
 
 Legacy repositories retain their 1.x behavior. Their event-store-only checks
 are reported as `legacy_not_applicable`, while the compatible repository policy

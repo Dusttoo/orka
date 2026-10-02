@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -483,7 +485,7 @@ class StartupDiagnosticTests(unittest.TestCase):
                     )
                 self.assertEqual(dump(), before)
 
-    def test_writer_lock_failures_do_not_repair_or_leave_runtime_sidecars(self) -> None:
+    def test_active_runtime_requires_an_unchanged_private_writer_lock(self) -> None:
         repository = self.repository("unsafe-existing-writer-lock")
         admission = prepare_startup_admission(repository, plugin_root=ROOT)
         identity = admission.database_identity
@@ -492,6 +494,13 @@ class StartupDiagnosticTests(unittest.TestCase):
         lock.write_text("existing-lock", encoding="utf-8")
         os.chmod(lock, 0o644)
         before = self.runtime_artifact_snapshot(repository)
+        receipt = run_startup_diagnostics(repository, plugin_root=ROOT)
+
+        self.assertFalse(receipt["healthy"])
+        self.assertEqual(
+            self.check(receipt, "runtime_permissions")["reason_code"],
+            "database_permissions_invalid",
+        )
 
         with self.assertRaises(WriterAuthorityError):
             TransactionalEventStore(
@@ -499,35 +508,35 @@ class StartupDiagnosticTests(unittest.TestCase):
                 writer_identity="supervisor:test",
                 expected_database_identity=(identity.device, identity.inode),
                 startup_validator=admission.validate_writer_connection,
+                require_existing_lock=True,
             )
 
         self.assertEqual(self.runtime_artifact_snapshot(repository), before)
         self.assertEqual(lock.stat().st_mode & 0o777, 0o644)
         self.assertEqual(lock.read_text(encoding="utf-8"), "existing-lock")
 
-        repository = self.repository("failed-new-writer-lock")
-        admission = prepare_startup_admission(repository, plugin_root=ROOT)
-        identity = admission.database_identity
-        assert identity is not None
+        repository = self.repository("missing-active-writer-lock")
         lock = Path(f"{self.database(repository)}.writer.lock")
         lock.unlink()
-        self.update_database(
-            repository, "UPDATE repositories SET policy_digest = 'tampered'"
-        )
         before = self.runtime_artifact_snapshot(repository)
+        receipt = run_startup_diagnostics(repository, plugin_root=ROOT)
 
-        with self.assertRaisesRegex(EventStoreError, "authority changed"):
+        self.assertFalse(receipt["healthy"])
+        self.assertEqual(
+            self.check(receipt, "runtime_permissions")["reason_code"],
+            "database_permissions_invalid",
+        )
+        with self.assertRaises(WriterAuthorityError):
             TransactionalEventStore(
                 self.database(repository),
                 writer_identity="supervisor:test",
-                expected_database_identity=(identity.device, identity.inode),
-                startup_validator=admission.validate_writer_connection,
+                require_existing_lock=True,
             )
 
         self.assertFalse(lock.exists() or lock.is_symlink())
         self.assertEqual(self.runtime_artifact_snapshot(repository), before)
 
-    def test_writer_lock_symlink_and_replacement_are_never_removed(self) -> None:
+    def test_writer_lock_symlink_is_never_followed_changed_or_removed(self) -> None:
         repository = self.repository("symlinked-writer-lock")
         admission = prepare_startup_admission(repository, plugin_root=ROOT)
         identity = admission.database_identity
@@ -546,36 +555,95 @@ class StartupDiagnosticTests(unittest.TestCase):
                 writer_identity="supervisor:test",
                 expected_database_identity=(identity.device, identity.inode),
                 startup_validator=admission.validate_writer_connection,
+                require_existing_lock=True,
             )
 
         self.assertEqual(self.runtime_artifact_snapshot(repository), before)
 
-        lock.unlink()
-        target.unlink()
-        replacement = lock.with_name(lock.name + ".replacement")
+    def test_bootstrap_creates_one_durable_writer_lock(self) -> None:
+        database_path = self.base / "bootstrap" / "state.sqlite3"
+        database_path.parent.mkdir()
+        lock = Path(f"{database_path}.writer.lock")
 
-        def replace_created_lock(
-            database: sqlite3.Connection, database_path: Path
+        with TransactionalEventStore(
+            database_path, writer_identity="bootstrap:first"
+        ):
+            self.assertTrue(lock.is_file() and not lock.is_symlink())
+            first = lock.stat()
+            self.assertEqual(first.st_mode & 0o777, 0o600)
+
+        with TransactionalEventStore(
+            database_path, writer_identity="bootstrap:second"
+        ):
+            second = lock.stat()
+
+        self.assertEqual((second.st_dev, second.st_ino), (first.st_dev, first.st_ino))
+        self.assertEqual(second.st_mode & 0o777, 0o600)
+
+    def test_failed_bootstrap_preserves_lock_inode_for_waiters(self) -> None:
+        repository = self.repository("durable-writer-lock-handoff")
+        admission = prepare_startup_admission(repository, plugin_root=ROOT)
+        identity = admission.database_identity
+        assert identity is not None
+        database_path = self.database(repository)
+        lock = Path(f"{database_path}.writer.lock")
+        lock.unlink()
+        runtime_before = self.runtime_artifact_snapshot(repository)
+        database_before = (database_path.stat().st_mode, database_path.read_bytes())
+        waiter: int | None = None
+        opened_identity: tuple[int, int] | None = None
+
+        def fail_with_waiter(
+            database: sqlite3.Connection, checked_path: Path
         ) -> None:
-            del database, database_path
-            created = lock.with_name(lock.name + ".created")
-            lock.rename(created)
-            replacement.write_text("replacement", encoding="utf-8")
-            os.chmod(replacement, 0o600)
-            os.replace(replacement, lock)
+            nonlocal waiter, opened_identity
+            del database, checked_path
+            flags = os.O_RDWR
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            waiter = os.open(lock, flags)
+            metadata = os.fstat(waiter)
+            opened_identity = (metadata.st_dev, metadata.st_ino)
+            with self.assertRaises(BlockingIOError):
+                fcntl.flock(waiter, fcntl.LOCK_EX | fcntl.LOCK_NB)
             raise RuntimeError("injected validation failure")
 
-        with self.assertRaisesRegex(EventStoreError, "authority changed"):
-            TransactionalEventStore(
-                self.database(repository),
-                writer_identity="supervisor:test",
-                expected_database_identity=(identity.device, identity.inode),
-                startup_validator=replace_created_lock,
+        try:
+            with self.assertRaisesRegex(EventStoreError, "authority changed"):
+                TransactionalEventStore(
+                    database_path,
+                    writer_identity="bootstrap:failed",
+                    expected_database_identity=(identity.device, identity.inode),
+                    startup_validator=fail_with_waiter,
+                )
+            assert waiter is not None
+            assert opened_identity is not None
+            current = lock.lstat()
+            self.assertEqual((current.st_dev, current.st_ino), opened_identity)
+            fcntl.flock(waiter, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaises(WriterAuthorityError):
+                TransactionalEventStore(
+                    database_path,
+                    writer_identity="runtime:third",
+                    expected_database_identity=(identity.device, identity.inode),
+                    require_existing_lock=True,
+                )
+            current = lock.lstat()
+            self.assertEqual((current.st_dev, current.st_ino), opened_identity)
+            runtime_after = self.runtime_artifact_snapshot(repository)
+            self.assertEqual(
+                {key: value for key, value in runtime_after.items() if key != lock.name},
+                runtime_before,
             )
-
-        self.assertTrue(lock.is_file() and not lock.is_symlink())
-        self.assertEqual(lock.read_text(encoding="utf-8"), "replacement")
-        self.assertTrue(lock.with_name(lock.name + ".created").exists())
+            self.assertEqual(
+                (database_path.stat().st_mode, database_path.read_bytes()),
+                database_before,
+            )
+        finally:
+            if waiter is not None:
+                with contextlib.suppress(OSError):
+                    fcntl.flock(waiter, fcntl.LOCK_UN)
+                os.close(waiter)
 
     def test_checked_policy_blob_survives_policy_ref_advance(self) -> None:
         repository = self.repository("policy-race")

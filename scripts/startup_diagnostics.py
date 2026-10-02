@@ -198,7 +198,9 @@ def _validate_writer_admission(
     identity = json.loads(admission.identity_document)
     marker = json.loads(admission.cutover_document)
     layout = repository_layout(admission.repository)
-    if _permission_check(layout, database_path)["status"] != "pass":
+    if _permission_check(
+        layout, database_path, require_writer_lock=True
+    )["status"] != "pass":
         raise RuntimeStateError("runtime permissions changed after startup diagnostics")
     if canonical_json(repository_identity(admission.repository)) != admission.identity_document:
         raise RuntimeStateError("repository identity changed after startup diagnostics")
@@ -317,7 +319,12 @@ def _read_only_database(path: Path) -> sqlite3.Connection:
     return database
 
 
-def _permission_check(layout: Any, database_path: Path) -> dict[str, Any]:
+def _permission_check(
+    layout: Any,
+    database_path: Path,
+    *,
+    require_writer_lock: bool = False,
+) -> dict[str, Any]:
     state_root = layout.state_root
     runtime_files = (state_root / IDENTITY_FILE, state_root / CUTOVER_FILE)
     try:
@@ -341,6 +348,13 @@ def _permission_check(layout: Any, database_path: Path) -> dict[str, Any]:
     if not _private_regular(database_path) or not os.access(
         database_path, os.R_OK | os.W_OK
     ):
+        return _check(
+            "runtime_permissions",
+            "fail",
+            "database_permissions_invalid",
+        )
+    writer_lock = Path(f"{database_path}.writer.lock")
+    if require_writer_lock and not _private_regular(writer_lock):
         return _check(
             "runtime_permissions",
             "fail",
@@ -479,7 +493,9 @@ def prepare_startup_admission(
         check_id: _check(check_id, "skipped", "dependency_failed")
         for check_id in CHECK_ORDER
     }
-    checks["runtime_permissions"] = _permission_check(layout, database_path)
+    checks["runtime_permissions"] = _permission_check(
+        layout, database_path, require_writer_lock=True
+    )
 
     identity: dict[str, Any] | None = None
     policy: Any = None
