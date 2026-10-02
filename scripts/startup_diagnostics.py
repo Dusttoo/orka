@@ -96,7 +96,41 @@ class StartupAdmission:
     ) -> None:
         """Revalidate retained authority on the writer-owned connection."""
 
-        _validate_writer_admission(self, database, database_path)
+        specifications = (
+            MIGRATIONS[:-1] if self.receipt.get("upgrade_required") else MIGRATIONS
+        )
+        _validate_writer_admission(
+            self, database, database_path, specifications=specifications
+        )
+
+    def validate_final_writer_connection(
+        self, database: sqlite3.Connection, database_path: Path
+    ) -> None:
+        """Require complete current authority after any registered migration."""
+
+        _validate_writer_admission(
+            self, database, database_path, specifications=MIGRATIONS
+        )
+
+    def finalized_receipt(self) -> dict[str, Any]:
+        """Return the admission receipt after writer-owned upgrade validation."""
+
+        if not self.receipt.get("upgrade_required"):
+            return dict(self.receipt)
+        checks = {item["id"]: dict(item) for item in self.receipt.get("checks") or []}
+        for check_id in ("schema", "migration_ledger"):
+            checks[check_id] = _check(
+                check_id,
+                "pass",
+                "ok",
+                {"schema_version": SCHEMA_VERSION},
+            )
+        receipt = _receipt("transactional", checks)
+        receipt["upgraded_from_schema_version"] = SCHEMA_VERSION - 1
+        receipt["receipt_digest"] = _digest(
+            {key: value for key, value in receipt.items() if key != "receipt_digest"}
+        )
+        return receipt
 
 
 def _digest(value: Any) -> str:
@@ -175,6 +209,8 @@ def _validate_writer_admission(
     admission: StartupAdmission,
     database: sqlite3.Connection,
     database_path: Path,
+    *,
+    specifications: tuple[tuple[int, str, Path], ...],
 ) -> None:
     """Fail when checked authority changed before writer admission.
 
@@ -183,7 +219,10 @@ def _validate_writer_admission(
     """
 
     if (
-        not admission.receipt.get("healthy")
+        not (
+            admission.receipt.get("healthy")
+            or admission.receipt.get("upgrade_required")
+        )
         or admission.receipt.get("mode") != "transactional"
         or admission.repository is None
         or admission.plugin_root is None
@@ -198,14 +237,21 @@ def _validate_writer_admission(
     identity = json.loads(admission.identity_document)
     marker = json.loads(admission.cutover_document)
     layout = repository_layout(admission.repository)
-    if _permission_check(
-        layout, database_path, require_writer_lock=True
-    )["status"] != "pass":
+    if (
+        _permission_check(layout, database_path, require_writer_lock=True)["status"]
+        != "pass"
+    ):
         raise RuntimeStateError("runtime permissions changed after startup diagnostics")
-    if canonical_json(repository_identity(admission.repository)) != admission.identity_document:
+    if (
+        canonical_json(repository_identity(admission.repository))
+        != admission.identity_document
+    ):
         raise RuntimeStateError("repository identity changed after startup diagnostics")
     current_marker = runtime_cutover_marker(admission.repository)
-    if current_marker is None or canonical_json(current_marker) != admission.cutover_document:
+    if (
+        current_marker is None
+        or canonical_json(current_marker) != admission.cutover_document
+    ):
         raise RuntimeStateError("cutover marker changed after startup diagnostics")
     if hashlib.sha256(admission.policy.content).hexdigest() != admission.policy.digest:
         raise RuntimeStateError("retained canonical policy content is invalid")
@@ -213,19 +259,21 @@ def _validate_writer_admission(
         active_version = manifest_version(admission.plugin_root)
         minimum_version = str(marker["minimum_orka_version"])
         if release_version(active_version) < release_version(minimum_version):
-            raise RuntimeStateError("minimum Orka version changed after startup diagnostics")
+            raise RuntimeStateError(
+                "minimum Orka version changed after startup diagnostics"
+            )
     except (KeyError, OSError, TypeError, ValueError) as exc:
         raise RuntimeStateError("minimum Orka version is invalid") from exc
 
     database.execute("BEGIN")
     try:
-        if [str(row[0]) for row in database.execute("PRAGMA quick_check(1)")] != [
-            "ok"
-        ]:
-            raise RuntimeStateError("SQLite quick check changed after startup diagnostics")
+        if [str(row[0]) for row in database.execute("PRAGMA quick_check(1)")] != ["ok"]:
+            raise RuntimeStateError(
+                "SQLite quick check changed after startup diagnostics"
+            )
         if list(database.execute("PRAGMA foreign_key_check")):
             raise RuntimeStateError("foreign keys changed after startup diagnostics")
-        if _schema_digest(database) != _expected_schema_digest():
+        if _schema_digest(database) != _expected_schema_digest(specifications):
             raise RuntimeStateError("schema changed after startup diagnostics")
         migrations = [
             [int(row[0]), str(row[1]), str(row[2])]
@@ -236,16 +284,19 @@ def _validate_writer_admission(
         metadata = database.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()
-        if migrations != _expected_migrations() or metadata != (str(SCHEMA_VERSION),):
-            raise RuntimeStateError("migration ledger changed after startup diagnostics")
-        repositories = database.execute(
-            """
+        expected_version = specifications[-1][0]
+        if migrations != _expected_migrations(specifications) or metadata != (
+            str(expected_version),
+        ):
+            raise RuntimeStateError(
+                "migration ledger changed after startup diagnostics"
+            )
+        repositories = database.execute("""
             SELECT repository_id, common_directory, object_directory_id,
                    policy_ref, policy_path, policy_commit, policy_blob,
                    policy_digest, created_at
             FROM repositories
-            """
-        ).fetchall()
+            """).fetchall()
         expected_repository = [
             identity["repository_uuid"],
             identity["common_directory"],
@@ -260,14 +311,14 @@ def _validate_writer_admission(
         if len(repositories) != 1 or list(map(str, repositories[0])) != list(
             map(str, expected_repository)
         ):
-            raise RuntimeStateError("repository authority changed after startup diagnostics")
-        cutovers = database.execute(
-            """
+            raise RuntimeStateError(
+                "repository authority changed after startup diagnostics"
+            )
+        cutovers = database.execute("""
             SELECT repository_id, activation_id, marker_digest,
                    minimum_version, legacy_snapshot_digest, state
             FROM runtime_cutovers
-            """
-        ).fetchall()
+            """).fetchall()
         expected_cutover = [
             identity["repository_uuid"],
             marker["activation_id"],
@@ -279,17 +330,21 @@ def _validate_writer_admission(
         if len(cutovers) != 1 or list(map(str, cutovers[0])) != list(
             map(str, expected_cutover)
         ):
-            raise RuntimeStateError("cutover authority changed after startup diagnostics")
+            raise RuntimeStateError(
+                "cutover authority changed after startup diagnostics"
+            )
     except (KeyError, sqlite3.Error) as exc:
         raise RuntimeStateError("startup authority cannot be revalidated") from exc
     finally:
         database.rollback()
 
 
-def _expected_schema_digest() -> str:
+def _expected_schema_digest(
+    specifications: tuple[tuple[int, str, Path], ...] = MIGRATIONS,
+) -> str:
     reference = sqlite3.connect(":memory:")
     try:
-        for _version, _migration_id, path in MIGRATIONS:
+        for _version, _migration_id, path in specifications:
             reference.executescript(path.read_text(encoding="utf-8"))
         return _schema_digest(reference)
     finally:
@@ -306,10 +361,12 @@ def _schema_digest(database: sqlite3.Connection) -> str:
     return _digest([list(map(str, row)) for row in rows])
 
 
-def _expected_migrations() -> list[list[Any]]:
+def _expected_migrations(
+    specifications: tuple[tuple[int, str, Path], ...] = MIGRATIONS,
+) -> list[list[Any]]:
     return [
         [version, migration_id, hashlib.sha256(path.read_bytes()).hexdigest()]
-        for version, migration_id, path in MIGRATIONS
+        for version, migration_id, path in specifications
     ]
 
 
@@ -448,11 +505,13 @@ def _legacy_admission(repository: Path) -> StartupAdmission:
 def _receipt(mode: str, checks: Mapping[str, dict[str, Any]]) -> dict[str, Any]:
     ordered = [checks[check_id] for check_id in CHECK_ORDER]
     failed = [item["reason_code"] for item in ordered if item["status"] == "fail"]
+    upgrade_required = any(item["status"] == "upgrade_required" for item in ordered)
     receipt: dict[str, Any] = {
         "contract_id": CONTRACT_ID,
         "schema_version": CONTRACT_SCHEMA_VERSION,
         "mode": mode,
-        "healthy": not failed,
+        "healthy": not failed and not upgrade_required,
+        "upgrade_required": upgrade_required and not failed,
         "checks": ordered,
         "failure_reason_codes": failed,
         "operator_next_actions": [NEXT_ACTIONS[code] for code in failed],
@@ -560,19 +619,25 @@ def prepare_startup_admission(
 
     if not database_path.is_file() or database_path.is_symlink():
         checks["quick_check"] = _check("quick_check", "fail", "database_unavailable")
-        return StartupAdmission(receipt=_receipt("transactional", checks), policy=policy)
+        return StartupAdmission(
+            receipt=_receipt("transactional", checks), policy=policy
+        )
 
     try:
         checked_database_identity = _database_identity(database_path)
     except OSError:
         checks["quick_check"] = _check("quick_check", "fail", "database_unavailable")
-        return StartupAdmission(receipt=_receipt("transactional", checks), policy=policy)
+        return StartupAdmission(
+            receipt=_receipt("transactional", checks), policy=policy
+        )
 
     try:
         database = connection_factory(database_path)
     except (OSError, sqlite3.Error):
         checks["quick_check"] = _check("quick_check", "fail", "database_unavailable")
-        return StartupAdmission(receipt=_receipt("transactional", checks), policy=policy)
+        return StartupAdmission(
+            receipt=_receipt("transactional", checks), policy=policy
+        )
 
     try:
         database.execute("BEGIN")
@@ -601,14 +666,29 @@ def prepare_startup_admission(
         try:
             observed_schema = _schema_digest(database)
             expected_schema = _expected_schema_digest()
+            prior_schema = _expected_schema_digest(MIGRATIONS[:-1])
+            schema_current = observed_schema == expected_schema
+            schema_prior = observed_schema == prior_schema
             checks["schema"] = _check(
                 "schema",
-                "pass" if observed_schema == expected_schema else "fail",
-                "ok" if observed_schema == expected_schema else "schema_mismatch",
+                (
+                    "pass"
+                    if schema_current
+                    else "upgrade_required" if schema_prior else "fail"
+                ),
+                (
+                    "ok"
+                    if schema_current
+                    else (
+                        "schema_upgrade_required" if schema_prior else "schema_mismatch"
+                    )
+                ),
                 {
                     "expected_digest": expected_schema,
                     "observed_digest": observed_schema,
-                    "schema_version": SCHEMA_VERSION,
+                    "schema_version": (
+                        SCHEMA_VERSION if schema_current else SCHEMA_VERSION - 1
+                    ),
                 },
             )
         except (OSError, sqlite3.Error):
@@ -624,11 +704,23 @@ def prepare_startup_admission(
                 "SELECT value FROM metadata WHERE key = 'schema_version'"
             ).fetchone()
             expected = _expected_migrations()
+            expected_prior = _expected_migrations(MIGRATIONS[:-1])
             matches = migrations == expected and metadata == (str(SCHEMA_VERSION),)
+            matches_prior = migrations == expected_prior and metadata == (
+                str(SCHEMA_VERSION - 1),
+            )
             checks["migration_ledger"] = _check(
                 "migration_ledger",
-                "pass" if matches else "fail",
-                "ok" if matches else "migration_ledger_mismatch",
+                "pass" if matches else "upgrade_required" if matches_prior else "fail",
+                (
+                    "ok"
+                    if matches
+                    else (
+                        "schema_upgrade_required"
+                        if matches_prior
+                        else "migration_ledger_mismatch"
+                    )
+                ),
                 {
                     "expected_digest": _digest(expected),
                     "observed_digest": _digest(migrations),
@@ -731,18 +823,21 @@ def prepare_startup_admission(
     except OSError:
         checks["quick_check"] = _check("quick_check", "fail", "database_unavailable")
     receipt = _receipt("transactional", checks)
+    retained_authority = bool(receipt["healthy"] or receipt["upgrade_required"])
     return StartupAdmission(
         receipt=receipt,
         policy=policy,
-        database_path=database_path if receipt["healthy"] else None,
-        database_identity=checked_database_identity if receipt["healthy"] else None,
-        repository=repository if receipt["healthy"] else None,
-        plugin_root=root if receipt["healthy"] else None,
+        database_path=database_path if retained_authority else None,
+        database_identity=checked_database_identity if retained_authority else None,
+        repository=repository if retained_authority else None,
+        plugin_root=root if retained_authority else None,
         identity_document=(
-            canonical_json(identity) if receipt["healthy"] and identity is not None else ""
+            canonical_json(identity)
+            if retained_authority and identity is not None
+            else ""
         ),
         cutover_document=(
-            canonical_json(marker) if receipt["healthy"] and marker is not None else ""
+            canonical_json(marker) if retained_authority and marker is not None else ""
         ),
     )
 

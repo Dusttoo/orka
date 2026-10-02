@@ -719,7 +719,9 @@ class CurrentRouteExecutionBackend:
         offer = self.adapter.phase_capability_offer(self.phase_contract)
         profile = str(offer.get("adapter") or "")
         if profile not in {"codex-desktop", "claude-desktop", "api"}:
-            raise BackendContractError("current route has no supported execution profile")
+            raise BackendContractError(
+                "current route has no supported execution profile"
+            )
         self.profile = profile
         return profile
 
@@ -732,8 +734,13 @@ class CurrentRouteExecutionBackend:
             "protocol_version": 1,
             "test_only": False,
             "lifecycle": [
-                "launch", "attach", "heartbeat", "progress", "cancel",
-                "inspect", "terminal",
+                "launch",
+                "attach",
+                "heartbeat",
+                "progress",
+                "cancel",
+                "inspect",
+                "terminal",
             ],
             "containment": {
                 "process": "shared-host" if desktop else "isolated-process",
@@ -818,9 +825,7 @@ class CurrentRouteExecutionBackend:
             raise BackendContractError("launch receipt has no worker identity")
         return identity
 
-    def attach(
-        self, binding: dict[str, str], launch: dict[str, Any]
-    ) -> dict[str, Any]:
+    def attach(self, binding: dict[str, str], launch: dict[str, Any]) -> dict[str, Any]:
         return self._event(
             binding,
             launch,
@@ -908,7 +913,9 @@ class CurrentRouteExecutionBackend:
             # inferring liveness from the absence of absence evidence.
             return self._event(binding, launch, "unknown")
         try:
-            tombstone = json.loads(_regular_private_file(tombstone_path, "execution tombstone"))
+            tombstone = json.loads(
+                _regular_private_file(tombstone_path, "execution tombstone")
+            )
         except (DispatchError, json.JSONDecodeError):
             return self._event(binding, launch, "unknown")
         if (
@@ -998,9 +1005,11 @@ class SupervisorDispatcher:
             )
         except BreakerRuntimeError as exc:
             raise DispatchError(str(exc)) from exc
-        repository_id = repository_id or "repository:" + hashlib.sha256(
-            str(self.repository).encode("utf-8")
-        ).hexdigest()
+        repository_id = (
+            repository_id
+            or "repository:"
+            + hashlib.sha256(str(self.repository).encode("utf-8")).hexdigest()
+        )
         try:
             self.phase_runtime = PhaseExecutionRuntime(
                 PHASE_CONTRACT,
@@ -1016,7 +1025,9 @@ class SupervisorDispatcher:
                 EXECUTION_BACKEND_CONTRACT
             )
         except Exception as exc:
-            raise DispatchError(f"cannot load execution-backend contract: {exc}") from exc
+            raise DispatchError(
+                f"cannot load execution-backend contract: {exc}"
+            ) from exc
         self.backend_state = (
             TransactionalBackendState(event_store, writer_identity=writer_identity)
             if event_store is not None and writer_identity
@@ -1052,8 +1063,13 @@ class SupervisorDispatcher:
             coordinator.negotiate(
                 required={
                     "lifecycle": [
-                        "launch", "attach", "heartbeat", "progress", "cancel",
-                        "inspect", "terminal",
+                        "launch",
+                        "attach",
+                        "heartbeat",
+                        "progress",
+                        "cancel",
+                        "inspect",
+                        "terminal",
                     ],
                     "containment": {"filesystem": "worktree"},
                 }
@@ -1090,6 +1106,50 @@ class SupervisorDispatcher:
         except BackendContractError as exc:
             raise DispatchError(f"execution backend restore failed: {exc}") from exc
         return backend, coordinator, identity
+
+    def _legacy_phase_execution(self, job: dict[str, Any]) -> bool:
+        """Recognize only the adjacent pre-backend in-flight job shape.
+
+        New jobs always contain ``execution_backend`` before reservation is
+        returned to the supervisor. Its absence, together with an attached v1
+        phase execution, is the bounded 1.8.33 compatibility boundary. No
+        backend receipt is synthesized for this path.
+        """
+
+        if "execution_backend" in job:
+            return False
+        state = job.get("phase_execution")
+        execution_identity = job.get("execution_identity")
+        if (
+            not isinstance(state, dict)
+            or state.get("schema_version") != "orka.phase-execution-state/v1"
+            or state.get("status") != "running"
+            or not isinstance(state.get("active"), dict)
+            or not isinstance(execution_identity, dict)
+            or not execution_identity.get("invocation_id")
+        ):
+            return False
+        active_identity = state["active"].get("identity")
+        attachment = state["active"].get("attachment")
+        if not isinstance(active_identity, dict) or not isinstance(attachment, dict):
+            return False
+        attached_phase_identity = attachment.get("identity")
+        attached_identity = attachment.get("adapter_execution_identity")
+        if (
+            attached_phase_identity != active_identity
+            or not isinstance(attached_identity, dict)
+            or attached_identity != execution_identity
+        ):
+            return False
+        if self.backend_state is not None:
+            binding = {
+                field: active_identity.get(field)
+                for field in self.execution_backend_contract["identity_fields"]
+            }
+            if all(isinstance(value, str) and value for value in binding.values()):
+                if self.backend_state.load(binding) is not None:
+                    return False
+        return True
 
     def _worker_transition(self, outcome: str) -> tuple[str, str]:
         event = (self.contract.get("worker_terminal_results") or {}).get(outcome)
@@ -1143,7 +1203,10 @@ class SupervisorDispatcher:
             if (
                 not isinstance(dependencies, list)
                 or not dependencies
-                or any(not isinstance(item, str) or not KEY.fullmatch(item) for item in dependencies)
+                or any(
+                    not isinstance(item, str) or not KEY.fullmatch(item)
+                    for item in dependencies
+                )
                 or len(set(dependencies)) != len(dependencies)
                 or not isinstance(receipt.get("receipt"), str)
                 or not receipt["receipt"].strip()
@@ -1159,7 +1222,11 @@ class SupervisorDispatcher:
             if supplied.get("decision_class") not in allowed:
                 raise DispatchError("operator decision class is not allowed")
             question = supplied.get("decision_question")
-            if not isinstance(question, str) or not question.strip() or len(question) > 2000:
+            if (
+                not isinstance(question, str)
+                or not question.strip()
+                or len(question) > 2000
+            ):
                 raise DispatchError("operator decision question is invalid")
         definition = (self.contract.get("events") or {}).get(event) or {}
         required = list(definition.get("required_evidence") or [])
@@ -1190,7 +1257,9 @@ class SupervisorDispatcher:
         try:
             route = llm_route_from_config(config, "sprint-worker")
         except Exception as exc:
-            raise DispatchError(f"cannot resolve sprint-worker resource route: {exc}") from exc
+            raise DispatchError(
+                f"cannot resolve sprint-worker resource route: {exc}"
+            ) from exc
         identity = {
             key: route.get(key)
             for key in ("execution", "provider", "model", "desktop_client")
@@ -1268,9 +1337,7 @@ class SupervisorDispatcher:
             "evidence": dict(result.get("evidence") or {}),
         }
 
-    def _phase_runtime_for_state(
-        self, state: dict[str, Any]
-    ) -> PhaseExecutionRuntime:
+    def _phase_runtime_for_state(self, state: dict[str, Any]) -> PhaseExecutionRuntime:
         """Use the dispatch's persisted fence after an authenticated takeover."""
 
         fence = str(state.get("supervisor_fence") or "")
@@ -1321,9 +1388,7 @@ class SupervisorDispatcher:
         if not KEY.fullmatch(ticket):
             raise DispatchError("controller plan returned an invalid ticket key")
         if resource_claims is None:
-            resource_claims = self.resource_claims(
-                ticket, capacity=1, heavy_capacity=1
-            )
+            resource_claims = self.resource_claims(ticket, capacity=1, heavy_capacity=1)
         try:
             resource_claims = normalize_claims(resource_claims)
             resource_claim_digest = claim_set_digest(resource_claims)
@@ -1404,9 +1469,7 @@ class SupervisorDispatcher:
                 result_path=paths["result"],
             )
             binding = phase_record["identity"]
-            launch_receipt = backend_coordinator.launch(
-                binding, phase_record["job"]
-            )
+            launch_receipt = backend_coordinator.launch(binding, phase_record["job"])
             attached = backend_coordinator.attach(binding)
             job["execution_backend"] = {
                 "binding": binding,
@@ -1472,33 +1535,39 @@ class SupervisorDispatcher:
             phase_state = job.get("phase_execution")
             if isinstance(phase_state, dict):
                 try:
-                    _backend, backend_coordinator, binding = (
-                        self._restore_execution_backend(job)
-                    )
-                    backend_terminal = backend_coordinator.terminal(binding)
-                    backend_result = backend_terminal.get("terminal_result")
-                    if not isinstance(backend_result, dict) or any(
-                        backend_result.get(field) != result.get(field)
-                        for field in (
-                            "schema_version",
-                            "ticket",
-                            "sprint",
-                            "attempt_token",
-                            "invocation_id",
-                            "outcome",
-                            "summary",
-                            "branch",
-                            "worktree",
-                            "pr",
+                    if self._legacy_phase_execution(job):
+                        self._phase_runtime_for_state(phase_state).ingest(
+                            phase_state,
+                            self._phase_terminal_envelope(job, result),
                         )
-                    ):
-                        raise DispatchError(
-                            "execution backend terminal result differs from supervisor evidence"
+                    else:
+                        _backend, backend_coordinator, binding = (
+                            self._restore_execution_backend(job)
                         )
-                    self._phase_runtime_for_state(phase_state).ingest(
-                        phase_state,
-                        backend_terminal["terminal_envelope"],
-                    )
+                        backend_terminal = backend_coordinator.terminal(binding)
+                        backend_result = backend_terminal.get("terminal_result")
+                        if not isinstance(backend_result, dict) or any(
+                            backend_result.get(field) != result.get(field)
+                            for field in (
+                                "schema_version",
+                                "ticket",
+                                "sprint",
+                                "attempt_token",
+                                "invocation_id",
+                                "outcome",
+                                "summary",
+                                "branch",
+                                "worktree",
+                                "pr",
+                            )
+                        ):
+                            raise DispatchError(
+                                "execution backend terminal result differs from supervisor evidence"
+                            )
+                        self._phase_runtime_for_state(phase_state).ingest(
+                            phase_state,
+                            backend_terminal["terminal_envelope"],
+                        )
                 except (PhaseExecutionError, BackendContractError) as exc:
                     raise DispatchError(f"phase terminal rejected: {exc}") from exc
             controller = self.adapter.finish(job["sprint"], job["ticket"], result)
@@ -1659,9 +1728,7 @@ class SupervisorDispatcher:
             if not isinstance(retry_at, (int, float)) or retry_at > current_time:
                 continue
             try:
-                self.adapter.requeue(
-                    job["sprint"], job, "supervisor cooldown elapsed"
-                )
+                self.adapter.requeue(job["sprint"], job, "supervisor cooldown elapsed")
             except DispatchError as exc:
                 self.last_errors.append({"ticket": job["ticket"], "error": str(exc)})
                 # Avoid a tight supervisor loop when the stopped-worker proof
@@ -1731,6 +1798,21 @@ class SupervisorDispatcher:
         return prepared
 
     def execution_terminal(self, job: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+        if self._legacy_phase_execution(job):
+            identity = job.get("execution_identity") or {}
+            path = Path(str(identity.get("tombstone_path") or ""))
+            if not path.is_file():
+                return False, {}
+            value = json.loads(_regular_private_file(path, "execution tombstone"))
+            if (
+                not isinstance(value, dict)
+                or value.get("phase") != "terminal"
+                or value.get("invocation_id") != identity.get("invocation_id")
+            ):
+                raise DispatchError(
+                    "legacy execution tombstone does not match the attached worker"
+                )
+            return True, value
         observation = self.observe_execution(job)
         return observation.get("status") in {"absent", "terminal"}, observation
 
@@ -1739,7 +1821,9 @@ class SupervisorDispatcher:
         if not terminal:
             return None
         if Path(job["paths"]["result"]).is_file():
-            if tombstone.get("status") == "absent":
+            if tombstone.get("status") == "absent" and not self._legacy_phase_execution(
+                job
+            ):
                 self._fence_exited_execution(
                     job,
                     reason="execution exited with an invalid structured terminal result",
@@ -1747,9 +1831,10 @@ class SupervisorDispatcher:
             return self.apply_terminal(job)
         if job.get("terminal"):
             return {"applied": False, "duplicate": True, "terminal": job["terminal"]}
-        self._fence_exited_execution(
-            job, reason="execution exited without a structured terminal result"
-        )
+        if not self._legacy_phase_execution(job):
+            self._fence_exited_execution(
+                job, reason="execution exited without a structured terminal result"
+            )
         raw = json.dumps(tombstone, sort_keys=True, separators=(",", ":")).encode()
         digest = hashlib.sha256(raw).hexdigest()
         result = {

@@ -234,8 +234,7 @@ class BackendCoordinator:
                 )
         provider_capabilities = offer.get("provider_capabilities")
         if not isinstance(provider_capabilities, list) or any(
-            not isinstance(value, str) or not value
-            for value in provider_capabilities
+            not isinstance(value, str) or not value for value in provider_capabilities
         ):
             raise BackendContractError("provider capabilities must be a string array")
 
@@ -260,7 +259,9 @@ class BackendCoordinator:
 
     def _require_negotiated(self) -> None:
         if not self.offer:
-            raise BackendContractError("backend capabilities must be negotiated before launch")
+            raise BackendContractError(
+                "backend capabilities must be negotiated before launch"
+            )
 
     def _validate_envelope(
         self, binding: dict[str, str], envelope: dict[str, Any]
@@ -269,7 +270,9 @@ class BackendCoordinator:
             raise BackendContractError("launch requires a phase-worker job envelope")
         ticket_id = envelope.get("ticket_id")
         if not isinstance(ticket_id, str) or not ticket_id:
-            raise BackendContractError("phase job invalid: job is missing required field ticket_id")
+            raise BackendContractError(
+                "phase job invalid: job is missing required field ticket_id"
+            )
         identity = {**binding, "ticket_id": ticket_id}
         try:
             validate_phase_envelope(
@@ -300,7 +303,9 @@ class BackendCoordinator:
             if not isinstance(receipt.get(field), str) or not receipt[field]:
                 raise BackendContractError(f"backend launch receipt requires {field}")
         if receipt.get("envelope_digest") != envelope_digest:
-            raise BackendContractError("launch receipt does not bind the phase envelope")
+            raise BackendContractError(
+                "launch receipt does not bind the phase envelope"
+            )
         expected = _launch_receipt_digest(
             binding,
             backend_instance_id=receipt["backend_instance_id"],
@@ -323,7 +328,9 @@ class BackendCoordinator:
         logical = self._logical_key(binding)
         for record in self._active.values():
             if record["logical_key"] == logical and not record["fenced"]:
-                raise BackendContractError("logical phase already has an active execution")
+                raise BackendContractError(
+                    "logical phase already has an active execution"
+                )
         key = self._execution_key(binding)
         if key in self._launched_keys:
             raise BackendContractError(
@@ -384,7 +391,9 @@ class BackendCoordinator:
         self._require_negotiated()
         binding = self._binding(binding_value)
         phase_identity = self._validate_envelope(binding, envelope)
-        persisted = self.state_store.load(binding) if self.state_store is not None else None
+        persisted = (
+            self.state_store.load(binding) if self.state_store is not None else None
+        )
         persisted_terminal: dict[str, Any] | None = None
         if persisted is not None:
             if persisted.get("state") in {"fenced", "uncertain"}:
@@ -392,7 +401,9 @@ class BackendCoordinator:
                     f"execution backend record is not active: {persisted.get('state')}"
                 )
             if persisted.get("backend_id") != self.offer.get("backend_id"):
-                raise BackendContractError("execution backend identity changed after launch")
+                raise BackendContractError(
+                    "execution backend identity changed after launch"
+                )
             launch_receipt = persisted.get("launch_receipt")
             if persisted.get("state") == "terminal":
                 persisted_terminal = persisted.get("terminal_receipt")
@@ -416,9 +427,7 @@ class BackendCoordinator:
         }
         if persisted_terminal is not None:
             self._validate_receipt(persisted_terminal, binding, "terminal")
-            self._validate_terminal_evidence(
-                persisted_terminal, self._active[key]
-            )
+            self._validate_terminal_evidence(persisted_terminal, self._active[key])
             self._terminal.add(key)
         return copy.deepcopy(receipt)
 
@@ -434,7 +443,9 @@ class BackendCoordinator:
             or key in self._fenced
             or (key in self._terminal and not allow_terminal)
         ):
-            raise BackendContractError("stale or fenced execution cannot report activity")
+            raise BackendContractError(
+                "stale or fenced execution cannot report activity"
+            )
         return binding, record
 
     def attach(self, binding_value: dict[str, Any]) -> dict[str, Any]:
@@ -487,7 +498,9 @@ class BackendCoordinator:
         self, result: dict[str, Any], record: dict[str, Any]
     ) -> None:
         if result.get("status") != "terminal":
-            raise BackendContractError("terminal evidence invalid: status is not terminal")
+            raise BackendContractError(
+                "terminal evidence invalid: status is not terminal"
+            )
         envelope = result.get("terminal_envelope")
         try:
             validate_phase_envelope(
@@ -498,10 +511,20 @@ class BackendCoordinator:
         except (PhaseContractError, TypeError) as exc:
             raise BackendContractError(f"terminal evidence invalid: {exc}") from exc
         if envelope.get("kind") != "terminal":
-            raise BackendContractError("terminal evidence invalid: expected terminal envelope")
+            raise BackendContractError(
+                "terminal evidence invalid: expected terminal envelope"
+            )
 
     def inspect(self, binding_value: dict[str, Any]) -> dict[str, Any]:
         binding, record = self._record(binding_value, allow_terminal=True)
+        persisted_terminal = record.get("persisted_terminal")
+        if isinstance(persisted_terminal, dict):
+            # Terminal evidence is immutable authority. A restart must replay
+            # it directly rather than asking the process adapter to observe a
+            # state that can no longer transition back to attached.
+            result = copy.deepcopy(persisted_terminal)
+            result["replacement_safe"] = True
+            return result
         result = self._validate_receipt(
             self.backend.inspect(binding, record["launch"]), binding, "inspection"
         )
@@ -510,14 +533,20 @@ class BackendCoordinator:
             result = {
                 **result,
                 "status": "unknown",
-                "reason": "inspection_timeout" if status == "timeout" else "inspection_permission_denied",
+                "reason": (
+                    "inspection_timeout"
+                    if status == "timeout"
+                    else "inspection_permission_denied"
+                ),
             }
             status = "unknown"
         if status not in self.contract["inspection"]["statuses"]:
-            raise BackendContractError("backend inspection returned an unsupported status")
-        result["replacement_safe"] = status in self.contract["inspection"][
-            "replacement_safe_statuses"
-        ]
+            raise BackendContractError(
+                "backend inspection returned an unsupported status"
+            )
+        result["replacement_safe"] = (
+            status in self.contract["inspection"]["replacement_safe_statuses"]
+        )
         if status == "absent":
             absence = result.get("absence_receipt")
             required = self.contract["inspection"]["absence_requires"]
@@ -525,14 +554,18 @@ class BackendCoordinator:
                 not isinstance(absence.get(field), str) or not absence[field]
                 for field in required
             ):
-                raise BackendContractError("absence requires a mechanical identity receipt")
+                raise BackendContractError(
+                    "absence requires a mechanical identity receipt"
+                )
             launch = record["launch"]
             if (
                 absence["backend_instance_id"] != launch["backend_instance_id"]
                 or absence["backend_handle"] != launch["backend_handle"]
                 or absence["original_process_identity"] != launch["process_identity"]
             ):
-                raise BackendContractError("absence receipt does not bind the original process")
+                raise BackendContractError(
+                    "absence receipt does not bind the original process"
+                )
         elif status == "terminal":
             try:
                 self._validate_terminal_evidence(result, record)
@@ -606,7 +639,13 @@ class BackendCoordinator:
             if (
                 result.get("cancellation_receipt") != expected_receipt
                 or not callable(verifier)
-                or verifier(binding, record["launch"], request, acknowledgement, expected_receipt)
+                or verifier(
+                    binding,
+                    record["launch"],
+                    request,
+                    acknowledgement,
+                    expected_receipt,
+                )
                 is not True
             ):
                 raise BackendContractError(
@@ -618,7 +657,9 @@ class BackendCoordinator:
                 binding, reason="backend acknowledged cancellation"
             )
         elif status not in self.contract["cancellation"]["unsafe_results"]:
-            raise BackendContractError("backend cancellation returned an unsupported status")
+            raise BackendContractError(
+                "backend cancellation returned an unsupported status"
+            )
         result["replacement_safe"] = status == "acknowledged"
         if self.state_store is not None and status != "acknowledged":
             self.state_store.record(binding, "cancel", result, "cancelling")
@@ -639,7 +680,11 @@ class BackendCoordinator:
             "replacement_safe": True,
             "binding": copy.deepcopy(binding),
             "fence_receipt": _digest(
-                {"binding": binding, "reason": reason.strip(), "launch": record["launch"]}
+                {
+                    "binding": binding,
+                    "reason": reason.strip(),
+                    "launch": record["launch"],
+                }
             ),
         }
         if self.state_store is not None:
@@ -682,7 +727,12 @@ class DeterministicFakeBackend:
             "protocol_version": 1,
             "test_only": True,
             "lifecycle": [
-                "launch", "attach", "heartbeat", "progress", "cancel", "inspect",
+                "launch",
+                "attach",
+                "heartbeat",
+                "progress",
+                "cancel",
+                "inspect",
                 "terminal",
             ],
             "containment": copy.deepcopy(self.containment),
@@ -734,17 +784,25 @@ class DeterministicFakeBackend:
             "binding": copy.deepcopy(binding),
             "backend_handle": launch["backend_handle"],
             "evidence_receipt": _digest(
-                {"binding": binding, "handle": launch["backend_handle"], "status": status}
+                {
+                    "binding": binding,
+                    "handle": launch["backend_handle"],
+                    "status": status,
+                }
             ),
         }
 
     def attach(self, binding: dict[str, str], launch: dict[str, Any]) -> dict[str, Any]:
         return self._event(binding, launch, "attached")
 
-    def heartbeat(self, binding: dict[str, str], launch: dict[str, Any]) -> dict[str, Any]:
+    def heartbeat(
+        self, binding: dict[str, str], launch: dict[str, Any]
+    ) -> dict[str, Any]:
         return self._event(binding, launch, "heartbeat")
 
-    def progress(self, binding: dict[str, str], launch: dict[str, Any]) -> dict[str, Any]:
+    def progress(
+        self, binding: dict[str, str], launch: dict[str, Any]
+    ) -> dict[str, Any]:
         return self._event(binding, launch, "progress")
 
     def _terminal_envelope(
@@ -765,7 +823,9 @@ class DeterministicFakeBackend:
             result["execution_unit_id"] = "another-execution"
         return result
 
-    def terminal(self, binding: dict[str, str], launch: dict[str, Any]) -> dict[str, Any]:
+    def terminal(
+        self, binding: dict[str, str], launch: dict[str, Any]
+    ) -> dict[str, Any]:
         result = self._event(binding, launch, "terminal")
         result["terminal_envelope"] = self._terminal_envelope(binding, launch)
         return result
@@ -780,8 +840,13 @@ class DeterministicFakeBackend:
                 **{
                     field: request[field]
                     for field in (
-                        "job_id", "ticket_id", "phase", "attempt_token",
-                        "supervisor_fence", "dispatch_id", "execution_unit_id",
+                        "job_id",
+                        "ticket_id",
+                        "phase",
+                        "attempt_token",
+                        "supervisor_fence",
+                        "dispatch_id",
+                        "execution_unit_id",
                     )
                 },
                 "kind": "cancellation_ack",
@@ -815,7 +880,9 @@ class DeterministicFakeBackend:
             binding, launch, request, acknowledgement
         )
 
-    def inspect(self, binding: dict[str, str], launch: dict[str, Any]) -> dict[str, Any]:
+    def inspect(
+        self, binding: dict[str, str], launch: dict[str, Any]
+    ) -> dict[str, Any]:
         self.inspect_count += 1
         record = self.records[launch["backend_handle"]]
         if record["current_process_identity"] != record["original_process_identity"]:

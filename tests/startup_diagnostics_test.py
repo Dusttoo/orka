@@ -158,6 +158,22 @@ class StartupDiagnosticTests(unittest.TestCase):
         finally:
             database.close()
 
+    @staticmethod
+    def downgrade_database_to_v3(repository: Path) -> None:
+        """Recreate the exact adjacent 1.8.33 event-store boundary."""
+
+        database = sqlite3.connect(StartupDiagnosticTests.database(repository))
+        try:
+            database.executescript("""
+                DROP INDEX execution_backends_attempt;
+                DROP TABLE execution_backends;
+                DELETE FROM schema_migrations WHERE version = 4;
+                UPDATE metadata SET value = '3' WHERE key = 'schema_version';
+                """)
+            database.commit()
+        finally:
+            database.close()
+
     def test_legacy_receipt_is_healthy_and_preserves_1x_state(self) -> None:
         repository = self.repository("legacy", cutover=False)
         before = {
@@ -179,7 +195,9 @@ class StartupDiagnosticTests(unittest.TestCase):
         self.assertEqual(before, after)
         self.assertEqual([item["id"] for item in first["checks"]], list(CHECK_ORDER))
 
-    def test_initialized_pre_cutover_is_deterministic_read_only_and_healthy(self) -> None:
+    def test_initialized_pre_cutover_is_deterministic_read_only_and_healthy(
+        self,
+    ) -> None:
         repository = self.repository("initialized-pre-cutover", cutover=False)
         initialize_repository_identity(
             repository,
@@ -285,6 +303,71 @@ class StartupDiagnosticTests(unittest.TestCase):
             )
         finally:
             command("stop", "--request-id", "diagnostic-test-cleanup")
+
+    def test_supervisor_upgrades_reviewed_v3_store_before_admission(self) -> None:
+        repository = self.repository("supervisor-v3-upgrade")
+        self.downgrade_database_to_v3(repository)
+        before = self.runtime_snapshot(repository)
+
+        admission = prepare_startup_admission(repository, plugin_root=ROOT)
+
+        self.assertFalse(admission.receipt["healthy"])
+        self.assertTrue(admission.receipt["upgrade_required"])
+        self.assertEqual(
+            self.check(admission.receipt, "schema")["status"], "upgrade_required"
+        )
+        self.assertEqual(
+            self.check(admission.receipt, "migration_ledger")["status"],
+            "upgrade_required",
+        )
+        self.assertEqual(before, self.runtime_snapshot(repository))
+
+        result = subprocess.run(
+            [sys.executable, str(SUPERVISOR), "start", "--repo", str(repository)],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        started = json.loads(result.stdout)
+        try:
+            self.assertTrue(started["startup_diagnostic"]["healthy"])
+            self.assertFalse(started["startup_diagnostic"]["upgrade_required"])
+            self.assertEqual(
+                started["startup_diagnostic"]["upgraded_from_schema_version"], 3
+            )
+            database = sqlite3.connect(self.database(repository))
+            try:
+                self.assertEqual(
+                    database.execute(
+                        "SELECT value FROM metadata WHERE key = 'schema_version'"
+                    ).fetchone(),
+                    ("4",),
+                )
+                self.assertEqual(
+                    database.execute(
+                        "SELECT version FROM schema_migrations ORDER BY version"
+                    ).fetchall(),
+                    [(1,), (2,), (3,), (4,)],
+                )
+            finally:
+                database.close()
+        finally:
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(SUPERVISOR),
+                    "stop",
+                    "--repo",
+                    str(repository),
+                    "--request-id",
+                    "v3-upgrade-cleanup",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
 
     def test_each_fault_has_a_stable_blocking_reason(self) -> None:
         def bad_permissions(repository: Path) -> None:
@@ -565,16 +648,12 @@ class StartupDiagnosticTests(unittest.TestCase):
         database_path.parent.mkdir()
         lock = Path(f"{database_path}.writer.lock")
 
-        with TransactionalEventStore(
-            database_path, writer_identity="bootstrap:first"
-        ):
+        with TransactionalEventStore(database_path, writer_identity="bootstrap:first"):
             self.assertTrue(lock.is_file() and not lock.is_symlink())
             first = lock.stat()
             self.assertEqual(first.st_mode & 0o777, 0o600)
 
-        with TransactionalEventStore(
-            database_path, writer_identity="bootstrap:second"
-        ):
+        with TransactionalEventStore(database_path, writer_identity="bootstrap:second"):
             second = lock.stat()
 
         self.assertEqual((second.st_dev, second.st_ino), (first.st_dev, first.st_ino))
@@ -593,9 +672,7 @@ class StartupDiagnosticTests(unittest.TestCase):
         waiter: int | None = None
         opened_identity: tuple[int, int] | None = None
 
-        def fail_with_waiter(
-            database: sqlite3.Connection, checked_path: Path
-        ) -> None:
+        def fail_with_waiter(database: sqlite3.Connection, checked_path: Path) -> None:
             nonlocal waiter, opened_identity
             del database, checked_path
             flags = os.O_RDWR
@@ -632,7 +709,11 @@ class StartupDiagnosticTests(unittest.TestCase):
             self.assertEqual((current.st_dev, current.st_ino), opened_identity)
             runtime_after = self.runtime_artifact_snapshot(repository)
             self.assertEqual(
-                {key: value for key, value in runtime_after.items() if key != lock.name},
+                {
+                    key: value
+                    for key, value in runtime_after.items()
+                    if key != lock.name
+                },
                 runtime_before,
             )
             self.assertEqual(
@@ -664,7 +745,9 @@ class StartupDiagnosticTests(unittest.TestCase):
             hashlib.sha256(materialized.read_bytes()).hexdigest(), checked.digest
         )
 
-    def test_runtime_path_faults_are_distinct_sanitized_and_stop_admission(self) -> None:
+    def test_runtime_path_faults_are_distinct_sanitized_and_stop_admission(
+        self,
+    ) -> None:
         def chmod_path(path_getter: Callable[[Path], Path], mode: int) -> Callable:
             def mutate(repository: Path) -> Callable[[], None]:
                 path = path_getter(repository)
@@ -726,17 +809,72 @@ class StartupDiagnosticTests(unittest.TestCase):
         identity = lambda repo: root(repo) / "repository.json"
         marker = lambda repo: root(repo) / "cutover.json"
         cases = [
-            ("state-root-mode", chmod_path(root, 0o755), "runtime_permissions", "runtime_path_permissions_invalid"),
-            ("state-root-symlink", symlink_path(root), "runtime_permissions", "runtime_path_permissions_invalid"),
-            ("identity-mode", chmod_path(identity, 0o644), "repository_identity", "repository_identity_invalid"),
-            ("identity-symlink", symlink_path(identity), "repository_identity", "repository_identity_invalid"),
-            ("identity-malformed", malformed(identity), "repository_identity", "repository_identity_invalid"),
-            ("cutover-mode", chmod_path(marker, 0o644), "cutover", "cutover_marker_invalid"),
-            ("cutover-symlink", symlink_path(marker), "cutover", "cutover_marker_invalid"),
-            ("cutover-malformed", malformed(marker), "cutover", "cutover_marker_invalid"),
-            ("database-unavailable", unavailable_database, "quick_check", "database_unavailable"),
-            ("sidecar-mode", lambda repo: sidecar(repo, symlink=False), "runtime_permissions", "database_permissions_invalid"),
-            ("sidecar-symlink", lambda repo: sidecar(repo, symlink=True), "runtime_permissions", "database_permissions_invalid"),
+            (
+                "state-root-mode",
+                chmod_path(root, 0o755),
+                "runtime_permissions",
+                "runtime_path_permissions_invalid",
+            ),
+            (
+                "state-root-symlink",
+                symlink_path(root),
+                "runtime_permissions",
+                "runtime_path_permissions_invalid",
+            ),
+            (
+                "identity-mode",
+                chmod_path(identity, 0o644),
+                "repository_identity",
+                "repository_identity_invalid",
+            ),
+            (
+                "identity-symlink",
+                symlink_path(identity),
+                "repository_identity",
+                "repository_identity_invalid",
+            ),
+            (
+                "identity-malformed",
+                malformed(identity),
+                "repository_identity",
+                "repository_identity_invalid",
+            ),
+            (
+                "cutover-mode",
+                chmod_path(marker, 0o644),
+                "cutover",
+                "cutover_marker_invalid",
+            ),
+            (
+                "cutover-symlink",
+                symlink_path(marker),
+                "cutover",
+                "cutover_marker_invalid",
+            ),
+            (
+                "cutover-malformed",
+                malformed(marker),
+                "cutover",
+                "cutover_marker_invalid",
+            ),
+            (
+                "database-unavailable",
+                unavailable_database,
+                "quick_check",
+                "database_unavailable",
+            ),
+            (
+                "sidecar-mode",
+                lambda repo: sidecar(repo, symlink=False),
+                "runtime_permissions",
+                "database_permissions_invalid",
+            ),
+            (
+                "sidecar-symlink",
+                lambda repo: sidecar(repo, symlink=True),
+                "runtime_permissions",
+                "database_permissions_invalid",
+            ),
         ]
         for name, mutate, check_id, reason in cases:
             with self.subTest(name=name):
@@ -770,8 +908,13 @@ class StartupDiagnosticTests(unittest.TestCase):
                 self.assertFalse(response["startup_diagnostic"]["healthy"])
                 database = sqlite3.connect(self.database(repository))
                 try:
-                    self.assertEqual(database.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 0)
-                    self.assertEqual(database.execute("SELECT COUNT(*) FROM attempts").fetchone()[0], 0)
+                    self.assertEqual(
+                        database.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 0
+                    )
+                    self.assertEqual(
+                        database.execute("SELECT COUNT(*) FROM attempts").fetchone()[0],
+                        0,
+                    )
                 finally:
                     database.close()
 
@@ -791,10 +934,13 @@ class StartupDiagnosticTests(unittest.TestCase):
             path = repository_layout(repository).state_root / "cutover.json"
             marker = json.loads(path.read_text(encoding="utf-8"))
             marker["minimum_orka_version"] = "not-a-version"
-            material = {key: marker[key] for key in sorted(marker) if key != "activation_id"}
-            marker["activation_id"] = "cutover-" + hashlib.sha256(
-                canonical_json(material).encode("utf-8")
-            ).hexdigest()
+            material = {
+                key: marker[key] for key in sorted(marker) if key != "activation_id"
+            }
+            marker["activation_id"] = (
+                "cutover-"
+                + hashlib.sha256(canonical_json(material).encode("utf-8")).hexdigest()
+            )
             path.write_text(canonical_json(marker) + "\n", encoding="utf-8")
             self.update_database(
                 repository,
@@ -807,10 +953,25 @@ class StartupDiagnosticTests(unittest.TestCase):
             )
 
         cases = [
-            ("identity-invalid", invalid_identity, "repository_identity", "repository_identity_invalid"),
-            ("policy-invalid", invalid_policy, "canonical_policy", "canonical_policy_invalid"),
+            (
+                "identity-invalid",
+                invalid_identity,
+                "repository_identity",
+                "repository_identity_invalid",
+            ),
+            (
+                "policy-invalid",
+                invalid_policy,
+                "canonical_policy",
+                "canonical_policy_invalid",
+            ),
             ("cutover-invalid", invalid_cutover, "cutover", "cutover_marker_invalid"),
-            ("minimum-invalid", invalid_minimum, "minimum_version", "minimum_version_invalid"),
+            (
+                "minimum-invalid",
+                invalid_minimum,
+                "minimum_version",
+                "minimum_version_invalid",
+            ),
         ]
         for name, mutate, check_id, reason in cases:
             with self.subTest(name=name):

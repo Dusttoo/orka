@@ -21,7 +21,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
-
 SCHEMA_VERSION = 4
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 SCHEMA_PATH = Path(__file__).resolve().parents[1] / "contracts/event-store-v1.sql"
@@ -168,6 +167,9 @@ class TransactionalEventStore:
         schema_path: Path = SCHEMA_PATH,
         expected_database_identity: tuple[int, int] | None = None,
         startup_validator: Callable[[sqlite3.Connection, Path], None] | None = None,
+        post_migration_validator: (
+            Callable[[sqlite3.Connection, Path], None] | None
+        ) = None,
         require_existing_lock: bool = False,
     ) -> None:
         if not writer_identity.strip():
@@ -208,6 +210,13 @@ class TransactionalEventStore:
                 local_filesystem=local_filesystem
             )
             self._apply_migrations(schema_path)
+            if post_migration_validator is not None:
+                try:
+                    post_migration_validator(self._database, self.database_path)
+                except Exception as exc:
+                    raise EventStoreError(
+                        "event-store authority is invalid after migration"
+                    ) from exc
             self._validate_connection_settings()
         except BaseException:
             if hasattr(self, "_database"):
@@ -235,7 +244,9 @@ class TransactionalEventStore:
         if self.database_path.exists():
             mode = self.database_path.lstat().st_mode
             if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
-                raise EventStoreError("database path must be a regular file, not a symlink")
+                raise EventStoreError(
+                    "database path must be a regular file, not a symlink"
+                )
 
     def _verify_expected_database_identity(self) -> None:
         if self._expected_database_identity is None:
@@ -243,7 +254,9 @@ class TransactionalEventStore:
         try:
             metadata = self.database_path.lstat()
         except OSError as exc:
-            raise EventStoreError("checked event-store database is unavailable") from exc
+            raise EventStoreError(
+                "checked event-store database is unavailable"
+            ) from exc
         observed = (metadata.st_dev, metadata.st_ino)
         if (
             stat.S_ISLNK(metadata.st_mode)
@@ -265,7 +278,9 @@ class TransactionalEventStore:
         )
 
     def _acquire_writer_lock(self, *, require_existing: bool) -> Any:
-        lock_path = self.database_path.with_name(self.database_path.name + ".writer.lock")
+        lock_path = self.database_path.with_name(
+            self.database_path.name + ".writer.lock"
+        )
         descriptor: int | None = None
         handle: Any | None = None
         opened_identity: tuple[int, int] | None = None
@@ -292,11 +307,10 @@ class TransactionalEventStore:
                     flags |= os.O_NOFOLLOW
                 descriptor = os.open(lock_path, flags)
                 opened = os.fstat(descriptor)
-                if (
-                    not self._private_lock_metadata(opened)
-                    or (opened.st_dev, opened.st_ino)
-                    != (existing.st_dev, existing.st_ino)
-                ):
+                if not self._private_lock_metadata(opened) or (
+                    opened.st_dev,
+                    opened.st_ino,
+                ) != (existing.st_dev, existing.st_ino):
                     raise OSError("writer lock changed while it was opened")
                 opened_identity = (opened.st_dev, opened.st_ino)
             handle = os.fdopen(descriptor, "a+", encoding="utf-8")
@@ -362,7 +376,9 @@ class TransactionalEventStore:
             try:
                 schema = path.read_text(encoding="utf-8")
             except OSError as exc:
-                raise EventStoreError(f"cannot read event-store schema: {path}") from exc
+                raise EventStoreError(
+                    f"cannot read event-store schema: {path}"
+                ) from exc
             migrations.append(
                 (
                     version,
@@ -416,7 +432,9 @@ class TransactionalEventStore:
         if self._closed:
             raise EventStoreError("event store is closed")
         if writer_identity != self._writer_identity:
-            raise WriterAuthorityError("mutation requires the supervisor writer identity")
+            raise WriterAuthorityError(
+                "mutation requires the supervisor writer identity"
+            )
 
     @contextlib.contextmanager
     def _transaction(self, writer_identity: str) -> Iterator[sqlite3.Connection]:
@@ -476,11 +494,17 @@ class TransactionalEventStore:
             ).fetchone()
             if existing is not None:
                 if tuple(existing) != values:
-                    raise IdempotencyConflict("repository identity is already bound differently")
+                    raise IdempotencyConflict(
+                        "repository identity is already bound differently"
+                    )
                 return
-            other = database.execute("SELECT repository_id FROM repositories LIMIT 1").fetchone()
+            other = database.execute(
+                "SELECT repository_id FROM repositories LIMIT 1"
+            ).fetchone()
             if other is not None:
-                raise EventStoreError("one event-store database cannot bind multiple repositories")
+                raise EventStoreError(
+                    "one event-store database cannot bind multiple repositories"
+                )
             database.execute(
                 "INSERT INTO repositories VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", values
             )
@@ -851,7 +875,9 @@ class TransactionalEventStore:
             or not isinstance(envelope_digest, str)
             or not envelope_digest.strip()
         ):
-            raise EventStoreError("execution backend identity and envelope digest are required")
+            raise EventStoreError(
+                "execution backend identity and envelope digest are required"
+            )
         at = occurred_at or utc_now()
         material = {field: binding[field] for field in required}
         execution_key = _digest(canonical_json(material))
@@ -951,8 +977,14 @@ class TransactionalEventStore:
                 f"execution backend {operation} cannot record state {target_state}"
             )
         required = (
-            "repository_id", "job_id", "phase", "attempt_token", "dispatch_id",
-            "execution_unit_id", "worktree_id", "supervisor_fence",
+            "repository_id",
+            "job_id",
+            "phase",
+            "attempt_token",
+            "dispatch_id",
+            "execution_unit_id",
+            "worktree_id",
+            "supervisor_fence",
         )
         material = {field: binding.get(field) for field in required}
         if any(not isinstance(value, str) or not value for value in material.values()):
@@ -1043,8 +1075,14 @@ class TransactionalEventStore:
 
     def execution_record(self, binding: Mapping[str, str]) -> dict[str, Any] | None:
         required = (
-            "repository_id", "job_id", "phase", "attempt_token", "dispatch_id",
-            "execution_unit_id", "worktree_id", "supervisor_fence",
+            "repository_id",
+            "job_id",
+            "phase",
+            "attempt_token",
+            "dispatch_id",
+            "execution_unit_id",
+            "worktree_id",
+            "supervisor_fence",
         )
         material = {field: binding.get(field) for field in required}
         if any(not isinstance(value, str) or not value for value in material.values()):
@@ -1061,9 +1099,14 @@ class TransactionalEventStore:
             return None
         result = dict(zip(names, value))
         for name in (
-            "launch_receipt_json", "attachment_receipt_json", "heartbeat_receipt_json",
-            "progress_receipt_json", "cancellation_receipt_json",
-            "fence_receipt_json", "inspection_receipt_json", "terminal_receipt_json",
+            "launch_receipt_json",
+            "attachment_receipt_json",
+            "heartbeat_receipt_json",
+            "progress_receipt_json",
+            "cancellation_receipt_json",
+            "fence_receipt_json",
+            "inspection_receipt_json",
+            "terminal_receipt_json",
         ):
             result[name.removesuffix("_json")] = (
                 json.loads(str(result[name])) if result.get(name) else None
@@ -1427,7 +1470,9 @@ class TransactionalEventStore:
             (str(item["document_type"]), str(item["document_id"])) for item in ordered
         ]
         if len(identities) != len(set(identities)):
-            raise IdempotencyConflict("cutover seed contains duplicate runtime documents")
+            raise IdempotencyConflict(
+                "cutover seed contains duplicate runtime documents"
+            )
         seed_manifest = []
         for item in ordered:
             payload_json = canonical_json(item["payload"])
@@ -1520,9 +1565,7 @@ class TransactionalEventStore:
                 raise IdempotencyConflict(
                     "cutover activation event exists without an active projection"
                 )
-            activation_generation = (
-                int(existing[5]) + 1 if existing is not None else 1
-            )
+            activation_generation = int(existing[5]) + 1 if existing is not None else 1
             database.execute(
                 "DELETE FROM runtime_documents WHERE repository_id = ?",
                 (repository_id,),
@@ -1605,7 +1648,9 @@ class TransactionalEventStore:
         """Commit one authoritative runtime generation under the active fence."""
 
         if not supervisor_fence:
-            raise WriterAuthorityError("runtime document write requires a supervisor fence")
+            raise WriterAuthorityError(
+                "runtime document write requires a supervisor fence"
+            )
         at = occurred_at or utc_now()
         payload_json = canonical_json(payload)
         payload_digest = _digest(payload_json)
@@ -1878,7 +1923,8 @@ class TransactionalEventStore:
 
         at = imported_at or utc_now()
         ordered = sorted(
-            (dict(source) for source in sources), key=lambda item: str(item["source_path"])
+            (dict(source) for source in sources),
+            key=lambda item: str(item["source_path"]),
         )
         manifest = {
             "repository_id": repository_id,
@@ -1896,7 +1942,9 @@ class TransactionalEventStore:
         }
         manifest_json = canonical_json(manifest)
         if _digest(manifest_json) != manifest_digest:
-            raise IdempotencyConflict("legacy import manifest digest does not match its sources")
+            raise IdempotencyConflict(
+                "legacy import manifest digest does not match its sources"
+            )
         with self._transaction(writer_identity) as database:
             existing = database.execute(
                 """
