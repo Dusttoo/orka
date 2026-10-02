@@ -437,6 +437,24 @@ def _materialize_policy(layout: RepositoryLayout, snapshot: PolicySnapshot) -> P
     return destination
 
 
+def materialize_policy_snapshot(start: Path, snapshot: PolicySnapshot) -> Path:
+    """Materialize the exact immutable policy already checked for admission.
+
+    The policy ref may advance after diagnostics.  Admission consumes the
+    retained commit/blob/content instead of resolving that moving ref again.
+    """
+
+    layout = repository_layout(start)
+    identity = _read_identity(layout)
+    if (
+        snapshot.policy_ref != identity["policy_ref"]
+        or snapshot.policy_path != identity["policy_path"]
+        or hashlib.sha256(snapshot.content).hexdigest() != snapshot.digest
+    ):
+        raise RuntimeStateError("checked canonical policy no longer matches repository identity")
+    return _materialize_policy(layout, snapshot)
+
+
 def legacy_state_inventory(start: Path) -> dict[str, Any]:
     layout = repository_layout(start)
     candidates: set[Path] = set()

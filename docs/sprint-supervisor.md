@@ -15,6 +15,11 @@ worktrees therefore resolve the same lease and state. The control socket is
 repository-derived, user-owned, and mode `0600`; the runtime directory and
 state are mode `0700` and `0600` respectively.
 
+Before its first planning cycle, the elected supervisor requires a healthy
+[startup-diagnostic receipt](startup-diagnostics.md). A schema, migration,
+identity, policy, cutover, minimum-version, foreign-key, quick-check, or
+permission failure stops the process before any reservation or launch.
+
 The state snapshot records:
 
 - the lifecycle contract and runtime fingerprints;

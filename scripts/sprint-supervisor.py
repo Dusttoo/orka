@@ -30,8 +30,8 @@ from typing import Any
 
 from runtime_state import (
     RuntimeStateError,
-    assert_cutover_runtime_compatible,
     canonical_config_path,
+    materialize_policy_snapshot,
     runtime_cutover_marker,
     shared_repository_root,
     shared_runtime_path,
@@ -67,6 +67,7 @@ from supervisor_state import (
     migrate_supervisor_state,
     migration_authorizes_runtime,
 )
+from startup_diagnostics import prepare_startup_admission, run_startup_diagnostics
 
 
 class SupervisorError(RuntimeError):
@@ -449,6 +450,12 @@ def runtime_fingerprint() -> str:
         + (PLUGIN_ROOT / "scripts/supervisor_state.py").read_bytes()
         + (PLUGIN_ROOT / "contracts/resource-claims-v1.json").read_bytes()
         + (PLUGIN_ROOT / "scripts/runtime_state.py").read_bytes()
+        + (PLUGIN_ROOT / "scripts/event_store.py").read_bytes()
+        + (PLUGIN_ROOT / "scripts/startup_diagnostics.py").read_bytes()
+        + (PLUGIN_ROOT / "contracts/startup-diagnostic-v1.json").read_bytes()
+        + (PLUGIN_ROOT / "contracts/event-store-v1.sql").read_bytes()
+        + (PLUGIN_ROOT / "contracts/event-store-v2-legacy-import.sql").read_bytes()
+        + (PLUGIN_ROOT / "contracts/event-store-v3-runtime-cutover.sql").read_bytes()
         + (PLUGIN_ROOT / ".codex-plugin/plugin.json").read_bytes()
     )
 
@@ -737,7 +744,7 @@ def validate_request(value: Any) -> dict[str, Any]:
 
 
 def response_for(state: dict[str, Any]) -> dict[str, Any]:
-    return {
+    response = {
         "status": "ok",
         "repository": state["repository"],
         "lifecycle_state": state["lifecycle_state"],
@@ -747,6 +754,9 @@ def response_for(state: dict[str, Any]) -> dict[str, Any]:
         "updated_at": state["updated_at"],
         "last_event": state["last_event"],
     }
+    if state.get("startup_diagnostic"):
+        response["startup_diagnostic"] = state["startup_diagnostic"]
+    return response
 
 
 def status_response(state: dict[str, Any]) -> dict[str, Any]:
@@ -867,11 +877,13 @@ def status_response(state: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def planning_settings(repository: Path) -> dict[str, Any]:
+def planning_settings(
+    repository: Path, *, config_path: Path | None = None
+) -> dict[str, Any]:
     """Resolve optional planning settings without breaking lifecycle-only repos."""
 
     try:
-        config = load_yaml(canonical_config_path(repository))
+        config = load_yaml(config_path or canonical_config_path(repository))
     except (AgentError, RuntimeStateError) as exc:
         raise SupervisorError(str(exc)) from exc
     configured = str(config.get("sprint_id") or "").strip()
@@ -1090,9 +1102,7 @@ def write_handshake(path: Path, value: dict[str, Any]) -> None:
 
 def run_daemon(repository: Path, handshake: Path) -> int:
     paths = runtime_paths(repository)
-    cutover_active = runtime_cutover_marker(repository) is not None
     try:
-        assert_cutover_runtime_compatible(repository)
         ensure_private_directory(paths["directory"])
         contract_value, lifecycle, contract_digest = contract()
         del contract_value
@@ -1133,6 +1143,22 @@ def run_daemon(repository: Path, handshake: Path) -> int:
             )
             return 2
 
+        startup_admission = prepare_startup_admission(
+            repository, plugin_root=PLUGIN_ROOT
+        )
+        startup_diagnostic = startup_admission.receipt
+        if not startup_diagnostic["healthy"]:
+            write_handshake(
+                handshake,
+                {
+                    "status": "error",
+                    "error": "startup diagnostic rejected supervisor admission",
+                    "startup_diagnostic": startup_diagnostic,
+                },
+            )
+            return 2
+        cutover_active = startup_diagnostic["mode"] == "transactional"
+
         previous = (
             read_authoritative_state(repository)
             if cutover_active
@@ -1169,9 +1195,22 @@ def run_daemon(repository: Path, handshake: Path) -> int:
         if cutover_active:
             repository_binding = repository_identity(repository)
             writer_identity = f"supervisor:{repository_binding['repository_uuid']}"
+            if (
+                startup_admission.database_path is None
+                or startup_admission.database_identity is None
+            ):
+                raise SupervisorError(
+                    "healthy transactional diagnostics did not bind a database"
+                )
             event_store = TransactionalEventStore(
-                repository_layout(repository).state_root / "orka-state.sqlite3",
+                startup_admission.database_path,
                 writer_identity=writer_identity,
+                expected_database_identity=(
+                    startup_admission.database_identity.device,
+                    startup_admission.database_identity.inode,
+                ),
+                startup_validator=startup_admission.validate_writer_connection,
+                require_existing_lock=True,
             )
             authoritative_state = AuthoritativeSupervisorState(
                 repository,
@@ -1180,7 +1219,11 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                 supervisor_fence=f"{lease_id}:{generation}",
             )
         try:
-            config_path = canonical_config_path(repository)
+            config_path = (
+                materialize_policy_snapshot(repository, startup_admission.policy)
+                if startup_admission.policy is not None
+                else canonical_config_path(repository)
+            )
         except RuntimeStateError as exc:
             write_handshake(handshake, {"status": "error", "error": str(exc)})
             return 2
@@ -1220,6 +1263,7 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                 "config_digest": initial_config_digest,
                 "runtime_fingerprint": initial_runtime_digest,
                 "contract_digest": contract_digest,
+                "startup_diagnostic": startup_diagnostic,
             }
             persist_state()
         try:
@@ -1227,7 +1271,7 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                 raise SupervisorError(f"repository config is missing: {config_path}")
             config_digest = initial_config_digest
             runtime_digest = initial_runtime_digest
-            settings = planning_settings(repository)
+            settings = planning_settings(repository, config_path=config_path)
             if previous and not previous_clean:
                 state = takeover_state(
                     previous,
@@ -1247,11 +1291,15 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                         "config_digest": config_digest,
                         "runtime_fingerprint": runtime_digest,
                         "lease_id": lease_id,
+                        "startup_diagnostic_digest": startup_diagnostic[
+                            "receipt_digest"
+                        ],
                     },
                 )
                 state["config_digest"] = config_digest
                 state["runtime_fingerprint"] = runtime_digest
                 state["contract_digest"] = contract_digest
+                state["startup_diagnostic"] = startup_diagnostic
                 state["planning"] = settings
                 state["planning"].update(
                     {
@@ -1270,6 +1318,7 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                     "terminal_count": 0,
                     "last_error": "",
                 }
+            state["startup_diagnostic"] = startup_diagnostic
             persist_state()
         except (OSError, RuntimeStateError, SupervisorError) as exc:
             diagnostic = str(exc)
@@ -2089,6 +2138,16 @@ def status(args: argparse.Namespace) -> None:
     emit(status_response(snapshot))
 
 
+def diagnose(args: argparse.Namespace) -> None:
+    """Emit the same read-only startup receipt used by supervisor admission."""
+
+    repository = resolve_repository(args.repo)
+    receipt = run_startup_diagnostics(repository, plugin_root=PLUGIN_ROOT)
+    emit(receipt)
+    if not receipt["healthy"]:
+        raise SystemExit(2)
+
+
 def control(args: argparse.Namespace) -> None:
     repository = resolve_repository(args.repo)
     paths = runtime_paths(repository)
@@ -2231,6 +2290,12 @@ def parser() -> argparse.ArgumentParser:
     )
     status_parser.add_argument("--repo")
     status_parser.set_defaults(func=status)
+
+    diagnose_parser = commands.add_parser(
+        "diagnose", help="run the read-only startup admission diagnostic"
+    )
+    diagnose_parser.add_argument("--repo")
+    diagnose_parser.set_defaults(func=diagnose)
 
     for name in ("pause", "resume", "drain", "stop"):
         command = commands.add_parser(name)

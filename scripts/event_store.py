@@ -19,7 +19,7 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 
 SCHEMA_VERSION = 3
@@ -134,6 +134,16 @@ def _sql_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def migration_specifications() -> tuple[tuple[int, str, Path], ...]:
+    """Return the one authoritative ordered event-store migration manifest."""
+
+    return (
+        (1, "0001-initial-event-store", SCHEMA_PATH),
+        (2, "0002-legacy-import", LEGACY_IMPORT_SCHEMA_PATH),
+        (3, "0003-runtime-cutover", RUNTIME_CUTOVER_SCHEMA_PATH),
+    )
+
+
 class TransactionalEventStore:
     """One supervisor-owned SQLite writer with serialized transactions.
 
@@ -151,6 +161,9 @@ class TransactionalEventStore:
         local_filesystem: bool = False,
         busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
         schema_path: Path = SCHEMA_PATH,
+        expected_database_identity: tuple[int, int] | None = None,
+        startup_validator: Callable[[sqlite3.Connection, Path], None] | None = None,
+        require_existing_lock: bool = False,
     ) -> None:
         if not writer_identity.strip():
             raise WriterAuthorityError("writer identity must be non-empty")
@@ -159,17 +172,29 @@ class TransactionalEventStore:
         self.database_path = database_path.resolve()
         self._writer_identity = writer_identity
         self._busy_timeout_ms = busy_timeout_ms
+        self._expected_database_identity = expected_database_identity
         self._write_lock = threading.RLock()
         self._closed = False
         self._validate_database_path()
-        self._writer_lock_handle = self._acquire_writer_lock()
+        self._writer_lock_handle = self._acquire_writer_lock(
+            require_existing=require_existing_lock
+        )
         try:
+            self._verify_expected_database_identity()
             self._database = sqlite3.connect(
                 self.database_path,
                 timeout=busy_timeout_ms / 1000,
                 isolation_level=None,
                 check_same_thread=False,
             )
+            self._verify_expected_database_identity()
+            if startup_validator is not None:
+                try:
+                    startup_validator(self._database, self.database_path)
+                except Exception as exc:
+                    raise EventStoreError(
+                        "event-store startup authority changed after diagnostics"
+                    ) from exc
             os.chmod(self.database_path, 0o600)
             self._database.execute("PRAGMA foreign_keys = ON")
             self._database.execute("PRAGMA synchronous = FULL")
@@ -207,21 +232,87 @@ class TransactionalEventStore:
             if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
                 raise EventStoreError("database path must be a regular file, not a symlink")
 
-    def _acquire_writer_lock(self) -> Any:
-        lock_path = self.database_path.with_name(self.database_path.name + ".writer.lock")
-        flags = os.O_RDWR | os.O_CREAT
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
+    def _verify_expected_database_identity(self) -> None:
+        if self._expected_database_identity is None:
+            return
         try:
-            descriptor = os.open(lock_path, flags, 0o600)
-            os.fchmod(descriptor, 0o600)
+            metadata = self.database_path.lstat()
+        except OSError as exc:
+            raise EventStoreError("checked event-store database is unavailable") from exc
+        observed = (metadata.st_dev, metadata.st_ino)
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+            or observed != self._expected_database_identity
+        ):
+            raise EventStoreError(
+                "event-store database identity changed after startup diagnostics"
+            )
+
+    @staticmethod
+    def _private_lock_metadata(metadata: os.stat_result) -> bool:
+        mode = stat.S_IMODE(metadata.st_mode)
+        return (
+            stat.S_ISREG(metadata.st_mode)
+            and not stat.S_ISLNK(metadata.st_mode)
+            and mode & 0o600 == 0o600
+            and not mode & 0o077
+        )
+
+    def _acquire_writer_lock(self, *, require_existing: bool) -> Any:
+        lock_path = self.database_path.with_name(self.database_path.name + ".writer.lock")
+        descriptor: int | None = None
+        handle: Any | None = None
+        opened_identity: tuple[int, int] | None = None
+        try:
+            try:
+                existing = lock_path.lstat()
+            except FileNotFoundError:
+                if require_existing:
+                    raise OSError("required writer lock does not exist")
+                flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+                if hasattr(os, "O_NOFOLLOW"):
+                    flags |= os.O_NOFOLLOW
+                descriptor = os.open(lock_path, flags, 0o600)
+                os.fchmod(descriptor, 0o600)
+                opened = os.fstat(descriptor)
+                if not self._private_lock_metadata(opened):
+                    raise OSError("new writer lock is not a private regular file")
+                opened_identity = (opened.st_dev, opened.st_ino)
+            else:
+                if not self._private_lock_metadata(existing):
+                    raise OSError("existing writer lock is not a private regular file")
+                flags = os.O_RDWR
+                if hasattr(os, "O_NOFOLLOW"):
+                    flags |= os.O_NOFOLLOW
+                descriptor = os.open(lock_path, flags)
+                opened = os.fstat(descriptor)
+                if (
+                    not self._private_lock_metadata(opened)
+                    or (opened.st_dev, opened.st_ino)
+                    != (existing.st_dev, existing.st_ino)
+                ):
+                    raise OSError("writer lock changed while it was opened")
+                opened_identity = (opened.st_dev, opened.st_ino)
             handle = os.fdopen(descriptor, "a+", encoding="utf-8")
+            descriptor = None
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            current = lock_path.lstat()
+            if (
+                not self._private_lock_metadata(current)
+                or (current.st_dev, current.st_ino) != opened_identity
+                or (os.fstat(handle.fileno()).st_dev, os.fstat(handle.fileno()).st_ino)
+                != opened_identity
+            ):
+                raise OSError("writer lock changed while authority was acquired")
         except (OSError, BlockingIOError) as exc:
-            with contextlib.suppress(UnboundLocalError, OSError):
+            with contextlib.suppress(OSError, AttributeError):
+                if handle is not None:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
                 handle.close()
-            with contextlib.suppress(UnboundLocalError, OSError):
-                os.close(descriptor)
+            with contextlib.suppress(OSError, TypeError):
+                if descriptor is not None:
+                    os.close(descriptor)
             raise WriterAuthorityError(
                 "another supervisor already owns the event-store writer lock"
             ) from exc
@@ -257,10 +348,9 @@ class TransactionalEventStore:
         return selected, reason
 
     def _apply_migrations(self, schema_path: Path) -> None:
-        specifications = (
-            (1, "0001-initial-event-store", schema_path),
-            (2, "0002-legacy-import", LEGACY_IMPORT_SCHEMA_PATH),
-            (3, "0003-runtime-cutover", RUNTIME_CUTOVER_SCHEMA_PATH),
+        specifications = tuple(
+            (version, migration_id, schema_path if version == 1 else path)
+            for version, migration_id, path in migration_specifications()
         )
         migrations: list[tuple[int, str, str, str]] = []
         for version, migration_id, path in specifications:
