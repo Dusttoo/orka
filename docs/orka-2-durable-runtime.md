@@ -139,7 +139,9 @@ concerns.
 7. Specify the disposable phase-worker protocol and shared adapter fixtures.
    **Complete in 1.8.18.**
    Supervisor-managed launch, progress, cancellation, terminal attribution,
-   replacement, and restart reconciliation are complete in 1.8.28.
+   replacement, and restart reconciliation are complete in 1.8.28. Codex
+   desktop, Claude desktop, and API capability negotiation and contract
+   integration are complete in 1.8.30.
 8. Introduce a transactional event store with checkpoint import/export.
    **The architecture decision, schema prototype, and implementation slices are
    complete in 1.8.19. Repository identity and canonical policy authority are
