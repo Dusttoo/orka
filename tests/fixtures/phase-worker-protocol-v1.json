@@ -164,6 +164,86 @@
       }
     },
     {
+      "name": "nested conversation id is forbidden",
+      "valid": false,
+      "error": "forbidden field conversation_id",
+      "use_identity": true,
+      "envelope": {
+        "kind": "job",
+        "protocol_version": 1,
+        "sanitized_input": {"metadata": {"conversation_id": "conversation-1"}},
+        "required_capabilities": [
+          "attempt-fencing",
+          "cancellation-ack-or-fence",
+          "fresh-context-per-dispatch",
+          "immutable-job-identity",
+          "structured-progress",
+          "structured-terminal-result"
+        ],
+        "fresh_context": true
+      }
+    },
+    {
+      "name": "nested previous conversation id in a list is forbidden",
+      "valid": false,
+      "error": "forbidden field previous_conversation_id",
+      "use_identity": true,
+      "envelope": {
+        "kind": "job",
+        "protocol_version": 1,
+        "sanitized_input": {"metadata": [{"previous_conversation_id": "conversation-0"}]},
+        "required_capabilities": [
+          "attempt-fencing",
+          "cancellation-ack-or-fence",
+          "fresh-context-per-dispatch",
+          "immutable-job-identity",
+          "structured-progress",
+          "structured-terminal-result"
+        ],
+        "fresh_context": true
+      }
+    },
+    {
+      "name": "nested provider session id is forbidden",
+      "valid": false,
+      "error": "forbidden field provider_session_id",
+      "use_identity": true,
+      "envelope": {
+        "kind": "job",
+        "protocol_version": 1,
+        "sanitized_input": {"provider": {"provider_session_id": "session-1"}},
+        "required_capabilities": [
+          "attempt-fencing",
+          "cancellation-ack-or-fence",
+          "fresh-context-per-dispatch",
+          "immutable-job-identity",
+          "structured-progress",
+          "structured-terminal-result"
+        ],
+        "fresh_context": true
+      }
+    },
+    {
+      "name": "nested resume session in a list is forbidden",
+      "valid": false,
+      "error": "forbidden field resume_session",
+      "use_identity": true,
+      "envelope": {
+        "kind": "job",
+        "protocol_version": 1,
+        "sanitized_input": {"steps": ["ordinary", {"resume_session": "session-0"}]},
+        "required_capabilities": [
+          "attempt-fencing",
+          "cancellation-ack-or-fence",
+          "fresh-context-per-dispatch",
+          "immutable-job-identity",
+          "structured-progress",
+          "structured-terminal-result"
+        ],
+        "fresh_context": true
+      }
+    },
+    {
       "name": "stale supervisor fence is rejected",
       "valid": false,
       "error": "identity field supervisor_fence does not match",
