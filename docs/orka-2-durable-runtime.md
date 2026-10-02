@@ -151,9 +151,9 @@ concerns.
    deterministic export, and shadow comparison are complete in 1.8.23;
    cutover activation, minimum-version refusal, generation-fenced runtime
    documents, and pre-first-write rollback are complete in 1.8.24. Controller
-   routing is complete in 1.8.27, and the authoritative one-writer supervisor
-   generation is complete in 1.8.29. The final no-dual-writer qualification
-   remains tracked by issue #127.**
+   routing is complete in 1.8.27, the authoritative one-writer supervisor
+   generation is complete in 1.8.29, and the final no-dual-writer production
+   qualification is complete in 1.8.31.**
 9. Add supervisor lease takeover and crash recovery.
 10. Expose stable status, pause, resume, and decision CLI commands.
 11. Prove the design with restart, timeout, provider-loss, and malformed-output

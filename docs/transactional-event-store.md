@@ -76,9 +76,10 @@ timers, or receipts.
 Orka 1.8.23 adds the explicit offline importer and deterministic export. See
 [Legacy state migration](legacy-state-migration.md). Orka 1.8.27 completes the
 controller-command routing slice (#125). Orka 1.8.29 makes the supervisor's
-whole state generation authoritative in the store (#126). The final no-dual-
-writer proof remains in #127; backup, replay validation, cross-platform
-behavior, and broader injected crash recovery remain in #119.
+whole state generation authoritative in the store (#126). Orka 1.8.31
+completes the no-dual-writer production qualification (#127). Backup media,
+restore validation, cross-platform behavior, and broader injected storage
+fault recovery remain in #119.
 
 ## Authoritative supervisor generations
 
@@ -135,3 +136,46 @@ no-op, while changed arguments or bindings fail closed.
 | Controller failure or malformed checkpoint | Discard the private materialization; commit nothing. |
 | More than one changed sprint document | Reject the whole command; commit nothing. |
 | Pre-cutover repository | Preserve the existing file-backed controller behavior. |
+
+## Production cutover procedure
+
+Cutover is intentionally offline and has no dual-writer phase:
+
+1. Cleanly stop the repository supervisor. `state_migration.py import` creates
+   and verifies the transactional shadow without changing runtime authority.
+2. Inspect the deterministic export and run `state_migration.py status`. The
+   legacy JSON checkpoints remain authoritative and writable at this point.
+3. Run `state_migration.py activate`. Activation takes the repository migration
+   lock, refuses a live or unclean legacy supervisor, authenticates the shadow
+   digest, installs the minimum-version marker, and seeds one transactional
+   generation.
+4. Start the supervisor normally. `status`, `pause`, `resume`, `drain`, and
+   `stop` use the same control socket, but every durable supervisor and
+   controller generation now commits through the sole SQLite writer.
+5. If activation validation fails before the supervisor's first authoritative
+   write, run `state_migration.py rollback --reason ...`. After that first
+   write, rollback is deliberately refused; recovery must restart from the
+   last committed generation or use the backup/export procedure tracked by
+   #119.
+
+If activation crashes after installing its marker, incompatible runtimes are
+already fenced out and rerunning `activate` completes the exact idempotent
+receipt. A stopped, crashed, or replaced supervisor is recovered with the
+normal supervisor `start` command. The new lease generation restores the last
+complete database generation; legacy controller and supervisor checkpoints
+are never consulted or rewritten.
+
+## Acceptance trace for #118 and #127
+
+| Invariant | Production boundary | Qualification evidence |
+| --- | --- | --- |
+| Workers and adapters cannot mutate SQLite | Lifetime writer lock and opaque supervisor identity in `event_store.py` | `event_store_test.py::test_writer_identity_is_required_for_every_mutation`; `authoritative_supervisor_state_test.py::test_workers_cannot_open_a_second_writer_or_reuse_closed_authority` |
+| Commands bind repository, activation, lease fence, and generations | Controller request validation and transactional command receipts | `controller_runtime_test.py`; `tests/controller-runtime.test.sh` |
+| Planning and status read one generation | `runtime_snapshot` and `read_authoritative_state` use one read transaction | `authoritative_supervisor_state_test.py::test_restart_restores_exact_state_without_rewriting_legacy_json` |
+| Reservations, launches, completions, decisions, timers, and reconciliation are authoritative | Whole-supervisor-document persistence plus atomic event-store operations | `authoritative_supervisor_state_test.py`; `event_store_test.py` |
+| A running legacy supervisor blocks cutover | `exclusive_migration_authority` takes the same lease lock | `no_dual_writer_cutover_test.py::test_running_legacy_supervisor_blocks_activation_without_a_marker` |
+| Older runtimes fail before mutation | Authenticated minimum-version cutover marker | `no_dual_writer_cutover_test.py::test_old_runtime_refuses_before_touching_transactional_or_legacy_state` |
+| Legacy checkpoints are read-only after activation | Controller routing and authoritative supervisor state bypass legacy paths | `no_dual_writer_cutover_test.py::test_cutover_pause_resume_status_restart_and_recovery_are_database_only` |
+| Rollback ends at the first authoritative write | `first_authoritative_sequence` fence | The same end-to-end test and `state_migration_test.py::test_cutover_cannot_roll_back_after_authoritative_write` |
+| Restart and concurrent completions preserve exact generations and receipts | Idempotency receipts, generation fences, and serialized host callbacks | `authoritative_supervisor_state_test.py::test_concurrent_completions_serialize_as_whole_generations`; `event_store_test.py` concurrent completion and external-operation cases |
+| Review, security, budget, merge, and destructive gates fail closed | Existing gate entry points and minimum-version enforcement remain outside model authority | `review-ledger.test.sh`, `review-contract.test.sh`, `sprint-controller.test.sh`, `merge-guard.test.sh`, and the full `tests/run.sh` suite |
