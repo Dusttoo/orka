@@ -1,6 +1,6 @@
 # Supervisor startup diagnostics
 
-Contract: `orka.startup-diagnostic`, schema version 1  
+Contract: `orka.startup-diagnostic`, schema version 1
 Machine-readable source: [`contracts/startup-diagnostic-v1.json`](../contracts/startup-diagnostic-v1.json)
 
 The elected repository supervisor must produce a healthy startup-diagnostic
@@ -25,6 +25,13 @@ changes permissions, updates policy, or creates a database sidecar. A failed
 check stops admission and preserves the source store for an explicit recovery
 procedure. `PRAGMA integrity_check` remains the deeper operator-requested
 diagnostic; it is intentionally not part of bounded startup.
+
+The supervisor retains the checked database device/inode identity and immutable
+policy commit, blob, digest, and content outside the sanitized receipt. Under
+its exclusive lease it opens the writer only when the database identity still
+matches, and materializes the retained policy blob without resolving the moving
+policy ref again. Deleting or corrupting `cutover.json` cannot downgrade an
+event store whose `runtime_cutovers` ledger already records active cutover.
 
 Legacy repositories retain their 1.x behavior. Their event-store-only checks
 are reported as `legacy_not_applicable`, while the compatible repository policy

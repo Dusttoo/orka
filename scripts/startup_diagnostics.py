@@ -13,6 +13,7 @@ import hashlib
 import os
 import sqlite3
 import stat
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -24,6 +25,7 @@ from event_store import (
 from runtime_state import (
     CUTOVER_FILE,
     IDENTITY_FILE,
+    PolicySnapshot,
     RuntimeStateError,
     repository_identity,
     repository_layout,
@@ -67,6 +69,24 @@ NEXT_ACTIONS = {
 }
 
 
+@dataclass(frozen=True)
+class DatabaseIdentity:
+    """Opaque local-file identity retained outside the sanitized receipt."""
+
+    device: int
+    inode: int
+
+
+@dataclass(frozen=True)
+class StartupAdmission:
+    """Checked capabilities the elected supervisor may consume exactly once."""
+
+    receipt: dict[str, Any]
+    policy: PolicySnapshot | None = None
+    database_path: Path | None = None
+    database_identity: DatabaseIdentity | None = None
+
+
 def _digest(value: Any) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
@@ -103,6 +123,40 @@ def _private_regular(path: Path) -> bool:
         and mode & 0o600 == 0o600
         and not mode & 0o077
     )
+
+
+def _database_identity(path: Path) -> DatabaseIdentity:
+    metadata = path.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise OSError("database path is not a regular file")
+    return DatabaseIdentity(device=metadata.st_dev, inode=metadata.st_ino)
+
+
+def _active_cutover_in_existing_store(path: Path) -> bool | None:
+    """Return active-cutover state, or None when an existing store is unreadable."""
+
+    if not path.exists() and not path.is_symlink():
+        return False
+    try:
+        database = _read_only_database(path)
+    except (OSError, sqlite3.Error):
+        return None
+    try:
+        table = database.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'runtime_cutovers'"
+        ).fetchone()
+        if table is None:
+            return False
+        return (
+            database.execute(
+                "SELECT 1 FROM runtime_cutovers WHERE state = 'active' LIMIT 1"
+            ).fetchone()
+            is not None
+        )
+    except sqlite3.Error:
+        return None
+    finally:
+        database.close()
 
 
 def _expected_schema_digest() -> str:
@@ -192,55 +246,64 @@ def _permission_check(layout: Any, database_path: Path) -> dict[str, Any]:
     )
 
 
-def _legacy_receipt(repository: Path) -> dict[str, Any]:
+def _legacy_admission(repository: Path) -> StartupAdmission:
     checks: dict[str, dict[str, Any]] = {}
+    policy: PolicySnapshot | None = None
     for check_id in CHECK_ORDER:
         checks[check_id] = _check(check_id, "skipped", "legacy_not_applicable")
     try:
         layout = repository_layout(repository)
-        identity_path = layout.state_root / IDENTITY_FILE
-        if identity_path.exists() or identity_path.is_symlink():
+    except RuntimeStateError:
+        checks["repository_identity"] = _check(
+            "repository_identity", "fail", "repository_identity_invalid"
+        )
+        return StartupAdmission(receipt=_receipt("legacy", checks))
+    identity_path = layout.state_root / IDENTITY_FILE
+    if identity_path.exists() or identity_path.is_symlink():
+        try:
             identity = repository_identity(repository)
-            policy = resolve_canonical_policy(repository)
             checks["repository_identity"] = _check(
                 "repository_identity",
                 "pass",
                 "ok",
                 {"identity_schema_version": int(identity["schema_version"])},
             )
+        except (KeyError, OSError, RuntimeStateError, TypeError, ValueError):
+            checks["repository_identity"] = _check(
+                "repository_identity", "fail", "repository_identity_invalid"
+            )
+        try:
+            policy = resolve_canonical_policy(repository)
             checks["canonical_policy"] = _check(
                 "canonical_policy",
                 "pass",
                 "ok",
                 {"policy_digest": policy.digest},
             )
-        else:
-            config = repository / ".orchestration/config.yaml"
-            if config.is_file() and not config.is_symlink():
-                checks["canonical_policy"] = _check(
-                    "canonical_policy",
-                    "pass",
-                    "ok",
-                    {"policy_digest": hashlib.sha256(config.read_bytes()).hexdigest()},
-                )
-            else:
-                # Preserve the 1.x preflight path and its durable failure state.
-                # Legacy policy absence is diagnosed by the existing preflight,
-                # not promoted into a new event-store admission condition.
-                checks["canonical_policy"] = _check(
-                    "canonical_policy", "skipped", "legacy_uninitialized"
-                )
-            checks["repository_identity"] = _check(
-                "repository_identity", "skipped", "legacy_uninitialized"
+        except (OSError, RuntimeStateError):
+            checks["canonical_policy"] = _check(
+                "canonical_policy", "fail", "canonical_policy_invalid"
             )
-    except (KeyError, OSError, RuntimeStateError, TypeError, ValueError):
-        checks["canonical_policy"] = _check(
-            "canonical_policy", "fail", "canonical_policy_invalid"
-        )
+    else:
+        config = repository / ".orchestration/config.yaml"
+        if config.is_file() and not config.is_symlink():
+            checks["canonical_policy"] = _check(
+                "canonical_policy",
+                "pass",
+                "ok",
+                {"policy_digest": hashlib.sha256(config.read_bytes()).hexdigest()},
+            )
+        else:
+            # Preserve the 1.x preflight path and its durable failure state.
+            # Legacy policy absence is diagnosed by the existing preflight,
+            # not promoted into a new event-store admission condition.
+            checks["canonical_policy"] = _check(
+                "canonical_policy", "skipped", "legacy_uninitialized"
+            )
         checks["repository_identity"] = _check(
-            "repository_identity", "fail", "repository_identity_invalid"
+            "repository_identity", "skipped", "legacy_uninitialized"
         )
-    return _receipt("legacy", checks)
+    return StartupAdmission(receipt=_receipt("legacy", checks), policy=policy)
 
 
 def _receipt(mode: str, checks: Mapping[str, dict[str, Any]]) -> dict[str, Any]:
@@ -259,13 +322,13 @@ def _receipt(mode: str, checks: Mapping[str, dict[str, Any]]) -> dict[str, Any]:
     return receipt
 
 
-def run_startup_diagnostics(
+def prepare_startup_admission(
     repository: Path,
     *,
     plugin_root: Path | None = None,
     connection_factory: Callable[[Path], sqlite3.Connection] = _read_only_database,
-) -> dict[str, Any]:
-    """Return a deterministic admission receipt without mutating runtime state."""
+) -> StartupAdmission:
+    """Check startup state and retain exact capabilities outside the receipt."""
 
     repository = repository.resolve()
     try:
@@ -278,13 +341,15 @@ def run_startup_diagnostics(
         checks["repository_identity"] = _check(
             "repository_identity", "fail", "repository_identity_invalid"
         )
-        return _receipt("unknown", checks)
+        return StartupAdmission(receipt=_receipt("unknown", checks))
 
     marker_path = layout.state_root / CUTOVER_FILE
-    if not marker_path.exists() and not marker_path.is_symlink():
-        return _legacy_receipt(layout.working_root)
-
     database_path = layout.state_root / DATABASE_NAME
+    if not marker_path.exists() and not marker_path.is_symlink():
+        active_cutover = _active_cutover_in_existing_store(database_path)
+        if active_cutover is False:
+            return _legacy_admission(layout.working_root)
+
     checks: dict[str, dict[str, Any]] = {
         check_id: _check(check_id, "skipped", "dependency_failed")
         for check_id in CHECK_ORDER
@@ -354,13 +419,19 @@ def run_startup_diagnostics(
 
     if not database_path.is_file() or database_path.is_symlink():
         checks["quick_check"] = _check("quick_check", "fail", "database_unavailable")
-        return _receipt("transactional", checks)
+        return StartupAdmission(receipt=_receipt("transactional", checks), policy=policy)
+
+    try:
+        checked_database_identity = _database_identity(database_path)
+    except OSError:
+        checks["quick_check"] = _check("quick_check", "fail", "database_unavailable")
+        return StartupAdmission(receipt=_receipt("transactional", checks), policy=policy)
 
     try:
         database = connection_factory(database_path)
     except (OSError, sqlite3.Error):
         checks["quick_check"] = _check("quick_check", "fail", "database_unavailable")
-        return _receipt("transactional", checks)
+        return StartupAdmission(receipt=_receipt("transactional", checks), policy=policy)
 
     try:
         database.execute("BEGIN")
@@ -511,4 +582,32 @@ def run_startup_diagnostics(
         database.rollback()
     finally:
         database.close()
-    return _receipt("transactional", checks)
+    try:
+        if _database_identity(database_path) != checked_database_identity:
+            checks["quick_check"] = _check(
+                "quick_check", "fail", "database_unavailable"
+            )
+    except OSError:
+        checks["quick_check"] = _check("quick_check", "fail", "database_unavailable")
+    receipt = _receipt("transactional", checks)
+    return StartupAdmission(
+        receipt=receipt,
+        policy=policy,
+        database_path=database_path if receipt["healthy"] else None,
+        database_identity=checked_database_identity if receipt["healthy"] else None,
+    )
+
+
+def run_startup_diagnostics(
+    repository: Path,
+    *,
+    plugin_root: Path | None = None,
+    connection_factory: Callable[[Path], sqlite3.Connection] = _read_only_database,
+) -> dict[str, Any]:
+    """Return only the deterministic sanitized portion of startup admission."""
+
+    return prepare_startup_admission(
+        repository,
+        plugin_root=plugin_root,
+        connection_factory=connection_factory,
+    ).receipt

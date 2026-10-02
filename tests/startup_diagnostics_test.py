@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -19,12 +20,22 @@ SUPERVISOR = ROOT / "scripts/sprint-supervisor.py"
 CONTRACT = ROOT / "contracts/startup-diagnostic-v1.json"
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from event_store import canonical_json  # noqa: E402
+from event_store import (  # noqa: E402
+    EventStoreError,
+    TransactionalEventStore,
+    canonical_json,
+)
 from runtime_state import (  # noqa: E402
     initialize_repository_identity,
+    materialize_policy_snapshot,
     repository_layout,
+    resolve_canonical_policy,
 )
-from startup_diagnostics import CHECK_ORDER, run_startup_diagnostics  # noqa: E402
+from startup_diagnostics import (  # noqa: E402
+    CHECK_ORDER,
+    prepare_startup_admission,
+    run_startup_diagnostics,
+)
 from state_migration import activate_runtime_cutover, import_legacy_state  # noqa: E402
 
 
@@ -148,6 +159,47 @@ class StartupDiagnosticTests(unittest.TestCase):
         self.assertEqual(first["mode"], "legacy")
         self.assertEqual(before, after)
         self.assertEqual([item["id"] for item in first["checks"]], list(CHECK_ORDER))
+
+    def test_initialized_pre_cutover_is_deterministic_read_only_and_healthy(self) -> None:
+        repository = self.repository("initialized-pre-cutover", cutover=False)
+        initialize_repository_identity(
+            repository,
+            policy_ref="refs/heads/main",
+            policy_path=".orchestration/config.yaml",
+        )
+        before = self.runtime_snapshot(repository)
+
+        first = run_startup_diagnostics(repository, plugin_root=ROOT)
+        second = run_startup_diagnostics(repository, plugin_root=ROOT)
+
+        self.assertEqual(first, second)
+        self.assertTrue(first["healthy"], first)
+        self.assertEqual(first["mode"], "legacy")
+        self.assertEqual(before, self.runtime_snapshot(repository))
+        self.assertEqual(self.check(first, "repository_identity")["status"], "pass")
+        self.assertEqual(self.check(first, "canonical_policy")["status"], "pass")
+        for check_id in (
+            "quick_check",
+            "foreign_keys",
+            "schema",
+            "migration_ledger",
+            "cutover",
+            "minimum_version",
+        ):
+            self.assertEqual(self.check(first, check_id)["status"], "skipped")
+
+    def test_deleted_cutover_marker_cannot_downgrade_an_active_store(self) -> None:
+        repository = self.repository("deleted-cutover")
+        (repository_layout(repository).state_root / "cutover.json").unlink()
+
+        receipt = run_startup_diagnostics(repository, plugin_root=ROOT)
+
+        self.assertFalse(receipt["healthy"])
+        self.assertEqual(receipt["mode"], "transactional")
+        self.assertEqual(
+            self.check(receipt, "cutover")["reason_code"],
+            "cutover_marker_invalid",
+        )
 
     def test_machine_contract_matches_runtime_receipts(self) -> None:
         contract = json.loads(CONTRACT.read_text(encoding="utf-8"))
@@ -341,6 +393,202 @@ class StartupDiagnosticTests(unittest.TestCase):
             self.check(receipt, "minimum_version")["reason_code"],
             "minimum_version_not_met",
         )
+
+    def test_checked_database_identity_rejects_a_path_swap(self) -> None:
+        repository = self.repository("database-swap")
+        admission = prepare_startup_admission(repository, plugin_root=ROOT)
+        self.assertTrue(admission.receipt["healthy"])
+        self.assertIsNotNone(admission.database_identity)
+        database = self.database(repository)
+        replacement = database.with_name("replacement.sqlite3")
+        shutil.copy2(database, replacement)
+        os.chmod(replacement, 0o600)
+        os.replace(replacement, database)
+
+        identity = admission.database_identity
+        assert identity is not None
+        with self.assertRaisesRegex(EventStoreError, "identity changed"):
+            TransactionalEventStore(
+                database,
+                writer_identity="supervisor:test",
+                expected_database_identity=(identity.device, identity.inode),
+            )
+
+    def test_checked_policy_blob_survives_policy_ref_advance(self) -> None:
+        repository = self.repository("policy-race")
+        admission = prepare_startup_admission(repository, plugin_root=ROOT)
+        self.assertTrue(admission.receipt["healthy"])
+        checked = admission.policy
+        assert checked is not None
+        config = repository / ".orchestration/config.yaml"
+        config.write_text("integration_branch: changed\n", encoding="utf-8")
+        self.git(repository, "add", str(config.relative_to(repository)))
+        self.git(repository, "commit", "-q", "-m", "advance policy")
+        self.assertNotEqual(resolve_canonical_policy(repository).blob, checked.blob)
+
+        materialized = materialize_policy_snapshot(repository, checked)
+
+        self.assertEqual(materialized.read_bytes(), checked.content)
+        self.assertEqual(
+            hashlib.sha256(materialized.read_bytes()).hexdigest(), checked.digest
+        )
+
+    def test_runtime_path_faults_are_distinct_sanitized_and_stop_admission(self) -> None:
+        def chmod_path(path_getter: Callable[[Path], Path], mode: int) -> Callable:
+            def mutate(repository: Path) -> Callable[[], None]:
+                path = path_getter(repository)
+                original = path.stat().st_mode & 0o777
+                os.chmod(path, mode)
+                return lambda: os.chmod(path, original)
+
+            return mutate
+
+        def symlink_path(path_getter: Callable[[Path], Path]) -> Callable:
+            def mutate(repository: Path) -> Callable[[], None]:
+                path = path_getter(repository)
+                saved = path.with_name(path.name + ".saved")
+                path.rename(saved)
+                path.symlink_to(saved.name)
+
+                def restore() -> None:
+                    path.unlink()
+                    saved.rename(path)
+
+                return restore
+
+            return mutate
+
+        def malformed(path_getter: Callable[[Path], Path]) -> Callable:
+            def mutate(repository: Path) -> Callable[[], None]:
+                path = path_getter(repository)
+                original = path.read_bytes()
+                path.write_text("{", encoding="utf-8")
+                os.chmod(path, 0o600)
+                return lambda: path.write_bytes(original)
+
+            return mutate
+
+        def unavailable_database(repository: Path) -> Callable[[], None]:
+            path = self.database(repository)
+            saved = path.with_name(path.name + ".saved")
+            path.rename(saved)
+            return lambda: saved.rename(path)
+
+        def sidecar(repository: Path, *, symlink: bool) -> Callable[[], None]:
+            path = Path(f"{self.database(repository)}-journal")
+            if symlink:
+                target = path.with_name(path.name + ".target")
+                target.write_text("sidecar", encoding="utf-8")
+                os.chmod(target, 0o600)
+                path.symlink_to(target.name)
+
+                def restore() -> None:
+                    path.unlink()
+                    target.unlink()
+
+                return restore
+            path.write_text("sidecar", encoding="utf-8")
+            os.chmod(path, 0o644)
+            return lambda: path.unlink()
+
+        root = lambda repo: repository_layout(repo).state_root
+        identity = lambda repo: root(repo) / "repository.json"
+        marker = lambda repo: root(repo) / "cutover.json"
+        cases = [
+            ("state-root-mode", chmod_path(root, 0o755), "runtime_permissions", "runtime_path_permissions_invalid"),
+            ("state-root-symlink", symlink_path(root), "runtime_permissions", "runtime_path_permissions_invalid"),
+            ("identity-mode", chmod_path(identity, 0o644), "repository_identity", "repository_identity_invalid"),
+            ("identity-symlink", symlink_path(identity), "repository_identity", "repository_identity_invalid"),
+            ("identity-malformed", malformed(identity), "repository_identity", "repository_identity_invalid"),
+            ("cutover-mode", chmod_path(marker, 0o644), "cutover", "cutover_marker_invalid"),
+            ("cutover-symlink", symlink_path(marker), "cutover", "cutover_marker_invalid"),
+            ("cutover-malformed", malformed(marker), "cutover", "cutover_marker_invalid"),
+            ("database-unavailable", unavailable_database, "quick_check", "database_unavailable"),
+            ("sidecar-mode", lambda repo: sidecar(repo, symlink=False), "runtime_permissions", "database_permissions_invalid"),
+            ("sidecar-symlink", lambda repo: sidecar(repo, symlink=True), "runtime_permissions", "database_permissions_invalid"),
+        ]
+        for name, mutate, check_id, reason in cases:
+            with self.subTest(name=name):
+                repository = self.repository(name)
+                cleanup = mutate(repository)
+                try:
+                    receipt = run_startup_diagnostics(repository, plugin_root=ROOT)
+                    handshake = self.base / f"{name}-handshake.json"
+                    result = subprocess.run(
+                        [
+                            sys.executable,
+                            str(SUPERVISOR),
+                            "_run",
+                            "--repo",
+                            str(repository),
+                            "--handshake",
+                            str(handshake),
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=15,
+                    )
+                    response = json.loads(handshake.read_text(encoding="utf-8"))
+                finally:
+                    cleanup()
+                self.assertFalse(receipt["healthy"], receipt)
+                self.assertEqual(self.check(receipt, check_id)["reason_code"], reason)
+                self.assertNotIn(str(repository), canonical_json(receipt))
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(response["status"], "error")
+                self.assertFalse(response["startup_diagnostic"]["healthy"])
+                database = sqlite3.connect(self.database(repository))
+                try:
+                    self.assertEqual(database.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 0)
+                    self.assertEqual(database.execute("SELECT COUNT(*) FROM attempts").fetchone()[0], 0)
+                finally:
+                    database.close()
+
+    def test_invalid_authority_inputs_keep_distinct_reason_codes(self) -> None:
+        def invalid_identity(repository: Path) -> None:
+            path = repository_layout(repository).state_root / "repository.json"
+            path.write_text("{}\n", encoding="utf-8")
+
+        def invalid_policy(repository: Path) -> None:
+            self.git(repository, "update-ref", "-d", "refs/heads/main")
+
+        def invalid_cutover(repository: Path) -> None:
+            path = repository_layout(repository).state_root / "cutover.json"
+            path.write_text("{}\n", encoding="utf-8")
+
+        def invalid_minimum(repository: Path) -> None:
+            path = repository_layout(repository).state_root / "cutover.json"
+            marker = json.loads(path.read_text(encoding="utf-8"))
+            marker["minimum_orka_version"] = "not-a-version"
+            material = {key: marker[key] for key in sorted(marker) if key != "activation_id"}
+            marker["activation_id"] = "cutover-" + hashlib.sha256(
+                canonical_json(material).encode("utf-8")
+            ).hexdigest()
+            path.write_text(canonical_json(marker) + "\n", encoding="utf-8")
+            self.update_database(
+                repository,
+                "UPDATE runtime_cutovers SET activation_id = ?, marker_digest = ?, minimum_version = ?",
+                (
+                    marker["activation_id"],
+                    hashlib.sha256(canonical_json(marker).encode("utf-8")).hexdigest(),
+                    marker["minimum_orka_version"],
+                ),
+            )
+
+        cases = [
+            ("identity-invalid", invalid_identity, "repository_identity", "repository_identity_invalid"),
+            ("policy-invalid", invalid_policy, "canonical_policy", "canonical_policy_invalid"),
+            ("cutover-invalid", invalid_cutover, "cutover", "cutover_marker_invalid"),
+            ("minimum-invalid", invalid_minimum, "minimum_version", "minimum_version_invalid"),
+        ]
+        for name, mutate, check_id, reason in cases:
+            with self.subTest(name=name):
+                repository = self.repository(name)
+                mutate(repository)
+                receipt = run_startup_diagnostics(repository, plugin_root=ROOT)
+                self.assertFalse(receipt["healthy"], receipt)
+                self.assertEqual(self.check(receipt, check_id)["reason_code"], reason)
+                self.assertNotIn(str(repository), canonical_json(receipt))
 
     def test_failed_receipt_stops_before_planning_reservation_or_launch(self) -> None:
         repository = self.repository("admission")

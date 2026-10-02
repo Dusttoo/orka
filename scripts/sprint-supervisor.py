@@ -31,6 +31,7 @@ from typing import Any
 from runtime_state import (
     RuntimeStateError,
     canonical_config_path,
+    materialize_policy_snapshot,
     runtime_cutover_marker,
     shared_repository_root,
     shared_runtime_path,
@@ -66,7 +67,7 @@ from supervisor_state import (
     migrate_supervisor_state,
     migration_authorizes_runtime,
 )
-from startup_diagnostics import run_startup_diagnostics
+from startup_diagnostics import prepare_startup_admission, run_startup_diagnostics
 
 
 class SupervisorError(RuntimeError):
@@ -876,11 +877,13 @@ def status_response(state: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def planning_settings(repository: Path) -> dict[str, Any]:
+def planning_settings(
+    repository: Path, *, config_path: Path | None = None
+) -> dict[str, Any]:
     """Resolve optional planning settings without breaking lifecycle-only repos."""
 
     try:
-        config = load_yaml(canonical_config_path(repository))
+        config = load_yaml(config_path or canonical_config_path(repository))
     except (AgentError, RuntimeStateError) as exc:
         raise SupervisorError(str(exc)) from exc
     configured = str(config.get("sprint_id") or "").strip()
@@ -1140,9 +1143,10 @@ def run_daemon(repository: Path, handshake: Path) -> int:
             )
             return 2
 
-        startup_diagnostic = run_startup_diagnostics(
+        startup_admission = prepare_startup_admission(
             repository, plugin_root=PLUGIN_ROOT
         )
+        startup_diagnostic = startup_admission.receipt
         if not startup_diagnostic["healthy"]:
             write_handshake(
                 handshake,
@@ -1191,9 +1195,20 @@ def run_daemon(repository: Path, handshake: Path) -> int:
         if cutover_active:
             repository_binding = repository_identity(repository)
             writer_identity = f"supervisor:{repository_binding['repository_uuid']}"
+            if (
+                startup_admission.database_path is None
+                or startup_admission.database_identity is None
+            ):
+                raise SupervisorError(
+                    "healthy transactional diagnostics did not bind a database"
+                )
             event_store = TransactionalEventStore(
-                repository_layout(repository).state_root / "orka-state.sqlite3",
+                startup_admission.database_path,
                 writer_identity=writer_identity,
+                expected_database_identity=(
+                    startup_admission.database_identity.device,
+                    startup_admission.database_identity.inode,
+                ),
             )
             authoritative_state = AuthoritativeSupervisorState(
                 repository,
@@ -1202,7 +1217,11 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                 supervisor_fence=f"{lease_id}:{generation}",
             )
         try:
-            config_path = canonical_config_path(repository)
+            config_path = (
+                materialize_policy_snapshot(repository, startup_admission.policy)
+                if startup_admission.policy is not None
+                else canonical_config_path(repository)
+            )
         except RuntimeStateError as exc:
             write_handshake(handshake, {"status": "error", "error": str(exc)})
             return 2
@@ -1250,7 +1269,7 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                 raise SupervisorError(f"repository config is missing: {config_path}")
             config_digest = initial_config_digest
             runtime_digest = initial_runtime_digest
-            settings = planning_settings(repository)
+            settings = planning_settings(repository, config_path=config_path)
             if previous and not previous_clean:
                 state = takeover_state(
                     previous,

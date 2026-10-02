@@ -161,6 +161,7 @@ class TransactionalEventStore:
         local_filesystem: bool = False,
         busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
         schema_path: Path = SCHEMA_PATH,
+        expected_database_identity: tuple[int, int] | None = None,
     ) -> None:
         if not writer_identity.strip():
             raise WriterAuthorityError("writer identity must be non-empty")
@@ -169,17 +170,20 @@ class TransactionalEventStore:
         self.database_path = database_path.resolve()
         self._writer_identity = writer_identity
         self._busy_timeout_ms = busy_timeout_ms
+        self._expected_database_identity = expected_database_identity
         self._write_lock = threading.RLock()
         self._closed = False
         self._validate_database_path()
         self._writer_lock_handle = self._acquire_writer_lock()
         try:
+            self._verify_expected_database_identity()
             self._database = sqlite3.connect(
                 self.database_path,
                 timeout=busy_timeout_ms / 1000,
                 isolation_level=None,
                 check_same_thread=False,
             )
+            self._verify_expected_database_identity()
             os.chmod(self.database_path, 0o600)
             self._database.execute("PRAGMA foreign_keys = ON")
             self._database.execute("PRAGMA synchronous = FULL")
@@ -216,6 +220,23 @@ class TransactionalEventStore:
             mode = self.database_path.lstat().st_mode
             if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
                 raise EventStoreError("database path must be a regular file, not a symlink")
+
+    def _verify_expected_database_identity(self) -> None:
+        if self._expected_database_identity is None:
+            return
+        try:
+            metadata = self.database_path.lstat()
+        except OSError as exc:
+            raise EventStoreError("checked event-store database is unavailable") from exc
+        observed = (metadata.st_dev, metadata.st_ino)
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+            or observed != self._expected_database_identity
+        ):
+            raise EventStoreError(
+                "event-store database identity changed after startup diagnostics"
+            )
 
     def _acquire_writer_lock(self) -> Any:
         lock_path = self.database_path.with_name(self.database_path.name + ".writer.lock")
