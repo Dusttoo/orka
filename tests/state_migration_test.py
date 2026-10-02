@@ -15,7 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from event_store import TransactionalEventStore  # noqa: E402
+from event_store import SCHEMA_VERSION, TransactionalEventStore  # noqa: E402
 from runtime_state import (  # noqa: E402
     RuntimeStateError,
     assert_legacy_runtime_writable,
@@ -187,7 +187,7 @@ class LegacyStateMigrationTests(unittest.TestCase):
             exported["digests"]["legacy_snapshot"],
             inventory["normalized_export_digest"],
         )
-        self.assertEqual(exported["schema_version"], 3)
+        self.assertEqual(exported["schema_version"], SCHEMA_VERSION)
         self.assertNotIn("must not enter", first_export.decode())
         self.assertNotIn("sk-ant", first_export.decode())
         self.assertIn("attempt-PROJ-1-1", first_export.decode())

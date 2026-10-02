@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 SCHEMA_PATH = Path(__file__).resolve().parents[1] / "contracts/event-store-v1.sql"
 LEGACY_IMPORT_SCHEMA_PATH = (
@@ -30,6 +30,10 @@ LEGACY_IMPORT_SCHEMA_PATH = (
 )
 RUNTIME_CUTOVER_SCHEMA_PATH = (
     Path(__file__).resolve().parents[1] / "contracts/event-store-v3-runtime-cutover.sql"
+)
+EXECUTION_BACKEND_SCHEMA_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "contracts/event-store-v4-execution-backends.sql"
 )
 
 
@@ -141,6 +145,7 @@ def migration_specifications() -> tuple[tuple[int, str, Path], ...]:
         (1, "0001-initial-event-store", SCHEMA_PATH),
         (2, "0002-legacy-import", LEGACY_IMPORT_SCHEMA_PATH),
         (3, "0003-runtime-cutover", RUNTIME_CUTOVER_SCHEMA_PATH),
+        (4, "0004-execution-backends", EXECUTION_BACKEND_SCHEMA_PATH),
     )
 
 
@@ -806,6 +811,264 @@ class TransactionalEventStore:
             if updated != 1:
                 raise StaleWriteError("launch attempt projection is stale")
             return event
+
+    def consume_execution_key(
+        self,
+        *,
+        binding: Mapping[str, str],
+        backend_id: str,
+        envelope_digest: str,
+        idempotency_key: str,
+        writer_identity: str,
+        occurred_at: str | None = None,
+    ) -> TransitionResult:
+        """Permanently consume one complete backend execution key before launch.
+
+        This is intentionally not replayable as a second launch.  An event
+        replay proves that the key was already consumed; callers must inspect
+        or reconcile the existing execution rather than invoke a backend
+        again.
+        """
+
+        required = (
+            "repository_id",
+            "job_id",
+            "phase",
+            "attempt_token",
+            "dispatch_id",
+            "execution_unit_id",
+            "worktree_id",
+            "supervisor_fence",
+        )
+        if any(
+            not isinstance(binding.get(field), str) or not binding[field]
+            for field in required
+        ):
+            raise EventStoreError("execution backend binding is incomplete")
+        if (
+            not isinstance(backend_id, str)
+            or not backend_id.strip()
+            or not isinstance(envelope_digest, str)
+            or not envelope_digest.strip()
+        ):
+            raise EventStoreError("execution backend identity and envelope digest are required")
+        at = occurred_at or utc_now()
+        material = {field: binding[field] for field in required}
+        execution_key = _digest(canonical_json(material))
+        payload = {
+            "execution_key": execution_key,
+            "binding": material,
+            "backend_id": backend_id,
+            "envelope_digest": envelope_digest,
+            "state": "intended",
+        }
+        with self._transaction(writer_identity) as database:
+            existing = database.execute(
+                "SELECT state FROM execution_backends WHERE execution_key = ?",
+                (execution_key,),
+            ).fetchone()
+            if existing is not None:
+                raise StaleWriteError(
+                    "execution backend key was already consumed; reconcile the existing execution"
+                )
+            event = self._append_event(
+                database,
+                repository_id=material["repository_id"],
+                aggregate_type="execution_backend",
+                aggregate_id=execution_key,
+                aggregate_version=1,
+                event_type="execution_launch_intended",
+                idempotency_key=idempotency_key,
+                payload=payload,
+                occurred_at=at,
+            )
+            if event.replayed:
+                raise StaleWriteError(
+                    "execution backend key was already consumed; reconcile the existing execution"
+                )
+            database.execute(
+                """
+                INSERT INTO execution_backends(
+                    execution_key, repository_id, job_id, phase, attempt_token,
+                    dispatch_id, execution_unit_id, worktree_id, supervisor_fence,
+                    backend_id, envelope_digest, version, last_event_sequence,
+                    state, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 'intended', ?, ?)
+                """,
+                (
+                    execution_key,
+                    *(material[field] for field in required),
+                    backend_id,
+                    envelope_digest,
+                    event.sequence,
+                    at,
+                    at,
+                ),
+            )
+            return event
+
+    def record_execution_receipt(
+        self,
+        *,
+        binding: Mapping[str, str],
+        operation: str,
+        receipt: Mapping[str, Any],
+        target_state: str,
+        idempotency_key: str,
+        writer_identity: str,
+        occurred_at: str | None = None,
+    ) -> TransitionResult:
+        """Append one exact backend receipt to its consumed execution key."""
+
+        columns = {
+            "launch": "launch_receipt_json",
+            "attach": "attachment_receipt_json",
+            "heartbeat": "heartbeat_receipt_json",
+            "progress": "progress_receipt_json",
+            "cancel": "cancellation_receipt_json",
+            "inspect": "inspection_receipt_json",
+            "terminal": "terminal_receipt_json",
+            "fence": "fence_receipt_json",
+            "uncertain": "launch_receipt_json",
+        }
+        if operation not in columns:
+            raise EventStoreError(
+                f"unsupported execution backend operation: {operation}"
+            )
+        operation_states = {
+            "launch": {"launched"},
+            "uncertain": {"uncertain"},
+            "attach": {"attached"},
+            "heartbeat": {"attached", "cancelling"},
+            "progress": {"attached", "cancelling"},
+            "inspect": {"attached", "cancelling"},
+            "cancel": {"cancelling"},
+            "terminal": {"terminal"},
+            "fence": {"fenced"},
+        }
+        if target_state not in operation_states[operation]:
+            raise EventStoreError(
+                f"execution backend {operation} cannot record state {target_state}"
+            )
+        required = (
+            "repository_id", "job_id", "phase", "attempt_token", "dispatch_id",
+            "execution_unit_id", "worktree_id", "supervisor_fence",
+        )
+        material = {field: binding.get(field) for field in required}
+        if any(not isinstance(value, str) or not value for value in material.values()):
+            raise EventStoreError("execution backend binding is incomplete")
+        if not isinstance(receipt, Mapping):
+            raise EventStoreError("execution backend receipt must be an object")
+        execution_key = _digest(canonical_json(material))
+        at = occurred_at or utc_now()
+        allowed_from = {
+            "launch": {"intended"},
+            "uncertain": {"intended"},
+            "attach": {"launched", "attached"},
+            "heartbeat": {"launched", "attached", "cancelling"},
+            "progress": {"launched", "attached", "cancelling"},
+            "inspect": {"launched", "attached", "cancelling"},
+            "cancel": {"launched", "attached", "cancelling"},
+            "terminal": {"launched", "attached", "cancelling"},
+            "fence": {"launched", "attached", "cancelling"},
+        }
+        payload = {
+            "execution_key": execution_key,
+            "binding": material,
+            "operation": operation,
+            "receipt": dict(receipt),
+            "state": target_state,
+        }
+        with self._transaction(writer_identity) as database:
+            replay = self._existing_event(
+                database,
+                repository_id=material["repository_id"],
+                aggregate_type="execution_backend",
+                aggregate_id=execution_key,
+                event_type=f"execution_{operation}_recorded",
+                idempotency_key=idempotency_key,
+                payload=payload,
+            )
+            if replay is not None:
+                return replay
+            row = database.execute(
+                """
+                SELECT repository_id, job_id, phase, attempt_token, dispatch_id,
+                       execution_unit_id, worktree_id, supervisor_fence, version, state
+                FROM execution_backends WHERE execution_key = ?
+                """,
+                (execution_key,),
+            ).fetchone()
+            if row is None or tuple(map(str, row[:8])) != tuple(
+                material[field] for field in required
+            ):
+                raise StaleWriteError("execution backend receipt binding is stale")
+            if str(row[9]) not in allowed_from[operation]:
+                raise StaleWriteError(
+                    f"execution backend {operation} is stale from state {row[9]}"
+                )
+            version = int(row[8]) + 1
+            event = self._append_event(
+                database,
+                repository_id=material["repository_id"],
+                aggregate_type="execution_backend",
+                aggregate_id=execution_key,
+                aggregate_version=version,
+                event_type=f"execution_{operation}_recorded",
+                idempotency_key=idempotency_key,
+                payload=payload,
+                occurred_at=at,
+            )
+            column = columns[operation]
+            updated = database.execute(
+                f"""
+                UPDATE execution_backends
+                SET state = ?, version = ?, last_event_sequence = ?,
+                    {column} = ?, updated_at = ?
+                WHERE execution_key = ? AND version = ?
+                """,
+                (
+                    target_state,
+                    version,
+                    event.sequence,
+                    canonical_json(receipt),
+                    at,
+                    execution_key,
+                    version - 1,
+                ),
+            ).rowcount
+            if updated != 1:
+                raise StaleWriteError("execution backend record changed concurrently")
+            return event
+
+    def execution_record(self, binding: Mapping[str, str]) -> dict[str, Any] | None:
+        required = (
+            "repository_id", "job_id", "phase", "attempt_token", "dispatch_id",
+            "execution_unit_id", "worktree_id", "supervisor_fence",
+        )
+        material = {field: binding.get(field) for field in required}
+        if any(not isinstance(value, str) or not value for value in material.values()):
+            raise EventStoreError("execution backend binding is incomplete")
+        execution_key = _digest(canonical_json(material))
+        with self._write_lock:
+            row = self._database.execute(
+                "SELECT * FROM execution_backends WHERE execution_key = ?",
+                (execution_key,),
+            )
+            names = [item[0] for item in row.description or []]
+            value = row.fetchone()
+        if value is None:
+            return None
+        result = dict(zip(names, value))
+        for name in (
+            "launch_receipt_json", "attachment_receipt_json", "heartbeat_receipt_json",
+            "progress_receipt_json", "cancellation_receipt_json",
+            "fence_receipt_json", "inspection_receipt_json", "terminal_receipt_json",
+        ):
+            result[name.removesuffix("_json")] = (
+                json.loads(str(result[name])) if result.get(name) else None
+            )
+        return result
 
     def complete_job(
         self,
@@ -1741,6 +2004,7 @@ class TransactionalEventStore:
         allowed = {
             "attempts",
             "events",
+            "execution_backends",
             "external_operations",
             "jobs",
             "legacy_records",

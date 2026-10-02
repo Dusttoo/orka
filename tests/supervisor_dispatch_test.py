@@ -19,6 +19,7 @@ from supervisor_dispatch import (  # noqa: E402
     StaleResultError,
     SupervisorDispatcher,
 )
+from event_store import RepositoryBinding, TransactionalEventStore  # noqa: E402
 
 
 class FakeAdapter:
@@ -30,7 +31,13 @@ class FakeAdapter:
         self.requeued: list[dict] = []
 
     def phase_capability_offer(self, contract: dict) -> dict:
-        profile = "api" if self.origin == "api" else "codex-desktop"
+        profile = (
+            "api"
+            if self.origin == "api"
+            else "claude-desktop"
+            if self.origin == "claude"
+            else "codex-desktop"
+        )
         profile_capability = (
             "provider-receipts" if profile == "api" else "desktop-subscription"
         )
@@ -109,6 +116,13 @@ class SelectiveFailureAdapter(FakeAdapter):
         if ticket == "PNP-1":
             raise DispatchError("ticket-local reservation rejection")
         return super().reserve(sprint, ticket, run_ref)
+
+
+class UnsupportedBackendAdapter(FakeAdapter):
+    def phase_capability_offer(self, contract: dict) -> dict:
+        offer = super().phase_capability_offer(contract)
+        offer["adapter"] = "remote"
+        return offer
 
 
 class DispatchTests(unittest.TestCase):
@@ -201,6 +215,200 @@ class DispatchTests(unittest.TestCase):
         prompt = Path(first["paths"]["prompt"]).read_text(encoding="utf-8")
         self.assertIn('"kind":"job"', prompt)
         self.assertIn('"phase":"implement"', prompt)
+
+    def test_current_codex_claude_and_api_routes_share_one_backend_contract(self) -> None:
+        for origin, profile in (
+            ("desktop", "codex-desktop"),
+            ("claude", "claude-desktop"),
+            ("api", "api"),
+        ):
+            with self.subTest(origin=origin):
+                adapter = FakeAdapter(self.temp, origin)
+                dispatcher = SupervisorDispatcher(
+                    self.repo,
+                    self.runtime,
+                    ROOT / "contracts/supervisor-lifecycle-v1.json",
+                    adapter,
+                )
+                job = dispatcher.launch("99", f"PNP-{adapter.count + 1}")
+                backend = job["execution_backend"]
+                self.assertEqual(
+                    backend["offer"]["backend_id"],
+                    f"orka-current-route/{profile}",
+                )
+                phase_identity = job["phase_execution"]["active"]["identity"]
+                self.assertEqual(
+                    backend["launch_receipt"]["binding"],
+                    {
+                        field: phase_identity[field]
+                        for field in dispatcher.execution_backend_contract[
+                            "identity_fields"
+                        ]
+                    },
+                )
+                self.assertEqual(
+                    backend["attachment_receipt"]["worker_identity"],
+                    job["execution_identity"],
+                )
+                self.assertNotIn(
+                    f"launch-{job['ticket']}-{adapter.count}",
+                    json.dumps(backend),
+                )
+                heartbeat = dispatcher.heartbeat_execution(job)
+                progress = dispatcher.progress_execution(job)
+                self.assertEqual(heartbeat["observed_status"], "unknown")
+                self.assertEqual(progress["observed_status"], "unknown")
+
+    def test_unsupported_backend_fails_before_reservation(self) -> None:
+        adapter = UnsupportedBackendAdapter(self.temp)
+        dispatcher = SupervisorDispatcher(
+            self.repo,
+            self.runtime,
+            ROOT / "contracts/supervisor-lifecycle-v1.json",
+            adapter,
+        )
+
+        with self.assertRaisesRegex(DispatchError, "unsupported adapter profile"):
+            dispatcher.launch("99", "PNP-1")
+
+        self.assertEqual(adapter.count, 0)
+
+    def test_transactional_dispatch_restores_exact_backend_after_restart(self) -> None:
+        repository_id = "repository:dispatch-fixture"
+        store = TransactionalEventStore(
+            self.temp / "orka-state.sqlite3", writer_identity="supervisor:test"
+        )
+        self.addCleanup(store.close)
+        store.bind_repository(
+            RepositoryBinding(
+                repository_id=repository_id,
+                common_directory=str(self.repo / ".git"),
+                object_directory_id="objects",
+                policy_ref="refs/heads/main",
+                policy_path="orchestration.yml",
+                policy_commit="a" * 40,
+                policy_blob="b" * 40,
+                policy_digest="policy",
+                created_at="2026-10-02T00:00:00Z",
+            ),
+            writer_identity="supervisor:test",
+        )
+        first = SupervisorDispatcher(
+            self.repo,
+            self.runtime,
+            ROOT / "contracts/supervisor-lifecycle-v1.json",
+            self.adapter,
+            event_store=store,
+            writer_identity="supervisor:test",
+            repository_id=repository_id,
+        )
+        job = first.launch("99", "PNP-1", phase="implement")
+        binding_value = job["execution_backend"]["binding"]
+        self.assertEqual(store.execution_record(binding_value)["state"], "attached")
+        self.write_result(job, self.envelope(job))
+
+        restarted = SupervisorDispatcher(
+            self.repo,
+            self.runtime,
+            ROOT / "contracts/supervisor-lifecycle-v1.json",
+            self.adapter,
+            event_store=store,
+            writer_identity="supervisor:test",
+            repository_id=repository_id,
+        )
+        applied = restarted.apply_terminal(job)
+        self.assertTrue(applied["applied"])
+        self.assertEqual(store.execution_record(binding_value)["state"], "terminal")
+
+    def test_transactional_process_exit_without_result_fences_execution(self) -> None:
+        repository_id = "repository:dispatch-exit-fixture"
+        store = TransactionalEventStore(
+            self.temp / "orka-exit-state.sqlite3", writer_identity="supervisor:test"
+        )
+        self.addCleanup(store.close)
+        store.bind_repository(
+            RepositoryBinding(
+                repository_id=repository_id,
+                common_directory=str(self.repo / ".git"),
+                object_directory_id="objects",
+                policy_ref="refs/heads/main",
+                policy_path="orchestration.yml",
+                policy_commit="a" * 40,
+                policy_blob="b" * 40,
+                policy_digest="policy",
+                created_at="2026-10-02T00:00:00Z",
+            ),
+            writer_identity="supervisor:test",
+        )
+        dispatcher = SupervisorDispatcher(
+            self.repo,
+            self.runtime,
+            ROOT / "contracts/supervisor-lifecycle-v1.json",
+            self.adapter,
+            event_store=store,
+            writer_identity="supervisor:test",
+            repository_id=repository_id,
+        )
+        job = dispatcher.launch("99", "PNP-1", phase="implement")
+        binding_value = job["execution_backend"]["binding"]
+        self.write_tombstone(job)
+
+        applied = dispatcher.apply_process_exit(job)
+
+        self.assertEqual(applied["terminal"]["event"], "worker_result_invalid")
+        self.assertEqual(store.execution_record(binding_value)["state"], "fenced")
+
+        malformed = dispatcher.launch("99", "PNP-2", phase="implement")
+        malformed_binding = malformed["execution_backend"]["binding"]
+        self.write_result(malformed, {"not": "the terminal schema"})
+        self.write_tombstone(malformed)
+        malformed_result = dispatcher.apply_process_exit(malformed)
+        self.assertEqual(
+            malformed_result["terminal"]["event"], "worker_result_invalid"
+        )
+        self.assertEqual(
+            store.execution_record(malformed_binding)["state"], "fenced"
+        )
+
+    def test_transactional_current_route_cancellation_persists_request_and_fence(self) -> None:
+        repository_id = "repository:dispatch-cancel-fixture"
+        store = TransactionalEventStore(
+            self.temp / "orka-cancel-state.sqlite3", writer_identity="supervisor:test"
+        )
+        self.addCleanup(store.close)
+        store.bind_repository(
+            RepositoryBinding(
+                repository_id=repository_id,
+                common_directory=str(self.repo / ".git"),
+                object_directory_id="objects",
+                policy_ref="refs/heads/main",
+                policy_path="orchestration.yml",
+                policy_commit="a" * 40,
+                policy_blob="b" * 40,
+                policy_digest="policy",
+                created_at="2026-10-02T00:00:00Z",
+            ),
+            writer_identity="supervisor:test",
+        )
+        dispatcher = SupervisorDispatcher(
+            self.repo,
+            self.runtime,
+            ROOT / "contracts/supervisor-lifecycle-v1.json",
+            self.adapter,
+            event_store=store,
+            writer_identity="supervisor:test",
+            repository_id=repository_id,
+        )
+        job = dispatcher.launch("99", "PNP-1", phase="implement")
+        binding_value = job["execution_backend"]["binding"]
+
+        result = dispatcher.cancel_execution(job, reason="operator drain")
+
+        self.assertTrue(result["replacement_safe"])
+        record = store.execution_record(binding_value)
+        self.assertEqual(record["state"], "fenced")
+        self.assertEqual(record["cancellation_receipt"]["status"], "requested")
+        self.assertEqual(record["fence_receipt"]["status"], "fenced")
 
     def test_legacy_terminal_is_attributed_to_protocol_execution(self) -> None:
         job = self.dispatcher.launch("99", "PNP-1", phase="implement")

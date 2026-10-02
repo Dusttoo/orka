@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from context_pipeline import llm_route_from_config
+from controller_runtime import execute_request, supervisor_request
 from breaker_runtime import BreakerRuntime, BreakerRuntimeError
 from github_progress import (
     ProgressError,
@@ -29,6 +30,14 @@ from github_progress import (
 )
 from provider_health import DESKTOP_CLIENTS, ProviderHealth, route_identity
 from phase_execution import PhaseExecutionError, PhaseExecutionRuntime
+from execution_backend import (
+    BackendContractError,
+    BackendCoordinator,
+    TransactionalBackendState,
+    _digest as backend_digest,
+    _launch_receipt_digest,
+)
+from execution_backend_contract import load_contract as load_backend_contract
 from phase_worker_adapter import (
     AdapterProtocolError,
     capability_offer,
@@ -68,6 +77,7 @@ API_AGENT = Path(__file__).with_name("api_agent.py")
 CONTEXT_PIPELINE = Path(__file__).with_name("context_pipeline.py")
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 PHASE_CONTRACT = PLUGIN_ROOT / "contracts/phase-worker-protocol-v1.json"
+EXECUTION_BACKEND_CONTRACT = PLUGIN_ROOT / "contracts/execution-backend-v1.json"
 RESULT_SCHEMA = "orka.worker-terminal-result/v1"
 TERMINAL_OUTCOMES = {
     "completed",
@@ -286,10 +296,22 @@ def result_prompt(
 class ControllerDispatchAdapter:
     """Mutation adapter; every operation remains fenced by sprint-controller."""
 
-    def __init__(self, repository: Path, runtime_directory: Path):
+    def __init__(
+        self,
+        repository: Path,
+        runtime_directory: Path,
+        *,
+        supervisor_fence: str = "",
+        writer_identity: str = "",
+        event_store: Any | None = None,
+    ):
         self.repository = repository.resolve()
         self.runtime_directory = runtime_directory.resolve()
         self.config = canonical_config_path(self.repository)
+        self.supervisor_fence = supervisor_fence
+        self.writer_identity = writer_identity
+        self.event_store = event_store
+        self.private_root = runtime_directory / "controller-materializations"
 
     def phase_capability_offer(self, contract: dict[str, Any]) -> dict[str, Any]:
         """Advertise the installed route before reservation or provider work."""
@@ -310,6 +332,34 @@ class ControllerDispatchAdapter:
         )
 
     def _run(self, *arguments: str) -> dict[str, Any]:
+        if self.event_store is not None:
+            try:
+                request = supervisor_request(
+                    self.repository,
+                    arguments,
+                    self.supervisor_fence,
+                    store=self.event_store,
+                )
+                response = execute_request(
+                    self.repository,
+                    request,
+                    supervisor_fence=self.supervisor_fence,
+                    writer_identity=self.writer_identity,
+                    private_root=self.private_root,
+                    controller_path=CONTROLLER,
+                    store=self.event_store,
+                )
+                result = subprocess.CompletedProcess(
+                    args=list(arguments),
+                    returncode=int(response["returncode"]),
+                    stdout=str(response.get("stdout") or ""),
+                    stderr=str(response.get("stderr") or ""),
+                )
+                return parse_json_output(result, arguments[0])
+            except Exception as exc:
+                raise DispatchError(
+                    f"cannot run transactional controller {arguments[0]}: {exc}"
+                ) from exc
         try:
             result = subprocess.run(
                 [sys.executable, str(CONTROLLER), *arguments],
@@ -631,6 +681,281 @@ class ControllerDispatchAdapter:
         )
 
 
+class CurrentRouteExecutionBackend:
+    """Production adapter for today's Codex, Claude, and API host paths.
+
+    Provider command construction remains in ``ControllerDispatchAdapter``;
+    the supervisor sees only the versioned execution-backend lifecycle.
+    """
+
+    def __init__(
+        self, adapter: ControllerDispatchAdapter, phase_contract: dict[str, Any]
+    ) -> None:
+        self.adapter = adapter
+        self.phase_contract = phase_contract
+        self.profile = ""
+        self.material: dict[str, Any] = {}
+
+    def bind_launch(
+        self,
+        *,
+        sprint: str,
+        ticket: str,
+        reservation: dict[str, Any],
+        prompt_path: Path,
+        output_path: Path,
+        result_path: Path,
+    ) -> None:
+        self.material = {
+            "sprint": sprint,
+            "ticket": ticket,
+            "reservation": reservation,
+            "prompt_path": prompt_path,
+            "output_path": output_path,
+            "result_path": result_path,
+        }
+
+    def _profile(self) -> str:
+        offer = self.adapter.phase_capability_offer(self.phase_contract)
+        profile = str(offer.get("adapter") or "")
+        if profile not in {"codex-desktop", "claude-desktop", "api"}:
+            raise BackendContractError("current route has no supported execution profile")
+        self.profile = profile
+        return profile
+
+    def discover(self) -> dict[str, Any]:
+        profile = self._profile()
+        desktop = profile != "api"
+        return {
+            "backend_id": f"orka-current-route/{profile}",
+            "backend_version": "1",
+            "protocol_version": 1,
+            "test_only": False,
+            "lifecycle": [
+                "launch", "attach", "heartbeat", "progress", "cancel",
+                "inspect", "terminal",
+            ],
+            "containment": {
+                "process": "shared-host" if desktop else "isolated-process",
+                "filesystem": "worktree",
+                "network": "unrestricted",
+                "credentials": "ambient",
+                "process_control": "inspect-cancel",
+            },
+            "provider_capabilities": [
+                "desktop-subscription" if desktop else "provider-receipts"
+            ],
+        }
+
+    def launch(
+        self, binding: dict[str, str], envelope: dict[str, Any]
+    ) -> dict[str, Any]:
+        if not self.material:
+            raise BackendContractError("execution backend launch material is missing")
+        launch = self.adapter.launch(
+            self.material["sprint"],
+            self.material["ticket"],
+            self.material["reservation"],
+            self.material["prompt_path"],
+            self.material["output_path"],
+            self.material["result_path"],
+        )
+        launch_evidence = str(launch.get("launch_evidence") or "")
+        if not launch_evidence:
+            raise BackendContractError("current route omitted launch evidence")
+        attached = self.adapter.attach(
+            self.material["sprint"], self.material["ticket"], launch_evidence
+        )
+        identity = attached.get("worker_identity")
+        if not isinstance(identity, dict) or not identity.get("invocation_id"):
+            raise BackendContractError(
+                "current route omitted an execution-unit identity"
+            )
+        profile = self.profile or self._profile()
+        backend_instance_id = f"orka-current-route/{profile}/1"
+        # The launch token is a one-use attach bearer and is consumed above.
+        # Persist only an opaque digest as the backend handle.
+        backend_handle = "launch:" + backend_digest(launch_evidence)
+        process_identity = backend_digest(identity)
+        envelope_digest = backend_digest(envelope)
+        return {
+            "status": "launched",
+            "binding": dict(binding),
+            "backend_instance_id": backend_instance_id,
+            "backend_handle": backend_handle,
+            "process_identity": process_identity,
+            "envelope_digest": envelope_digest,
+            "launch_receipt": _launch_receipt_digest(
+                binding,
+                backend_instance_id=backend_instance_id,
+                backend_handle=backend_handle,
+                process_identity=process_identity,
+                envelope_digest=envelope_digest,
+            ),
+            "backend_metadata": {
+                "worker_identity": identity,
+            },
+        }
+
+    @staticmethod
+    def _event(
+        binding: dict[str, str], launch: dict[str, Any], status: str, **extra: Any
+    ) -> dict[str, Any]:
+        value = {
+            "status": status,
+            "binding": dict(binding),
+            "backend_handle": launch["backend_handle"],
+            **extra,
+        }
+        value["evidence_receipt"] = backend_digest(value)
+        return value
+
+    @staticmethod
+    def _identity(launch: dict[str, Any]) -> dict[str, Any]:
+        metadata = launch.get("backend_metadata") or {}
+        identity = metadata.get("worker_identity")
+        if not isinstance(identity, dict) or not identity.get("invocation_id"):
+            raise BackendContractError("launch receipt has no worker identity")
+        return identity
+
+    def attach(
+        self, binding: dict[str, str], launch: dict[str, Any]
+    ) -> dict[str, Any]:
+        return self._event(
+            binding,
+            launch,
+            "attached",
+            worker_identity=self._identity(launch),
+        )
+
+    def heartbeat(
+        self, binding: dict[str, str], launch: dict[str, Any]
+    ) -> dict[str, Any]:
+        observation = self.inspect(binding, launch)
+        return self._event(
+            binding,
+            launch,
+            "heartbeat",
+            observed_at=time.time(),
+            observed_status=observation["status"],
+            observation_receipt=observation["evidence_receipt"],
+        )
+
+    def progress(
+        self, binding: dict[str, str], launch: dict[str, Any]
+    ) -> dict[str, Any]:
+        observation = self.inspect(binding, launch)
+        return self._event(
+            binding,
+            launch,
+            "progress",
+            observed_at=time.time(),
+            observed_status=observation["status"],
+            observation_receipt=observation["evidence_receipt"],
+        )
+
+    def _terminal_result(
+        self, binding: dict[str, str], launch: dict[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        if not self.material or not Path(self.material["result_path"]).is_file():
+            raise BackendContractError("execution has no structured terminal result")
+        result, _digest_value = extract_terminal_result(self.material["result_path"])
+        identity = self._identity(launch)
+        validated = validate_terminal_result(
+            result,
+            ticket=self.material["ticket"],
+            sprint=self.material["sprint"],
+            attempt_token=binding["attempt_token"],
+            invocation_id=str(identity["invocation_id"]),
+        )
+        ticket_id = str(self.material["ticket"])
+        terminal = {
+            **binding,
+            "ticket_id": ticket_id,
+            "kind": "terminal",
+            "protocol_version": 1,
+            "outcome": validated["outcome"],
+            "summary": validated["summary"],
+            "artifacts": {
+                key: validated[key]
+                for key in ("branch", "pr")
+                if isinstance(validated.get(key), str) and validated[key]
+            },
+            "evidence": dict(validated.get("evidence") or {}),
+        }
+        return validated, terminal
+
+    def terminal(
+        self, binding: dict[str, str], launch: dict[str, Any]
+    ) -> dict[str, Any]:
+        validated, terminal = self._terminal_result(binding, launch)
+        return self._event(
+            binding,
+            launch,
+            "terminal",
+            terminal_envelope=terminal,
+            terminal_result=validated,
+        )
+
+    def inspect(
+        self, binding: dict[str, str], launch: dict[str, Any]
+    ) -> dict[str, Any]:
+        identity = self._identity(launch)
+        tombstone_path = Path(str(identity.get("tombstone_path") or ""))
+        if not tombstone_path.is_file():
+            # A missing terminal record does not mechanically prove that the
+            # original process is still live. Preserve uncertainty instead of
+            # inferring liveness from the absence of absence evidence.
+            return self._event(binding, launch, "unknown")
+        try:
+            tombstone = json.loads(_regular_private_file(tombstone_path, "execution tombstone"))
+        except (DispatchError, json.JSONDecodeError):
+            return self._event(binding, launch, "unknown")
+        if (
+            not isinstance(tombstone, dict)
+            or tombstone.get("phase") != "terminal"
+            or tombstone.get("invocation_id") != identity.get("invocation_id")
+        ):
+            return self._event(binding, launch, "unknown")
+        if self.material and Path(self.material["result_path"]).is_file():
+            try:
+                return self.terminal(binding, launch)
+            except (BackendContractError, DispatchError, StaleResultError):
+                # The output is invalid, but the exact host tombstone still
+                # proves that the original execution is absent. The
+                # supervisor will classify the malformed result separately.
+                pass
+        return self._event(
+            binding,
+            launch,
+            "absent",
+            absence_receipt={
+                "backend_instance_id": launch["backend_instance_id"],
+                "backend_handle": launch["backend_handle"],
+                "original_process_identity": launch["process_identity"],
+                "inspection_receipt": backend_digest(tombstone),
+            },
+        )
+
+    def cancel(
+        self,
+        binding: dict[str, str],
+        launch: dict[str, Any],
+        request: dict[str, Any],
+    ) -> dict[str, Any]:
+        # The current host primitive has no exact acknowledgement handshake.
+        # Report a request only; the supervisor must retain or fence the lane.
+        return self._event(
+            binding,
+            launch,
+            "requested",
+            cancellation_id=request["cancellation_id"],
+        )
+
+    def verify_cancellation_ack(self, *_args: Any) -> bool:
+        return False
+
+
 class SupervisorDispatcher:
     def __init__(
         self,
@@ -642,11 +967,18 @@ class SupervisorDispatcher:
         retry_delay_seconds: float = 30.0,
         breaker_contract_path: Path | None = None,
         supervisor_fence: str | None = None,
+        event_store: Any | None = None,
+        writer_identity: str = "",
+        repository_id: str | None = None,
     ) -> None:
         self.repository = repository.resolve()
         self.runtime_directory = runtime_directory.resolve()
         self.adapter = adapter or ControllerDispatchAdapter(
-            repository, runtime_directory
+            repository,
+            runtime_directory,
+            supervisor_fence=supervisor_fence or "",
+            writer_identity=writer_identity,
+            event_store=event_store,
         )
         if retry_delay_seconds < 5 or retry_delay_seconds > 3600:
             raise DispatchError("retry delay must be from 5 through 3600 seconds")
@@ -666,7 +998,7 @@ class SupervisorDispatcher:
             )
         except BreakerRuntimeError as exc:
             raise DispatchError(str(exc)) from exc
-        repository_id = "repository:" + hashlib.sha256(
+        repository_id = repository_id or "repository:" + hashlib.sha256(
             str(self.repository).encode("utf-8")
         ).hexdigest()
         try:
@@ -679,6 +1011,85 @@ class SupervisorDispatcher:
             )
         except (PhaseExecutionError, PhaseContractError) as exc:
             raise DispatchError(str(exc)) from exc
+        try:
+            self.execution_backend_contract = load_backend_contract(
+                EXECUTION_BACKEND_CONTRACT
+            )
+        except Exception as exc:
+            raise DispatchError(f"cannot load execution-backend contract: {exc}") from exc
+        self.backend_state = (
+            TransactionalBackendState(event_store, writer_identity=writer_identity)
+            if event_store is not None and writer_identity
+            else None
+        )
+
+    def _execution_backend(
+        self,
+        *,
+        sprint: str,
+        ticket: str,
+        reservation: dict[str, Any] | None,
+        paths: dict[str, Path],
+    ) -> tuple[CurrentRouteExecutionBackend, BackendCoordinator]:
+        backend = CurrentRouteExecutionBackend(
+            self.adapter, self.phase_runtime.contract
+        )
+        if reservation is not None:
+            backend.bind_launch(
+                sprint=sprint,
+                ticket=ticket,
+                reservation=reservation,
+                prompt_path=paths["prompt"],
+                output_path=paths["output"],
+                result_path=paths["result"],
+            )
+        coordinator = BackendCoordinator(
+            self.execution_backend_contract,
+            backend,
+            state_store=self.backend_state,
+        )
+        try:
+            coordinator.negotiate(
+                required={
+                    "lifecycle": [
+                        "launch", "attach", "heartbeat", "progress", "cancel",
+                        "inspect", "terminal",
+                    ],
+                    "containment": {"filesystem": "worktree"},
+                }
+            )
+        except BackendContractError as exc:
+            raise DispatchError(f"execution backend is incompatible: {exc}") from exc
+        return backend, coordinator
+
+    def _restore_execution_backend(
+        self, job: dict[str, Any]
+    ) -> tuple[CurrentRouteExecutionBackend, BackendCoordinator, dict[str, str]]:
+        state = job.get("phase_execution")
+        backend_state = job.get("execution_backend") or {}
+        if not isinstance(state, dict) or not isinstance(state.get("executions"), list):
+            raise DispatchError("job has no disposable phase execution")
+        executions = state["executions"]
+        if not executions:
+            raise DispatchError("job has no execution-backend binding")
+        record = executions[-1]
+        identity = record.get("identity")
+        envelope = record.get("job")
+        launch_receipt = backend_state.get("launch_receipt")
+        if not isinstance(identity, dict) or not isinstance(envelope, dict):
+            raise DispatchError("job execution-backend identity is malformed")
+        paths = {key: Path(value) for key, value in (job.get("paths") or {}).items()}
+        backend, coordinator = self._execution_backend(
+            sprint=str(job["sprint"]),
+            ticket=str(job["ticket"]),
+            reservation={},
+            paths=paths,
+        )
+        try:
+            coordinator.restore(identity, envelope, launch_receipt)
+        except BackendContractError as exc:
+            raise DispatchError(f"execution backend restore failed: {exc}") from exc
+        return backend, coordinator, identity
 
     def _worker_transition(self, outcome: str) -> tuple[str, str]:
         event = (self.contract.get("worker_terminal_results") or {}).get(outcome)
@@ -918,15 +1329,21 @@ class SupervisorDispatcher:
             resource_claim_digest = claim_set_digest(resource_claims)
         except AdmissionError as exc:
             raise DispatchError(str(exc)) from exc
-        # Negotiation is deliberately first: an incompatible installed adapter
-        # cannot consume a controller reservation, attempt, or provider request.
+        # Both protocol and execution-backend negotiation deliberately happen
+        # before reservation or provider work.
         capability_offer, negotiation_receipt = self._phase_capability_offer()
         run_ref = f"supervisor-{ticket}-{uuid.uuid4().hex}"
+        paths = self._job_paths(run_ref)
+        _backend, backend_coordinator = self._execution_backend(
+            sprint=sprint,
+            ticket=ticket,
+            reservation=None,
+            paths=paths,
+        )
         reservation = self.adapter.reserve(sprint, ticket, run_ref)
         attempt_token = str(reservation.get("attempt_token") or "")
         if not attempt_token or not reservation.get("attach_capability"):
             raise DispatchError("controller reservation omitted launch capabilities")
-        paths = self._job_paths(run_ref)
         try:
             phase_execution = self.phase_runtime.create_job(
                 ticket_id=ticket,
@@ -964,6 +1381,7 @@ class SupervisorDispatcher:
             "terminal": {},
             "phase_execution": phase_execution,
             "phase_negotiation": negotiation_receipt,
+            "execution_backend": {},
             "resource_claims": resource_claims,
             "resource_claim_schema": CLAIM_SCHEMA,
             "resource_claim_digest": resource_claim_digest,
@@ -976,17 +1394,28 @@ class SupervisorDispatcher:
             ],
         }
         try:
-            launch = self.adapter.launch(
-                sprint,
-                ticket,
-                reservation,
-                paths["prompt"],
-                paths["output"],
-                paths["result"],
+            backend = backend_coordinator.backend
+            backend.bind_launch(
+                sprint=sprint,
+                ticket=ticket,
+                reservation=reservation,
+                prompt_path=paths["prompt"],
+                output_path=paths["output"],
+                result_path=paths["result"],
             )
-            job["launch_evidence"] = str(launch.get("launch_evidence") or "")
-            attached = self.adapter.attach(sprint, ticket, job["launch_evidence"])
-        except DispatchError as exc:
+            binding = phase_record["identity"]
+            launch_receipt = backend_coordinator.launch(
+                binding, phase_record["job"]
+            )
+            attached = backend_coordinator.attach(binding)
+            job["execution_backend"] = {
+                "binding": binding,
+                "offer": backend_coordinator.offer,
+                "launch_receipt": launch_receipt,
+                "attachment_receipt": attached,
+            }
+            job["launch_evidence"] = str(launch_receipt["backend_handle"])
+        except (DispatchError, BackendContractError) as exc:
             job["state"] = "launch_uncertain"
             job["launch_error"] = str(exc)
             return job
@@ -1043,11 +1472,34 @@ class SupervisorDispatcher:
             phase_state = job.get("phase_execution")
             if isinstance(phase_state, dict):
                 try:
+                    _backend, backend_coordinator, binding = (
+                        self._restore_execution_backend(job)
+                    )
+                    backend_terminal = backend_coordinator.terminal(binding)
+                    backend_result = backend_terminal.get("terminal_result")
+                    if not isinstance(backend_result, dict) or any(
+                        backend_result.get(field) != result.get(field)
+                        for field in (
+                            "schema_version",
+                            "ticket",
+                            "sprint",
+                            "attempt_token",
+                            "invocation_id",
+                            "outcome",
+                            "summary",
+                            "branch",
+                            "worktree",
+                            "pr",
+                        )
+                    ):
+                        raise DispatchError(
+                            "execution backend terminal result differs from supervisor evidence"
+                        )
                     self._phase_runtime_for_state(phase_state).ingest(
                         phase_state,
-                        self._phase_terminal_envelope(job, result),
+                        backend_terminal["terminal_envelope"],
                     )
-                except PhaseExecutionError as exc:
+                except (PhaseExecutionError, BackendContractError) as exc:
                     raise DispatchError(f"phase terminal rejected: {exc}") from exc
             controller = self.adapter.finish(job["sprint"], job["ticket"], result)
             validation_error = ""
@@ -1115,6 +1567,68 @@ class SupervisorDispatcher:
         except AdmissionError as exc:
             raise DispatchError(str(exc)) from exc
         return {"applied": True, "duplicate": False, "terminal": terminal}
+
+    def observe_execution(self, job: dict[str, Any]) -> dict[str, Any]:
+        """Inspect one exact backend execution without inferring absence."""
+
+        _backend, coordinator, binding = self._restore_execution_backend(job)
+        try:
+            return coordinator.inspect(binding)
+        except BackendContractError as exc:
+            raise DispatchError(f"execution inspection failed: {exc}") from exc
+
+    def heartbeat_execution(self, job: dict[str, Any]) -> dict[str, Any]:
+        _backend, coordinator, binding = self._restore_execution_backend(job)
+        try:
+            return coordinator.heartbeat(binding)
+        except BackendContractError as exc:
+            raise DispatchError(f"execution heartbeat failed: {exc}") from exc
+
+    def progress_execution(self, job: dict[str, Any]) -> dict[str, Any]:
+        _backend, coordinator, binding = self._restore_execution_backend(job)
+        try:
+            return coordinator.progress(binding)
+        except BackendContractError as exc:
+            raise DispatchError(f"execution progress failed: {exc}") from exc
+
+    def cancel_execution(self, job: dict[str, Any], *, reason: str) -> dict[str, Any]:
+        """Request cancellation, then apply the supervisor-owned fence.
+
+        Today's host launcher cannot authenticate an in-band acknowledgement,
+        so a request alone is never replacement-safe. The supervisor records
+        its separate fence and binds the phase-runtime cancellation to it.
+        """
+
+        _backend, coordinator, binding = self._restore_execution_backend(job)
+        phase_state = job.get("phase_execution")
+        if not isinstance(phase_state, dict):
+            raise DispatchError("job has no disposable phase execution")
+        runtime = self._phase_runtime_for_state(phase_state)
+        try:
+            cancellation = runtime.request_cancel(
+                phase_state,
+                reason=reason,
+                deadline="supervisor-fence-immediate",
+            )
+            requested = coordinator.cancel(binding, reason=reason)
+            fenced = requested.get("supervisor_fence")
+            if not isinstance(fenced, dict):
+                fenced = coordinator.fence(binding, reason=reason)
+            runtime.fence_cancellation(
+                phase_state,
+                cancellation["cancellation_id"],
+                fenced["fence_receipt"],
+            )
+        except (BackendContractError, PhaseExecutionError) as exc:
+            raise DispatchError(f"execution cancellation failed: {exc}") from exc
+        return {"request": requested, "fence": fenced, "replacement_safe": True}
+
+    def _fence_exited_execution(self, job: dict[str, Any], *, reason: str) -> None:
+        try:
+            _backend, coordinator, binding = self._restore_execution_backend(job)
+            coordinator.fence(binding, reason=reason)
+        except BackendContractError as exc:
+            raise DispatchError(f"execution exit fence failed: {exc}") from exc
 
     def wake_due_retries(
         self, jobs: dict[str, Any], *, current_time: float | None = None
@@ -1217,29 +1731,25 @@ class SupervisorDispatcher:
         return prepared
 
     def execution_terminal(self, job: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
-        identity = job.get("execution_identity") or {}
-        path = Path(str(identity.get("tombstone_path") or ""))
-        if not path.is_file():
-            return False, {}
-        value = json.loads(_regular_private_file(path, "execution tombstone"))
-        if (
-            not isinstance(value, dict)
-            or value.get("phase") != "terminal"
-            or value.get("invocation_id") != identity.get("invocation_id")
-        ):
-            raise DispatchError(
-                "execution tombstone does not match the attached worker"
-            )
-        return True, value
+        observation = self.observe_execution(job)
+        return observation.get("status") in {"absent", "terminal"}, observation
 
     def apply_process_exit(self, job: dict[str, Any]) -> dict[str, Any] | None:
         terminal, tombstone = self.execution_terminal(job)
         if not terminal:
             return None
         if Path(job["paths"]["result"]).is_file():
+            if tombstone.get("status") == "absent":
+                self._fence_exited_execution(
+                    job,
+                    reason="execution exited with an invalid structured terminal result",
+                )
             return self.apply_terminal(job)
         if job.get("terminal"):
             return {"applied": False, "duplicate": True, "terminal": job["terminal"]}
+        self._fence_exited_execution(
+            job, reason="execution exited without a structured terminal result"
+        )
         raw = json.dumps(tombstone, sort_keys=True, separators=(",", ":")).encode()
         digest = hashlib.sha256(raw).hexdigest()
         result = {

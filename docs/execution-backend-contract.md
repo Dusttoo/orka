@@ -157,14 +157,28 @@ convert uncertainty into acknowledgement.
 
 | Route | Existing fresh-context behavior | Baseline host containment | Backend mapping |
 |---|---|---|---|
-| Codex desktop | `codex exec --ephemeral` | Shared host and managed worktree | Local-process backend plus Codex provider adapter |
-| Claude desktop | One `claude --print` invocation | Shared host and managed worktree | Local-process backend plus Claude provider adapter |
-| Direct API | One on-demand request with no session resume | Isolated request process and managed worktree | Local-process backend plus API provider adapter |
+| Codex desktop | `codex exec --ephemeral` | Shared host and managed worktree | `orka-current-route/codex-desktop` |
+| Claude desktop | One `claude --print` invocation | Shared host and managed worktree | `orka-current-route/claude-desktop` |
+| Direct API | One on-demand request with no session resume | Isolated request process and managed worktree | `orka-current-route/api` |
 
-The execution backend does not build prompts or provider payloads. The phase
-worker/provider adapter does that after backend negotiation. This preserves the
-same scheduler behavior while keeping provider-specific invocation details out
-of the backend contract.
+`SupervisorDispatcher` negotiates this interface before the controller creates
+a reservation. The current-route backend then delegates provider command
+construction to the existing phase-worker adapter after admission. Launch,
+attach, heartbeat, progress, inspection, cancellation, and terminal evidence
+all return through the same backend coordinator; scheduler code no longer
+branches on Codex, Claude, API, PID, or output-process behavior.
+
+For an activated transactional runtime, schema migration 0004 stores the full
+execution key before the backend is invoked. Launch, attachment, liveness,
+cancellation, inspection, and terminal receipts are appended by the elected
+supervisor writer. A crash after dispatch but before a valid launch receipt
+therefore leaves an `intended` or `uncertain` permanent tombstone instead of
+making the key launchable again. Restart restores the exact launch and
+terminal receipts idempotently, while rejecting a different backend, fence,
+execution unit, or envelope. Cancellation acknowledgements and supervisor
+fences retain separate receipts; one cannot overwrite the other. One-use
+controller attach capabilities are consumed before persistence, and receipts
+retain only an opaque digest as their backend handle.
 
 ## Conformance kit
 
@@ -186,6 +200,11 @@ suite proves:
   passes a backend-specific mechanical verification hook;
 - only the supervisor may assert a fence;
 - containment and provider capabilities remain separate;
+- all current Codex desktop, Claude desktop, and API adapters satisfy the same
+  production boundary without live credentials in tests;
+- transactional launch intent survives restart, malformed launch receipts stay
+  uncertain, duplicate launch is rejected, and terminal/cancellation receipts
+  preserve their exact execution binding;
 - the backend exposes no scheduling or merge-authority operation.
 
 Run it with:
@@ -198,18 +217,16 @@ The fake backend is a conformance reference, not a production execution host,
 and cannot be selected outside explicit conformance mode.
 Production backends must pass the same suite with backend-specific fixtures.
 
-## Delivery boundary
+## Production integration
 
-This contract and conformance kit are independently reviewable before the
-runtime cutover. Integrating the local Codex, Claude, and API implementations
-behind this interface is the next implementation step. Until that integration
-lands, the existing 1.x launcher remains authoritative and the scheduler still
-contains compatibility code for current route processes.
-
-That production integration must persist launched-key tombstones, launch and
-cancellation receipts, and backend inspection evidence in the authoritative
-transactional supervisor store. The in-memory reference coordinator is not a
-restart-safe production state store.
+The local Codex, Claude, and API implementations now run behind this boundary.
+The existing phase-worker adapters remain responsible for provider payloads and
+fresh-context invocation, while the execution backend owns host lifecycle
+evidence. On repositories that have activated the transactional supervisor
+cutover, execution tombstones and receipts live in the same authoritative event
+store as supervisor state. Legacy pre-cutover repositories retain their prior
+checkpoint behavior until their explicit state migration; the fake backend is
+never selectable by either path.
 
 Container, microVM, Kubernetes, and remote-worker implementations remain
 explicit non-goals for this slice.

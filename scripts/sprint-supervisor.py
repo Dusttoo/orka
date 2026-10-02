@@ -1401,6 +1401,13 @@ def run_daemon(repository: Path, handshake: Path) -> int:
             supervisor_fence=(
                 f"{state['lease']['id']}:{state['lease']['generation']}"
             ),
+            event_store=event_store,
+            writer_identity=writer_identity,
+            repository_id=(
+                authoritative_state.repository_id
+                if authoritative_state is not None
+                else None
+            ),
         )
         while not should_stop:
             if signal_number:

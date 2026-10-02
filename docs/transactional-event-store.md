@@ -36,6 +36,9 @@ The initial API supports:
   transaction;
 - external-operation intent followed by an independently committed receipt or
   reconciliation state;
+- execution-backend intent before process/provider launch, followed by exact
+  launch, attachment, liveness, cancellation, inspection, and terminal
+  receipts bound to the complete execution key;
 - generation-fenced timer firing;
 - deterministic diagnostic reads and SQLite integrity checks.
 
@@ -47,9 +50,11 @@ without another mutation; changing its operation material fails closed.
 ## Schema and durability
 
 The version-1 schema is `contracts/event-store-v1.sql`; the additive legacy
-import schema is `contracts/event-store-v2-legacy-import.sql`; and the cutover
+import schema is `contracts/event-store-v2-legacy-import.sql`; the cutover
 authority/runtime-document schema is
-`contracts/event-store-v3-runtime-cutover.sql`. Initialization records each
+`contracts/event-store-v3-runtime-cutover.sql`; and the execution-backend
+tombstone/receipt schema is
+`contracts/event-store-v4-execution-backends.sql`. Initialization records each
 migration identifier and SHA-256 source digest. Reopening is idempotent;
 unknown, missing, or changed migration history is rejected rather than
 inferred.
@@ -70,8 +75,8 @@ The production API suite proves migration idempotency, repository-binding
 conflicts, exclusive writer ownership, direct-worker rejection, exact replay,
 changed-payload rejection, stale versions and fences, immutable events,
 exclusive-claim rollback, timer generations, external-operation receipts, and
-12 concurrent terminal completions without losing jobs, events, claims,
-timers, or receipts.
+permanent execution-key tombstones. It also proves 12 concurrent terminal
+completions without losing jobs, events, claims, timers, or receipts.
 
 Orka 1.8.23 adds the explicit offline importer and deterministic export. See
 [Legacy state migration](legacy-state-migration.md). Orka 1.8.27 completes the

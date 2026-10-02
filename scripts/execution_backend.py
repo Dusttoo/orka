@@ -28,6 +28,71 @@ class BackendContractError(RuntimeError):
     pass
 
 
+class TransactionalBackendState:
+    """Supervisor-owned persistence adapter for production backend evidence."""
+
+    def __init__(self, store: Any, *, writer_identity: str) -> None:
+        self.store = store
+        self.writer_identity = writer_identity
+
+    @staticmethod
+    def _key(binding: dict[str, str]) -> str:
+        return _digest(binding)
+
+    def consume(
+        self,
+        binding: dict[str, str],
+        *,
+        backend_id: str,
+        envelope_digest: str,
+    ) -> None:
+        try:
+            self.store.consume_execution_key(
+                binding=binding,
+                backend_id=backend_id,
+                envelope_digest=envelope_digest,
+                idempotency_key=f"execution-intent:{self._key(binding)}",
+                writer_identity=self.writer_identity,
+            )
+        except Exception as exc:
+            raise BackendContractError(str(exc)) from exc
+
+    def record(
+        self,
+        binding: dict[str, str],
+        operation: str,
+        receipt: dict[str, Any],
+        target_state: str,
+    ) -> None:
+        try:
+            current = self.store.execution_record(binding)
+            if (
+                operation in {"heartbeat", "progress", "inspect"}
+                and isinstance(current, dict)
+                and current.get("state") == "cancelling"
+            ):
+                target_state = "cancelling"
+            self.store.record_execution_receipt(
+                binding=binding,
+                operation=operation,
+                receipt=receipt,
+                target_state=target_state,
+                idempotency_key=(
+                    f"execution-receipt:{self._key(binding)}:{operation}:"
+                    f"{_digest(receipt)}"
+                ),
+                writer_identity=self.writer_identity,
+            )
+        except Exception as exc:
+            raise BackendContractError(str(exc)) from exc
+
+    def load(self, binding: dict[str, str]) -> dict[str, Any] | None:
+        try:
+            return self.store.execution_record(binding)
+        except Exception as exc:
+            raise BackendContractError(str(exc)) from exc
+
+
 def _digest(value: Any) -> str:
     encoded = json.dumps(
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
@@ -83,6 +148,7 @@ class BackendCoordinator:
         *,
         allow_test_backend: bool = False,
         phase_contract_path: Path | None = None,
+        state_store: TransactionalBackendState | None = None,
     ) -> None:
         try:
             validate_contract(contract)
@@ -91,6 +157,7 @@ class BackendCoordinator:
         self.contract = copy.deepcopy(contract)
         self.backend = backend
         self.allow_test_backend = allow_test_backend
+        self.state_store = state_store
         try:
             self.phase_contract = load_phase_contract(
                 phase_contract_path
@@ -103,9 +170,10 @@ class BackendCoordinator:
         self.offer: dict[str, Any] = {}
         self._active: dict[tuple[str, ...], dict[str, Any]] = {}
         self._fenced: set[tuple[str, ...]] = set()
-        # This conformance implementation is memory-only. Production
-        # integration must persist these tombstones in supervisor state before
-        # it can safely admit launches after restart.
+        self._terminal: set[tuple[str, ...]] = set()
+        # The in-memory index supports credential-free conformance tests.
+        # Production supplies TransactionalBackendState, which consumes the
+        # same key in the supervisor event store before backend invocation.
         self._launched_keys: set[tuple[str, ...]] = set()
 
     @property
@@ -221,6 +289,31 @@ class BackendCoordinator:
             raise BackendContractError(f"backend {label} receipt has a stale binding")
         return receipt
 
+    def _validate_launch_receipt(
+        self,
+        receipt: dict[str, Any],
+        binding: dict[str, str],
+        envelope_digest: str,
+    ) -> dict[str, Any]:
+        receipt = self._validate_receipt(receipt, binding, "launch")
+        for field in ("backend_instance_id", "backend_handle", "process_identity"):
+            if not isinstance(receipt.get(field), str) or not receipt[field]:
+                raise BackendContractError(f"backend launch receipt requires {field}")
+        if receipt.get("envelope_digest") != envelope_digest:
+            raise BackendContractError("launch receipt does not bind the phase envelope")
+        expected = _launch_receipt_digest(
+            binding,
+            backend_instance_id=receipt["backend_instance_id"],
+            backend_handle=receipt["backend_handle"],
+            process_identity=receipt["process_identity"],
+            envelope_digest=envelope_digest,
+        )
+        if receipt.get("launch_receipt") != expected:
+            raise BackendContractError(
+                "launch receipt is missing or mechanically mismatched"
+            )
+        return receipt
+
     def launch(
         self, binding_value: dict[str, Any], envelope: dict[str, Any]
     ) -> dict[str, Any]:
@@ -238,28 +331,37 @@ class BackendCoordinator:
             )
         # A launch may have occurred even when its receipt is malformed or the
         # transport fails after dispatch, so this identity is consumed before
-        # invoking the backend and remains a tombstone.
+        # invoking the backend and remains a tombstone. Production persistence
+        # performs this write transactionally before process/provider work.
         self._launched_keys.add(key)
-        receipt = self._validate_receipt(
-            self.backend.launch(copy.deepcopy(binding), copy.deepcopy(envelope)),
-            binding,
-            "launch",
-        )
-        for field in ("backend_instance_id", "backend_handle", "process_identity"):
-            if not isinstance(receipt.get(field), str) or not receipt[field]:
-                raise BackendContractError(f"backend launch receipt requires {field}")
         envelope_digest = _digest(envelope)
-        if receipt.get("envelope_digest") != envelope_digest:
-            raise BackendContractError("launch receipt does not bind the phase envelope")
-        expected_launch_receipt = _launch_receipt_digest(
-            binding,
-            backend_instance_id=receipt["backend_instance_id"],
-            backend_handle=receipt["backend_handle"],
-            process_identity=receipt["process_identity"],
-            envelope_digest=envelope_digest,
-        )
-        if receipt.get("launch_receipt") != expected_launch_receipt:
-            raise BackendContractError("launch receipt is missing or mechanically mismatched")
+        if self.state_store is not None:
+            self.state_store.consume(
+                binding,
+                backend_id=str(self.offer["backend_id"]),
+                envelope_digest=envelope_digest,
+            )
+        try:
+            receipt = self._validate_launch_receipt(
+                self.backend.launch(copy.deepcopy(binding), copy.deepcopy(envelope)),
+                binding,
+                envelope_digest,
+            )
+        except Exception as exc:
+            if self.state_store is not None:
+                self.state_store.record(
+                    binding,
+                    "uncertain",
+                    {
+                        "binding": copy.deepcopy(binding),
+                        "status": "uncertain",
+                        "diagnostic_digest": _digest(
+                            {"type": type(exc).__name__, "message": str(exc)[:2000]}
+                        ),
+                    },
+                    "uncertain",
+                )
+            raise
         self._active[key] = {
             "binding": binding,
             "phase_identity": phase_identity,
@@ -267,46 +369,118 @@ class BackendCoordinator:
             "launch": copy.deepcopy(receipt),
             "fenced": False,
         }
+        if self.state_store is not None:
+            self.state_store.record(binding, "launch", receipt, "launched")
         return copy.deepcopy(receipt)
 
-    def _record(self, binding_value: dict[str, Any]) -> tuple[dict[str, str], dict[str, Any]]:
+    def restore(
+        self,
+        binding_value: dict[str, Any],
+        envelope: dict[str, Any],
+        launch_receipt: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Rehydrate one exact active execution without invoking launch again."""
+
+        self._require_negotiated()
+        binding = self._binding(binding_value)
+        phase_identity = self._validate_envelope(binding, envelope)
+        persisted = self.state_store.load(binding) if self.state_store is not None else None
+        persisted_terminal: dict[str, Any] | None = None
+        if persisted is not None:
+            if persisted.get("state") in {"fenced", "uncertain"}:
+                raise BackendContractError(
+                    f"execution backend record is not active: {persisted.get('state')}"
+                )
+            if persisted.get("backend_id") != self.offer.get("backend_id"):
+                raise BackendContractError("execution backend identity changed after launch")
+            launch_receipt = persisted.get("launch_receipt")
+            if persisted.get("state") == "terminal":
+                persisted_terminal = persisted.get("terminal_receipt")
+                if not isinstance(persisted_terminal, dict):
+                    raise BackendContractError(
+                        "terminal execution backend record lacks its receipt"
+                    )
+        envelope_digest = _digest(envelope)
+        receipt = self._validate_launch_receipt(
+            launch_receipt or {}, binding, envelope_digest
+        )
+        key = self._execution_key(binding)
+        self._launched_keys.add(key)
+        self._active[key] = {
+            "binding": binding,
+            "phase_identity": phase_identity,
+            "logical_key": self._logical_key(binding),
+            "launch": copy.deepcopy(receipt),
+            "fenced": False,
+            "persisted_terminal": copy.deepcopy(persisted_terminal),
+        }
+        if persisted_terminal is not None:
+            self._validate_receipt(persisted_terminal, binding, "terminal")
+            self._validate_terminal_evidence(
+                persisted_terminal, self._active[key]
+            )
+            self._terminal.add(key)
+        return copy.deepcopy(receipt)
+
+    def _record(
+        self, binding_value: dict[str, Any], *, allow_terminal: bool = False
+    ) -> tuple[dict[str, str], dict[str, Any]]:
         binding = self._binding(binding_value)
         key = self._execution_key(binding)
         record = self._active.get(key)
-        if record is None or record.get("fenced") or key in self._fenced:
+        if (
+            record is None
+            or record.get("fenced")
+            or key in self._fenced
+            or (key in self._terminal and not allow_terminal)
+        ):
             raise BackendContractError("stale or fenced execution cannot report activity")
         return binding, record
 
     def attach(self, binding_value: dict[str, Any]) -> dict[str, Any]:
         binding, record = self._record(binding_value)
-        return copy.deepcopy(
-            self._validate_receipt(
-                self.backend.attach(binding, record["launch"]), binding, "attach"
-            )
+        receipt = self._validate_receipt(
+            self.backend.attach(binding, record["launch"]), binding, "attach"
         )
+        if self.state_store is not None:
+            self.state_store.record(binding, "attach", receipt, "attached")
+        return copy.deepcopy(receipt)
 
     def heartbeat(self, binding_value: dict[str, Any]) -> dict[str, Any]:
         binding, record = self._record(binding_value)
-        return copy.deepcopy(
-            self._validate_receipt(
-                self.backend.heartbeat(binding, record["launch"]), binding, "heartbeat"
-            )
+        receipt = self._validate_receipt(
+            self.backend.heartbeat(binding, record["launch"]), binding, "heartbeat"
         )
+        if self.state_store is not None:
+            self.state_store.record(binding, "heartbeat", receipt, "attached")
+        return copy.deepcopy(receipt)
 
     def progress(self, binding_value: dict[str, Any]) -> dict[str, Any]:
         binding, record = self._record(binding_value)
-        return copy.deepcopy(
-            self._validate_receipt(
-                self.backend.progress(binding, record["launch"]), binding, "progress"
-            )
+        receipt = self._validate_receipt(
+            self.backend.progress(binding, record["launch"]), binding, "progress"
         )
+        if self.state_store is not None:
+            self.state_store.record(binding, "progress", receipt, "attached")
+        return copy.deepcopy(receipt)
 
     def terminal(self, binding_value: dict[str, Any]) -> dict[str, Any]:
+        binding = self._binding(binding_value)
+        key = self._execution_key(binding)
+        existing = self._active.get(key)
+        if existing is not None and key in self._terminal:
+            persisted = existing.get("persisted_terminal")
+            if isinstance(persisted, dict):
+                return copy.deepcopy(persisted)
         binding, record = self._record(binding_value)
         result = self._validate_receipt(
             self.backend.terminal(binding, record["launch"]), binding, "terminal"
         )
         self._validate_terminal_evidence(result, record)
+        if self.state_store is not None:
+            self.state_store.record(binding, "terminal", result, "terminal")
+        record["persisted_terminal"] = copy.deepcopy(result)
+        self._terminal.add(self._execution_key(binding))
         return copy.deepcopy(result)
 
     def _validate_terminal_evidence(
@@ -327,7 +501,7 @@ class BackendCoordinator:
             raise BackendContractError("terminal evidence invalid: expected terminal envelope")
 
     def inspect(self, binding_value: dict[str, Any]) -> dict[str, Any]:
-        binding, record = self._record(binding_value)
+        binding, record = self._record(binding_value, allow_terminal=True)
         result = self._validate_receipt(
             self.backend.inspect(binding, record["launch"]), binding, "inspection"
         )
@@ -372,6 +546,8 @@ class BackendCoordinator:
         elif status == "unknown":
             result.pop("absence_receipt", None)
             result["replacement_safe"] = False
+        if self.state_store is not None:
+            self.state_store.record(binding, "inspect", result, "attached")
         return copy.deepcopy(result)
 
     def cancel(self, binding_value: dict[str, Any], *, reason: str) -> dict[str, Any]:
@@ -436,10 +612,16 @@ class BackendCoordinator:
                 raise BackendContractError(
                     "cancellation acknowledgement failed mechanical verification"
                 )
-            self.fence(binding, reason="backend acknowledged cancellation")
+            if self.state_store is not None:
+                self.state_store.record(binding, "cancel", result, "cancelling")
+            result["supervisor_fence"] = self.fence(
+                binding, reason="backend acknowledged cancellation"
+            )
         elif status not in self.contract["cancellation"]["unsafe_results"]:
             raise BackendContractError("backend cancellation returned an unsupported status")
         result["replacement_safe"] = status == "acknowledged"
+        if self.state_store is not None and status != "acknowledged":
+            self.state_store.record(binding, "cancel", result, "cancelling")
         return copy.deepcopy(result)
 
     def fence(self, binding_value: dict[str, Any], *, reason: str) -> dict[str, Any]:
@@ -452,7 +634,7 @@ class BackendCoordinator:
             raise BackendContractError("cannot fence an unknown execution")
         record["fenced"] = True
         self._fenced.add(key)
-        return {
+        receipt = {
             "status": "fenced",
             "replacement_safe": True,
             "binding": copy.deepcopy(binding),
@@ -460,6 +642,9 @@ class BackendCoordinator:
                 {"binding": binding, "reason": reason.strip(), "launch": record["launch"]}
             ),
         }
+        if self.state_store is not None:
+            self.state_store.record(binding, "fence", receipt, "fenced")
+        return receipt
 
 
 class DeterministicFakeBackend:
