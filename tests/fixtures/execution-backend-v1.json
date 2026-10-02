@@ -1,0 +1,43 @@
+{
+  "contract_id": "orka.execution-backend",
+  "protocol_version": 1,
+  "binding": {
+    "repository_id": "repository:fixture",
+    "job_id": "job-1",
+    "phase": "implement",
+    "attempt_token": "attempt-1",
+    "dispatch_id": "dispatch-1",
+    "execution_unit_id": "execution-1",
+    "worktree_id": "worktree:fixture",
+    "supervisor_fence": "lease:fixture"
+  },
+  "default_offer": {
+    "backend_id": "deterministic-fake",
+    "backend_version": "1",
+    "protocol_version": 1,
+    "lifecycle": [
+      "launch",
+      "attach",
+      "heartbeat",
+      "progress",
+      "cancel",
+      "inspect",
+      "terminal"
+    ],
+    "containment": {
+      "process": "isolated-process",
+      "filesystem": "worktree",
+      "network": "unrestricted",
+      "credentials": "ambient",
+      "process_control": "inspect-cancel-fence"
+    },
+    "provider_capabilities": []
+  },
+  "inspection_cases": [
+    {"observed": "live", "replacement_safe": false},
+    {"observed": "terminal", "replacement_safe": true},
+    {"observed": "absent", "replacement_safe": true},
+    {"observed": "unknown", "replacement_safe": false},
+    {"observed": "timeout", "normalized": "unknown", "replacement_safe": false}
+  ]
+}

@@ -1,0 +1,126 @@
+{
+  "schema_version": 1,
+  "contract_id": "orka.execution-backend",
+  "protocol_version": 1,
+  "description": "Provider-neutral lifecycle and trust boundary for replaceable phase execution backends.",
+  "operations": [
+    "discover",
+    "launch",
+    "attach",
+    "heartbeat",
+    "progress",
+    "cancel",
+    "inspect",
+    "terminal"
+  ],
+  "identity_fields": [
+    "repository_id",
+    "job_id",
+    "phase",
+    "attempt_token",
+    "dispatch_id",
+    "execution_unit_id",
+    "worktree_id",
+    "supervisor_fence"
+  ],
+  "fresh_context": {
+    "phase_worker_contract": "orka.phase-worker-protocol/v1",
+    "required": true,
+    "process_reuse_allowed": true,
+    "model_context_reuse_allowed": false,
+    "forbidden_fields": [
+      "conversation_id",
+      "previous_conversation_id",
+      "provider_session_id",
+      "resume_session"
+    ]
+  },
+  "capability_domains": {
+    "lifecycle": {
+      "required": [
+        "launch",
+        "attach",
+        "heartbeat",
+        "progress",
+        "cancel",
+        "inspect",
+        "terminal"
+      ]
+    },
+    "containment": {
+      "required_fields": [
+        "process",
+        "filesystem",
+        "network",
+        "credentials",
+        "process_control"
+      ],
+      "values": {
+        "process": ["shared-host", "isolated-process", "container", "microvm", "remote"],
+        "filesystem": ["none", "worktree", "sandbox", "isolated-volume"],
+        "network": ["none", "restricted", "unrestricted", "unknown"],
+        "credentials": ["none", "scoped", "ambient", "unknown"],
+        "process_control": ["observe-only", "inspect-cancel", "inspect-cancel-fence"]
+      }
+    },
+    "provider": {
+      "separate_from_containment": true,
+      "backend_may_require": true,
+      "backend_may_authorize": false
+    }
+  },
+  "inspection": {
+    "statuses": ["live", "absent", "terminal", "unknown"],
+    "timeout_status": "unknown",
+    "permission_denied_status": "unknown",
+    "replacement_safe_statuses": ["absent", "terminal"],
+    "absence_requires": [
+      "backend_instance_id",
+      "backend_handle",
+      "original_process_identity",
+      "inspection_receipt"
+    ],
+    "pid_alone_proves_absence": false,
+    "process_identity_reuse": "original_absent_with_receipt"
+  },
+  "cancellation": {
+    "safe_results": ["acknowledged", "fenced"],
+    "unsafe_results": ["requested", "timeout", "unknown"],
+    "acknowledgement_requires": ["cancellation_id", "cancellation_receipt"],
+    "unacknowledged_requires_supervisor_fence": true
+  },
+  "authority_boundary": {
+    "allowed": [
+      "advertise_capabilities",
+      "execute_bound_phase",
+      "report_observations",
+      "acknowledge_cancellation",
+      "return_terminal_evidence"
+    ],
+    "forbidden": [
+      "schedule_work",
+      "reserve_budget",
+      "admit_replacement",
+      "weaken_policy",
+      "authorize_merge",
+      "infer_absence_from_uncertainty"
+    ]
+  },
+  "compatibility_profiles": {
+    "codex-desktop": {
+      "process": "ephemeral codex exec process",
+      "fresh_context": "--ephemeral",
+      "containment_baseline": "shared-host"
+    },
+    "claude-desktop": {
+      "process": "fresh claude print process",
+      "fresh_context": "one print invocation",
+      "containment_baseline": "shared-host"
+    },
+    "api": {
+      "process": "one on-demand request execution",
+      "fresh_context": "one request without session resumption",
+      "containment_baseline": "isolated-process"
+    }
+  }
+}

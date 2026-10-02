@@ -162,3 +162,8 @@ The fixture set covers Codex desktop, Claude desktop, and API capability offers;
 valid job, progress, cancellation, and terminal messages; stale fences;
 conversation reuse; missing capabilities; unknown outcomes; and unsupported
 protocol versions. It contains no repository-specific credentials or data.
+
+The phase-worker protocol describes what one AI phase communicates. The
+[replaceable execution-backend contract](execution-backend-contract.md)
+separately describes how the supervisor discovers, launches, observes,
+cancels, and fences the host execution carrying that phase.
