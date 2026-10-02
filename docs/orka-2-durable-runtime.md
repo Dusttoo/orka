@@ -156,7 +156,11 @@ concerns.
    documents, and pre-first-write rollback are complete in 1.8.24. Controller
    routing is complete in 1.8.27, the authoritative one-writer supervisor
    generation is complete in 1.8.29, and the final no-dual-writer production
-   qualification is complete in 1.8.31.**
+   qualification is complete in 1.8.31. Deterministic, sanitized, read-only
+   startup diagnostics now fail closed before planning or admission when the
+   store, migration ledger, repository/policy binding, cutover, version, or
+   permissions are unhealthy; this first #119 operational-proof slice is
+   complete in 1.8.33 through #157.**
 9. Add supervisor lease takeover and crash recovery.
 10. Expose stable status, pause, resume, and decision CLI commands.
 11. Prove the design with restart, timeout, provider-loss, and malformed-output
