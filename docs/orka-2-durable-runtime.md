@@ -141,7 +141,10 @@ concerns.
    Supervisor-managed launch, progress, cancellation, terminal attribution,
    replacement, and restart reconciliation are complete in 1.8.28. Codex
    desktop, Claude desktop, and API capability negotiation and contract
-   integration are complete in 1.8.30.
+   integration are complete in 1.8.30. The provider-neutral replaceable
+   execution-backend contract, compatibility map, and credential-free
+   conformance kit are complete in 1.8.32; routing the production launch and
+   inspection paths behind that accepted boundary remains tracked by #131.
 8. Introduce a transactional event store with checkpoint import/export.
    **The architecture decision, schema prototype, and implementation slices are
    complete in 1.8.19. Repository identity and canonical policy authority are
