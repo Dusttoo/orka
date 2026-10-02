@@ -27,8 +27,14 @@ from github_progress import (
     number_from_evidence,
     repository as github_repository,
 )
-from provider_health import DESKTOP_CLIENTS
+from provider_health import DESKTOP_CLIENTS, ProviderHealth, route_identity
 from phase_execution import PhaseExecutionError, PhaseExecutionRuntime
+from phase_worker_adapter import (
+    AdapterProtocolError,
+    capability_offer,
+    classify_route_failure,
+    negotiate,
+)
 from phase_worker_contract import ContractError as PhaseContractError
 from supervisor_contract import (
     ContractError,
@@ -284,6 +290,24 @@ class ControllerDispatchAdapter:
         self.repository = repository.resolve()
         self.runtime_directory = runtime_directory.resolve()
         self.config = canonical_config_path(self.repository)
+
+    def phase_capability_offer(self, contract: dict[str, Any]) -> dict[str, Any]:
+        """Advertise the installed route before reservation or provider work."""
+
+        route = llm_route_from_config(self.config, "sprint-worker")
+        if route["execution"] == "desktop":
+            client = DESKTOP_CLIENTS.get(route["provider"])
+            profile = f"{client}-desktop" if client else ""
+        else:
+            profile = "api"
+        return capability_offer(
+            profile,
+            adapter_version="orka-phase-adapter/1",
+            # This adapter implementation consumes protocol v1. Never echo the
+            # supervisor's requested version: mixed-version rollout must fail
+            # closed until the installed adapter itself is upgraded.
+            protocol_version=1,
+        )
 
     def _run(self, *arguments: str) -> dict[str, Any]:
         try:
@@ -763,37 +787,50 @@ class SupervisorDispatcher:
         }
         return canonical_digest(identity)[:32]
 
-    def _phase_capability_offer(self) -> dict[str, Any]:
-        config = getattr(self.adapter, "config", None)
-        if isinstance(config, Path) and config.is_file():
-            try:
-                route = llm_route_from_config(config, "sprint-worker")
-            except Exception as exc:
-                raise DispatchError(
-                    f"cannot resolve phase-worker adapter capabilities: {exc}"
-                ) from exc
-            if route["execution"] == "desktop":
-                client = DESKTOP_CLIENTS.get(route["provider"])
-                adapter = f"{client}-desktop"
-                profile_capability = "desktop-subscription"
-            else:
-                adapter = "api"
-                profile_capability = "provider-receipts"
-        else:
-            origin = str(getattr(self.adapter, "origin", "desktop"))
-            adapter = "api" if origin == "api" else "codex-desktop"
-            profile_capability = (
-                "provider-receipts" if adapter == "api" else "desktop-subscription"
+    def _phase_capability_offer(self) -> tuple[dict[str, Any], dict[str, Any]]:
+        advertise = getattr(self.adapter, "phase_capability_offer", None)
+        if not callable(advertise):
+            error = AdapterProtocolError(
+                "missing_advertisement",
+                "execution adapter does not advertise the phase-worker protocol",
             )
-        mandatory = list(self.phase_runtime.contract["capabilities"]["mandatory"])
-        return {
-            "kind": "capability_offer",
-            "protocol_version": self.phase_runtime.contract["protocol_version"],
-            "adapter": adapter,
-            "adapter_version": "orka-supervisor-v1",
-            "supported_capabilities": [*mandatory, profile_capability],
-            "fresh_context_per_dispatch": True,
-        }
+            self._record_protocol_incompatibility(error)
+            raise DispatchError(f"phase-worker protocol incompatibility: {error}")
+        try:
+            offer = advertise(self.phase_runtime.contract)
+            receipt = negotiate(self.phase_runtime.contract, offer)
+        except (AdapterProtocolError, PhaseExecutionError) as exc:
+            protocol_error = (
+                exc
+                if isinstance(exc, AdapterProtocolError)
+                else AdapterProtocolError("malformed_offer", str(exc))
+            )
+            self._record_protocol_incompatibility(protocol_error)
+            raise DispatchError(
+                f"phase-worker protocol incompatibility: {protocol_error}"
+            ) from exc
+        return offer, receipt
+
+    def _record_protocol_incompatibility(self, error: AdapterProtocolError) -> None:
+        config = getattr(self.adapter, "config", None)
+        if not isinstance(config, Path) or not config.is_file():
+            return
+        try:
+            route = llm_route_from_config(config, "sprint-worker")
+            classification = classify_route_failure(error)
+            ProviderHealth(self.repository).failure(
+                route["provider"],
+                "incompatible",
+                scope=route_identity(route),
+                client="phase-worker-protocol",
+                detail=f"{classification['code']}: {classification['detail']}",
+                incident_class=classification["class"],
+            )
+        except Exception:
+            # Compatibility rejection itself remains authoritative. Health is
+            # diagnostic and must never turn a pre-reservation refusal into an
+            # attempted launch.
+            return
 
     def _phase_terminal_envelope(
         self, job: dict[str, Any], result: dict[str, Any]
@@ -881,7 +918,9 @@ class SupervisorDispatcher:
             resource_claim_digest = claim_set_digest(resource_claims)
         except AdmissionError as exc:
             raise DispatchError(str(exc)) from exc
-        capability_offer = self._phase_capability_offer()
+        # Negotiation is deliberately first: an incompatible installed adapter
+        # cannot consume a controller reservation, attempt, or provider request.
+        capability_offer, negotiation_receipt = self._phase_capability_offer()
         run_ref = f"supervisor-{ticket}-{uuid.uuid4().hex}"
         reservation = self.adapter.reserve(sprint, ticket, run_ref)
         attempt_token = str(reservation.get("attempt_token") or "")
@@ -924,6 +963,7 @@ class SupervisorDispatcher:
             "launched_at": time.time(),
             "terminal": {},
             "phase_execution": phase_execution,
+            "phase_negotiation": negotiation_receipt,
             "resource_claims": resource_claims,
             "resource_claim_schema": CLAIM_SCHEMA,
             "resource_claim_digest": resource_claim_digest,

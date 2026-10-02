@@ -172,9 +172,10 @@ HOLD_STATES = {"rate_limited", "authentication", "incompatible", "transport"}
 SCOPED_INCIDENTS = "scoped_incidents"
 
 
-def scoped_incident(client, detail):
+def scoped_incident(client, detail, incident_class="client_incompatibility"):
     return dict(
         state="incompatible",
+        incident_class=str(incident_class)[:64],
         client=str(client)[:64],
         reason=str(detail)[:300],
         failures=1,
@@ -256,7 +257,16 @@ class ProviderHealth:
         result.pop("probe_token", None)
         return result
 
-    def failure(self, provider, reason, retry_after=30, scope=None, client="", detail=""):
+    def failure(
+        self,
+        provider,
+        reason,
+        retry_after=30,
+        scope=None,
+        client="",
+        detail="",
+        incident_class="client_incompatibility",
+    ):
         if reason not in HOLD_STATES:
             raise HealthError("invalid provider incident")
         if scope is not None:
@@ -271,7 +281,9 @@ class ProviderHealth:
                     existing["failures"] = int(existing.get("failures", 1)) + 1
                     existing["last_at"] = time.time()
                 else:
-                    incidents[scope] = scoped_incident(client, detail)
+                    incidents[scope] = scoped_incident(
+                        client, detail, incident_class
+                    )
             return
         with self.locked(provider) as state:
             # A later transient failure must not erase an authentication hold.
