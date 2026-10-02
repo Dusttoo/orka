@@ -1,0 +1,459 @@
+{
+  "schema_version": 1,
+  "contract_id": "orka.durable-liveness",
+  "description": "Bounded reachability contract for Orka durable ticket and sprint state.",
+  "source_contracts": {
+    "supervisor": "contracts/supervisor-lifecycle-v1.json",
+    "breaker": "contracts/breaker-classification-v1.json",
+    "recovery": "contracts/recovery-eligibility-v1.json",
+    "phase_worker": "contracts/phase-worker-protocol-v1.json",
+    "review": "scripts/review-ledger.py",
+    "controller": "scripts/sprint-controller.py",
+    "supervisor_cli": "scripts/sprint-supervisor.py",
+    "api_agent": "scripts/api_agent.py",
+    "operator_authority": "host-tools/orchestration-recovery-authority.py"
+  },
+  "exit_classes": [
+    "automatic",
+    "timer_driven",
+    "authenticated_external_evidence",
+    "operator_authorized",
+    "terminal_failure"
+  ],
+  "dimensions": {
+    "ticket_state": [
+      "queued", "reserved", "running", "retry_wait", "repair_ready",
+      "recovery_ready", "parked_decision", "parked_external", "blocked",
+      "completed", "decomposed", "cancelled"
+    ],
+    "attempt_identity": ["none", "current", "stale", "missing"],
+    "execution_state": ["none", "live", "absent", "unknown"],
+    "pr_state": ["none", "bound", "preserved", "moved_head"],
+    "review_state": [
+      "not_required", "pending", "repair_pending",
+      "escalated_repair_pending", "passed", "failed"
+    ],
+    "reservation_state": ["none", "open", "settled", "ambiguous"],
+    "route_breaker": ["healthy", "retry_wait", "hard_hold"],
+    "sprint_breaker": [
+      "active", "paused_budget", "paused_budget_policy_raised",
+      "paused_budget_resolved", "stopped_integrity"
+    ],
+    "peer_ticket": ["none", "queued", "running", "completed"]
+  },
+  "terminal": {
+    "ticket_state": ["completed", "decomposed", "cancelled"],
+    "sprint_breaker": ["stopped_integrity"],
+    "peer_terminal": ["none", "completed"]
+  },
+  "initial_states": [
+    {
+      "name": "fresh-queued-ticket",
+      "state": {
+        "ticket_state": "queued",
+        "attempt_identity": "none",
+        "execution_state": "none",
+        "pr_state": "none",
+        "review_state": "not_required",
+        "reservation_state": "none",
+        "route_breaker": "healthy",
+        "sprint_breaker": "active",
+        "peer_ticket": "none"
+      }
+    }
+  ],
+  "operator_authorities": {
+    "ticket_scoped_operator": {
+      "commands": ["controller:resolve-decision"]
+    },
+    "root_capability": {
+      "commands": [
+        "controller:recover-terminal",
+        "controller:restart-ticket",
+        "review:authorize-repair"
+      ]
+    },
+    "sprint_scoped_root": {
+      "commands": ["operator_authority:set-budget-policy"]
+    },
+    "sprint_operator": {
+      "commands": ["supervisor_cli:resume", "supervisor_cli:start"]
+    }
+  },
+  "transitions": [
+    {
+      "id": "admit-ticket",
+      "exit_class": "automatic",
+      "operation": "controller:reserve",
+      "source_refs": ["supervisor:event:job_admitted", "controller:command:reserve"],
+      "when": {
+        "ticket_state": "queued", "attempt_identity": "none",
+        "execution_state": "none", "reservation_state": "none",
+        "route_breaker": "healthy", "sprint_breaker": "active"
+      },
+      "set": {
+        "ticket_state": "reserved", "attempt_identity": "current",
+        "reservation_state": "open"
+      }
+    },
+    {
+      "id": "attach-worker",
+      "exit_class": "authenticated_external_evidence",
+      "operation": "controller:attach",
+      "source_refs": ["supervisor:event:worker_attached", "controller:command:attach"],
+      "when": {
+        "ticket_state": "reserved", "attempt_identity": "current",
+        "execution_state": "none", "reservation_state": "open"
+      },
+      "set": {"ticket_state": "running", "execution_state": "live"}
+    },
+    {
+      "id": "record-completed-worker",
+      "exit_class": "authenticated_external_evidence",
+      "operation": "controller:finish",
+      "source_refs": [
+        "supervisor:event:worker_completed",
+        "phase_worker:terminal:completed",
+        "controller:command:finish"
+      ],
+      "when": {
+        "ticket_state": "running", "attempt_identity": "current",
+        "execution_state": "live", "reservation_state": "open"
+      },
+      "set": {
+        "ticket_state": "completed", "execution_state": "absent",
+        "pr_state": "bound", "review_state": "passed",
+        "reservation_state": "settled"
+      }
+    },
+    {
+      "id": "record-retry-wait",
+      "exit_class": "authenticated_external_evidence",
+      "operation": "controller:finish",
+      "source_refs": [
+        "supervisor:event:launch_rejected_transient",
+        "phase_worker:terminal:timeout_without_progress",
+        "breaker:class:ticket_retry_wait",
+        "controller:command:finish"
+      ],
+      "when": {
+        "ticket_state": "running", "attempt_identity": "current",
+        "execution_state": "live", "reservation_state": "open"
+      },
+      "set": {
+        "ticket_state": "retry_wait", "execution_state": "absent",
+        "reservation_state": "settled"
+      }
+    },
+    {
+      "id": "wake-retry-deadline",
+      "exit_class": "timer_driven",
+      "operation": "supervisor:retry-deadline",
+      "source_refs": ["breaker:class:ticket_retry_wait"],
+      "when": {
+        "ticket_state": "retry_wait", "execution_state": "absent",
+        "reservation_state": "settled"
+      },
+      "set": {
+        "ticket_state": "queued", "attempt_identity": "none",
+        "execution_state": "none",
+        "reservation_state": "none"
+      }
+    },
+    {
+      "id": "admit-repair",
+      "exit_class": "automatic",
+      "operation": "controller:reserve",
+      "source_refs": ["supervisor:event:repair_admitted", "controller:command:reserve"],
+      "when": {
+        "ticket_state": "repair_ready", "attempt_identity": "current",
+        "execution_state": "absent", "pr_state": ["bound", "preserved"],
+        "review_state": ["failed", "repair_pending"],
+        "reservation_state": "settled"
+      },
+      "set": {
+        "ticket_state": "reserved", "execution_state": "none",
+        "reservation_state": "open"
+      }
+    },
+    {
+      "id": "recover-tokenless-repair",
+      "exit_class": "operator_authorized",
+      "operation": "controller:recover-terminal",
+      "authority": "root_capability",
+      "source_refs": [
+        "supervisor:event:recovery_admitted",
+        "recovery:verdict:eligible",
+        "controller:command:recover-terminal"
+      ],
+      "when": {
+        "ticket_state": "repair_ready", "attempt_identity": "missing",
+        "execution_state": "absent", "pr_state": "preserved",
+        "reservation_state": "settled"
+      },
+      "set": {"attempt_identity": "current"}
+    },
+    {
+      "id": "review-recorded-repair",
+      "exit_class": "automatic",
+      "operation": "review:permit-review",
+      "source_refs": ["review:action:review", "review:command:permit-review"],
+      "when": {
+        "ticket_state": "repair_ready",
+        "review_state": ["repair_pending", "escalated_repair_pending"],
+        "pr_state": ["bound", "preserved"]
+      },
+      "set": {"review_state": "pending"}
+    },
+    {
+      "id": "rebind-moved-pr-head",
+      "exit_class": "authenticated_external_evidence",
+      "operation": "review:rebind-generation",
+      "source_refs": ["review:command:rebind-generation"],
+      "when": {
+        "ticket_state": "repair_ready", "pr_state": "moved_head",
+        "review_state": ["passed", "failed"]
+      },
+      "set": {"pr_state": "bound", "review_state": "pending"}
+    },
+    {
+      "id": "complete-review-generation",
+      "exit_class": "authenticated_external_evidence",
+      "operation": "review:complete-review",
+      "source_refs": [
+        "review:action:gates-clear",
+        "review:command:complete-review"
+      ],
+      "when": {
+        "ticket_state": "repair_ready", "pr_state": ["bound", "preserved"],
+        "review_state": "pending"
+      },
+      "set": {"review_state": "passed"}
+    },
+    {
+      "id": "merge-reviewed-pr",
+      "exit_class": "authenticated_external_evidence",
+      "operation": "supervisor:merge-receipt",
+      "source_refs": ["supervisor:event:worker_completed"],
+      "when": {
+        "ticket_state": "repair_ready", "pr_state": ["bound", "preserved"],
+        "review_state": "passed"
+      },
+      "set": {"ticket_state": "completed"}
+    },
+    {
+      "id": "authorize-escalated-repair",
+      "exit_class": "operator_authorized",
+      "operation": "review:authorize-repair",
+      "authority": "root_capability",
+      "source_refs": [
+        "review:action:escalate-human",
+        "review:command:authorize-repair"
+      ],
+      "when": {
+        "ticket_state": "repair_ready", "review_state": "failed",
+        "attempt_identity": "current"
+      },
+      "set": {"review_state": "repair_pending"}
+    },
+    {
+      "id": "recover-preserved-pr",
+      "exit_class": "operator_authorized",
+      "operation": "controller:recover-terminal",
+      "authority": "root_capability",
+      "source_refs": [
+        "recovery:verdict:eligible",
+        "controller:command:recover-terminal"
+      ],
+      "when": {
+        "ticket_state": "recovery_ready", "attempt_identity": "missing",
+        "execution_state": "absent", "pr_state": "preserved",
+        "reservation_state": "settled"
+      },
+      "set": {
+        "ticket_state": "repair_ready", "attempt_identity": "current"
+      }
+    },
+    {
+      "id": "reconcile-ambiguous-reservation",
+      "exit_class": "authenticated_external_evidence",
+      "operation": "api_agent:reconcile",
+      "source_refs": ["api_agent:command:reconcile"],
+      "when": {"reservation_state": "ambiguous"},
+      "set": {"reservation_state": "settled"}
+    },
+    {
+      "id": "recover-stale-attempt",
+      "exit_class": "operator_authorized",
+      "operation": "controller:recover-terminal",
+      "authority": "root_capability",
+      "source_refs": [
+        "recovery:reason:execution_identity_mismatch",
+        "controller:command:recover-terminal"
+      ],
+      "when": {
+        "ticket_state": "running", "attempt_identity": "stale",
+        "execution_state": "unknown", "reservation_state": "settled"
+      },
+      "set": {
+        "ticket_state": "recovery_ready", "attempt_identity": "current",
+        "execution_state": "absent"
+      }
+    },
+    {
+      "id": "admit-recovered-attempt",
+      "exit_class": "automatic",
+      "operation": "controller:reserve",
+      "source_refs": ["supervisor:event:recovery_admitted", "controller:command:reserve"],
+      "when": {
+        "ticket_state": "recovery_ready", "attempt_identity": "current",
+        "execution_state": "absent", "reservation_state": "settled"
+      },
+      "set": {
+        "ticket_state": "reserved", "execution_state": "none",
+        "reservation_state": "open"
+      }
+    },
+    {
+      "id": "dependency-receipt-wakes-ticket",
+      "exit_class": "authenticated_external_evidence",
+      "operation": "controller:sync",
+      "source_refs": ["breaker:class:ticket_external_wait", "controller:command:sync"],
+      "when": {"ticket_state": "parked_external", "sprint_breaker": "active"},
+      "set": {
+        "ticket_state": "queued", "attempt_identity": "none",
+        "execution_state": "none", "reservation_state": "none"
+      }
+    },
+    {
+      "id": "resolve-ticket-decision",
+      "exit_class": "operator_authorized",
+      "operation": "controller:resolve-decision",
+      "authority": "ticket_scoped_operator",
+      "source_refs": [
+        "breaker:class:ticket_hard_decision",
+        "controller:command:resolve-decision"
+      ],
+      "when": {"ticket_state": "parked_decision", "sprint_breaker": "active"},
+      "set": {
+        "ticket_state": "queued", "attempt_identity": "none",
+        "execution_state": "none", "reservation_state": "none"
+      }
+    },
+    {
+      "id": "terminalize-irrecoverable-ticket",
+      "exit_class": "terminal_failure",
+      "operation": "controller:finish",
+      "source_refs": [
+        "breaker:class:ticket_irrecoverable",
+        "phase_worker:terminal:cancelled_attempt",
+        "controller:command:finish"
+      ],
+      "when": {"ticket_state": "blocked"},
+      "set": {"ticket_state": "cancelled"}
+    },
+    {
+      "id": "restart-cancelled-ticket",
+      "exit_class": "operator_authorized",
+      "operation": "controller:restart-ticket",
+      "authority": "root_capability",
+      "explicit_recovery": true,
+      "source_refs": ["controller:command:restart-ticket"],
+      "when": {"ticket_state": "cancelled", "sprint_breaker": "active"},
+      "set": {
+        "ticket_state": "queued", "attempt_identity": "none",
+        "execution_state": "none", "reservation_state": "none"
+      }
+    },
+    {
+      "id": "probe-transient-route",
+      "exit_class": "timer_driven",
+      "operation": "controller:health-check",
+      "source_refs": [
+        "breaker:class:route_transient_hold",
+        "controller:command:health-check"
+      ],
+      "when": {"route_breaker": "retry_wait", "sprint_breaker": "active"},
+      "set": {"route_breaker": "healthy"}
+    },
+    {
+      "id": "repair-hard-route",
+      "exit_class": "authenticated_external_evidence",
+      "operation": "controller:health-check",
+      "source_refs": [
+        "breaker:class:route_hard_hold",
+        "controller:command:health-check"
+      ],
+      "when": {"route_breaker": "hard_hold", "sprint_breaker": "active"},
+      "set": {"route_breaker": "healthy"}
+    },
+    {
+      "id": "raise-sprint-budget-policy",
+      "exit_class": "operator_authorized",
+      "operation": "operator_authority:set-budget-policy",
+      "authority": "sprint_scoped_root",
+      "source_refs": [
+        "breaker:class:sprint_hard_budget",
+        "operator_authority:command:set-budget-policy"
+      ],
+      "when": {"sprint_breaker": "paused_budget"},
+      "set": {"sprint_breaker": "paused_budget_policy_raised"}
+    },
+    {
+      "id": "observe-sprint-budget-resolution",
+      "exit_class": "authenticated_external_evidence",
+      "operation": "supervisor:budget-sync",
+      "source_refs": ["breaker:class:sprint_hard_budget"],
+      "when": {"sprint_breaker": "paused_budget_policy_raised"},
+      "set": {"sprint_breaker": "paused_budget_resolved"}
+    },
+    {
+      "id": "resume-after-sprint-budget",
+      "exit_class": "operator_authorized",
+      "operation": "supervisor_cli:resume",
+      "authority": "sprint_operator",
+      "source_refs": [
+        "supervisor:event:operator_resumed",
+        "supervisor_cli:command:resume"
+      ],
+      "when": {"sprint_breaker": "paused_budget_resolved"},
+      "set": {"sprint_breaker": "active"}
+    },
+    {
+      "id": "restart-after-integrity-preflight",
+      "exit_class": "operator_authorized",
+      "operation": "supervisor_cli:start",
+      "authority": "sprint_operator",
+      "explicit_recovery": true,
+      "source_refs": [
+        "breaker:class:sprint_integrity_stop",
+        "supervisor_cli:command:start"
+      ],
+      "when": {"sprint_breaker": "stopped_integrity"},
+      "set": {"sprint_breaker": "active"}
+    },
+    {
+      "id": "dispatch-independent-ticket",
+      "exit_class": "automatic",
+      "operation": "controller:reserve",
+      "source_refs": ["supervisor:event:job_admitted", "controller:command:reserve"],
+      "when": {
+        "peer_ticket": "queued", "route_breaker": "healthy",
+        "sprint_breaker": "active"
+      },
+      "set": {"peer_ticket": "running"}
+    },
+    {
+      "id": "complete-independent-ticket",
+      "exit_class": "authenticated_external_evidence",
+      "operation": "controller:finish",
+      "source_refs": [
+        "supervisor:event:worker_completed",
+        "phase_worker:terminal:completed",
+        "controller:command:finish"
+      ],
+      "when": {"peer_ticket": "running"},
+      "set": {"peer_ticket": "completed"}
+    }
+  ]
+}

@@ -168,7 +168,11 @@ concerns.
 9. Add supervisor lease takeover and crash recovery.
 10. Expose stable status, pause, resume, and decision CLI commands.
 11. Prove the design with restart, timeout, provider-loss, and malformed-output
-   chaos tests.
+   chaos tests. The repository-agnostic
+   [durable-state liveness contract](durable-liveness-contract.md) and bounded
+   verifier define the accepted design boundary for proving that every modeled
+   nonterminal state has a supported exit; production supervisor integration
+   remains tracked by #129.
 
 Each step must be independently releasable and keep existing Orka 1.x
 configuration working until a documented migration is available.

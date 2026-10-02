@@ -1,0 +1,185 @@
+{
+  "schema": "orka.durable-liveness-fixtures/v1",
+  "cases": [
+    {
+      "name": "automatic-admission",
+      "expected_transition": "admit-ticket",
+      "expected_exit_class": "automatic",
+      "state": {
+        "ticket_state": "queued", "attempt_identity": "none",
+        "execution_state": "none", "pr_state": "none",
+        "review_state": "not_required", "reservation_state": "none",
+        "route_breaker": "healthy", "sprint_breaker": "active",
+        "peer_ticket": "none"
+      }
+    },
+    {
+      "name": "timer-driven-retry",
+      "expected_transition": "wake-retry-deadline",
+      "expected_exit_class": "timer_driven",
+      "state": {
+        "ticket_state": "retry_wait", "attempt_identity": "current",
+        "execution_state": "absent", "pr_state": "none",
+        "review_state": "not_required", "reservation_state": "settled",
+        "route_breaker": "healthy", "sprint_breaker": "active",
+        "peer_ticket": "none"
+      }
+    },
+    {
+      "name": "external-dependency-receipt",
+      "expected_transition": "dependency-receipt-wakes-ticket",
+      "expected_exit_class": "authenticated_external_evidence",
+      "state": {
+        "ticket_state": "parked_external", "attempt_identity": "current",
+        "execution_state": "absent", "pr_state": "none",
+        "review_state": "not_required", "reservation_state": "settled",
+        "route_breaker": "healthy", "sprint_breaker": "active",
+        "peer_ticket": "none"
+      }
+    },
+    {
+      "name": "operator-decision",
+      "expected_transition": "resolve-ticket-decision",
+      "expected_exit_class": "operator_authorized",
+      "state": {
+        "ticket_state": "parked_decision", "attempt_identity": "current",
+        "execution_state": "absent", "pr_state": "none",
+        "review_state": "not_required", "reservation_state": "settled",
+        "route_breaker": "healthy", "sprint_breaker": "active",
+        "peer_ticket": "none"
+      }
+    },
+    {
+      "name": "terminal-failure",
+      "expected_transition": "terminalize-irrecoverable-ticket",
+      "expected_exit_class": "terminal_failure",
+      "state": {
+        "ticket_state": "blocked", "attempt_identity": "stale",
+        "execution_state": "unknown", "pr_state": "none",
+        "review_state": "not_required", "reservation_state": "ambiguous",
+        "route_breaker": "healthy", "sprint_breaker": "active",
+        "peer_ticket": "none"
+      }
+    },
+    {
+      "name": "historical-tokenless-repair",
+      "expected_transition": "recover-tokenless-repair",
+      "expected_exit_class": "operator_authorized",
+      "state": {
+        "ticket_state": "repair_ready", "attempt_identity": "missing",
+        "execution_state": "absent", "pr_state": "preserved",
+        "review_state": "failed", "reservation_state": "settled",
+        "route_breaker": "healthy", "sprint_breaker": "active",
+        "peer_ticket": "none"
+      }
+    },
+    {
+      "name": "historical-escalated-pending-review",
+      "expected_transition": "review-recorded-repair",
+      "expected_exit_class": "automatic",
+      "state": {
+        "ticket_state": "repair_ready", "attempt_identity": "current",
+        "execution_state": "absent", "pr_state": "bound",
+        "review_state": "escalated_repair_pending",
+        "reservation_state": "settled", "route_breaker": "healthy",
+        "sprint_breaker": "active", "peer_ticket": "none"
+      }
+    },
+    {
+      "name": "historical-moved-pr-head",
+      "expected_transition": "rebind-moved-pr-head",
+      "expected_exit_class": "authenticated_external_evidence",
+      "state": {
+        "ticket_state": "repair_ready", "attempt_identity": "current",
+        "execution_state": "absent", "pr_state": "moved_head",
+        "review_state": "passed", "reservation_state": "settled",
+        "route_breaker": "healthy", "sprint_breaker": "active",
+        "peer_ticket": "none"
+      }
+    },
+    {
+      "name": "historical-stale-attempt-identity",
+      "expected_transition": "reconcile-ambiguous-reservation",
+      "expected_exit_class": "authenticated_external_evidence",
+      "state": {
+        "ticket_state": "running", "attempt_identity": "stale",
+        "execution_state": "unknown", "pr_state": "bound",
+        "review_state": "pending", "reservation_state": "ambiguous",
+        "route_breaker": "healthy", "sprint_breaker": "active",
+        "peer_ticket": "none"
+      }
+    },
+    {
+      "name": "historical-preserved-pr-recovery",
+      "expected_transition": "recover-preserved-pr",
+      "expected_exit_class": "operator_authorized",
+      "state": {
+        "ticket_state": "recovery_ready", "attempt_identity": "missing",
+        "execution_state": "absent", "pr_state": "preserved",
+        "review_state": "failed", "reservation_state": "settled",
+        "route_breaker": "healthy", "sprint_breaker": "active",
+        "peer_ticket": "none"
+      }
+    },
+    {
+      "name": "independent-ticket-progress",
+      "expected_transition": "dispatch-independent-ticket",
+      "expected_exit_class": "automatic",
+      "state": {
+        "ticket_state": "parked_decision", "attempt_identity": "current",
+        "execution_state": "absent", "pr_state": "none",
+        "review_state": "not_required", "reservation_state": "settled",
+        "route_breaker": "healthy", "sprint_breaker": "active",
+        "peer_ticket": "queued"
+      }
+    },
+    {
+      "name": "transient-provider-route",
+      "expected_transition": "probe-transient-route",
+      "expected_exit_class": "timer_driven",
+      "state": {
+        "ticket_state": "queued", "attempt_identity": "none",
+        "execution_state": "none", "pr_state": "none",
+        "review_state": "not_required", "reservation_state": "none",
+        "route_breaker": "retry_wait", "sprint_breaker": "active",
+        "peer_ticket": "none"
+      }
+    },
+    {
+      "name": "hard-provider-route",
+      "expected_transition": "repair-hard-route",
+      "expected_exit_class": "authenticated_external_evidence",
+      "state": {
+        "ticket_state": "queued", "attempt_identity": "none",
+        "execution_state": "none", "pr_state": "none",
+        "review_state": "not_required", "reservation_state": "none",
+        "route_breaker": "hard_hold", "sprint_breaker": "active",
+        "peer_ticket": "none"
+      }
+    },
+    {
+      "name": "hard-sprint-budget",
+      "expected_transition": "raise-sprint-budget-policy",
+      "expected_exit_class": "operator_authorized",
+      "state": {
+        "ticket_state": "queued", "attempt_identity": "none",
+        "execution_state": "none", "pr_state": "none",
+        "review_state": "not_required", "reservation_state": "none",
+        "route_breaker": "healthy", "sprint_breaker": "paused_budget",
+        "peer_ticket": "none"
+      }
+    },
+    {
+      "name": "integrity-stop-recovery",
+      "expected_transition": "restart-after-integrity-preflight",
+      "expected_exit_class": "operator_authorized",
+      "state": {
+        "ticket_state": "queued", "attempt_identity": "none",
+        "execution_state": "none", "pr_state": "none",
+        "review_state": "not_required", "reservation_state": "none",
+        "route_breaker": "healthy", "sprint_breaker": "stopped_integrity",
+        "peer_ticket": "none"
+      }
+    }
+  ]
+}

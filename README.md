@@ -212,7 +212,7 @@ supports them.
 | `agents/` | Role briefs: ticket-scoper, design-reviewer, implementer, code-reviewer, security-reviewer, visual-qa |
 | `commands/` | Claude Code slash commands: `/orchestrate`, `/orchestrate-sprint`, `/gate`, `/release`, `/orchestration-init`, `/orchestration-report` |
 | `hooks/` | Claude Code/Codex `PreToolUse` merge-guard + `Stop` worktree sweep |
-| `contracts/` | Versioned machine-readable lifecycle, persistence, recovery, and worker boundaries |
+| `contracts/` | Versioned machine-readable lifecycle, persistence, recovery, worker, and bounded-liveness boundaries |
 | `scripts/` | The mechanics: config reader, sprint controller, workflow engine, gate runner, merge-guard, safe-merge, worktree lifecycle, verification |
 | `skills/` | Codex/Claude natural-language procedures: orchestrate ticket/sprint, gate, release, init, scope, recover, report |
 | `templates/` | Configuration template plus the plugin-owned process reference |
