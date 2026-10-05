@@ -21,8 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
-
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 SCHEMA_PATH = Path(__file__).resolve().parents[1] / "contracts/event-store-v1.sql"
 LEGACY_IMPORT_SCHEMA_PATH = (
@@ -30,6 +29,10 @@ LEGACY_IMPORT_SCHEMA_PATH = (
 )
 RUNTIME_CUTOVER_SCHEMA_PATH = (
     Path(__file__).resolve().parents[1] / "contracts/event-store-v3-runtime-cutover.sql"
+)
+EXECUTION_BACKEND_SCHEMA_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "contracts/event-store-v4-execution-backends.sql"
 )
 
 
@@ -141,6 +144,7 @@ def migration_specifications() -> tuple[tuple[int, str, Path], ...]:
         (1, "0001-initial-event-store", SCHEMA_PATH),
         (2, "0002-legacy-import", LEGACY_IMPORT_SCHEMA_PATH),
         (3, "0003-runtime-cutover", RUNTIME_CUTOVER_SCHEMA_PATH),
+        (4, "0004-execution-backends", EXECUTION_BACKEND_SCHEMA_PATH),
     )
 
 
@@ -163,6 +167,9 @@ class TransactionalEventStore:
         schema_path: Path = SCHEMA_PATH,
         expected_database_identity: tuple[int, int] | None = None,
         startup_validator: Callable[[sqlite3.Connection, Path], None] | None = None,
+        post_migration_validator: (
+            Callable[[sqlite3.Connection, Path], None] | None
+        ) = None,
         require_existing_lock: bool = False,
     ) -> None:
         if not writer_identity.strip():
@@ -203,6 +210,13 @@ class TransactionalEventStore:
                 local_filesystem=local_filesystem
             )
             self._apply_migrations(schema_path)
+            if post_migration_validator is not None:
+                try:
+                    post_migration_validator(self._database, self.database_path)
+                except Exception as exc:
+                    raise EventStoreError(
+                        "event-store authority is invalid after migration"
+                    ) from exc
             self._validate_connection_settings()
         except BaseException:
             if hasattr(self, "_database"):
@@ -230,7 +244,9 @@ class TransactionalEventStore:
         if self.database_path.exists():
             mode = self.database_path.lstat().st_mode
             if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
-                raise EventStoreError("database path must be a regular file, not a symlink")
+                raise EventStoreError(
+                    "database path must be a regular file, not a symlink"
+                )
 
     def _verify_expected_database_identity(self) -> None:
         if self._expected_database_identity is None:
@@ -238,7 +254,9 @@ class TransactionalEventStore:
         try:
             metadata = self.database_path.lstat()
         except OSError as exc:
-            raise EventStoreError("checked event-store database is unavailable") from exc
+            raise EventStoreError(
+                "checked event-store database is unavailable"
+            ) from exc
         observed = (metadata.st_dev, metadata.st_ino)
         if (
             stat.S_ISLNK(metadata.st_mode)
@@ -260,7 +278,9 @@ class TransactionalEventStore:
         )
 
     def _acquire_writer_lock(self, *, require_existing: bool) -> Any:
-        lock_path = self.database_path.with_name(self.database_path.name + ".writer.lock")
+        lock_path = self.database_path.with_name(
+            self.database_path.name + ".writer.lock"
+        )
         descriptor: int | None = None
         handle: Any | None = None
         opened_identity: tuple[int, int] | None = None
@@ -287,11 +307,10 @@ class TransactionalEventStore:
                     flags |= os.O_NOFOLLOW
                 descriptor = os.open(lock_path, flags)
                 opened = os.fstat(descriptor)
-                if (
-                    not self._private_lock_metadata(opened)
-                    or (opened.st_dev, opened.st_ino)
-                    != (existing.st_dev, existing.st_ino)
-                ):
+                if not self._private_lock_metadata(opened) or (
+                    opened.st_dev,
+                    opened.st_ino,
+                ) != (existing.st_dev, existing.st_ino):
                     raise OSError("writer lock changed while it was opened")
                 opened_identity = (opened.st_dev, opened.st_ino)
             handle = os.fdopen(descriptor, "a+", encoding="utf-8")
@@ -357,7 +376,9 @@ class TransactionalEventStore:
             try:
                 schema = path.read_text(encoding="utf-8")
             except OSError as exc:
-                raise EventStoreError(f"cannot read event-store schema: {path}") from exc
+                raise EventStoreError(
+                    f"cannot read event-store schema: {path}"
+                ) from exc
             migrations.append(
                 (
                     version,
@@ -411,7 +432,9 @@ class TransactionalEventStore:
         if self._closed:
             raise EventStoreError("event store is closed")
         if writer_identity != self._writer_identity:
-            raise WriterAuthorityError("mutation requires the supervisor writer identity")
+            raise WriterAuthorityError(
+                "mutation requires the supervisor writer identity"
+            )
 
     @contextlib.contextmanager
     def _transaction(self, writer_identity: str) -> Iterator[sqlite3.Connection]:
@@ -471,11 +494,17 @@ class TransactionalEventStore:
             ).fetchone()
             if existing is not None:
                 if tuple(existing) != values:
-                    raise IdempotencyConflict("repository identity is already bound differently")
+                    raise IdempotencyConflict(
+                        "repository identity is already bound differently"
+                    )
                 return
-            other = database.execute("SELECT repository_id FROM repositories LIMIT 1").fetchone()
+            other = database.execute(
+                "SELECT repository_id FROM repositories LIMIT 1"
+            ).fetchone()
             if other is not None:
-                raise EventStoreError("one event-store database cannot bind multiple repositories")
+                raise EventStoreError(
+                    "one event-store database cannot bind multiple repositories"
+                )
             database.execute(
                 "INSERT INTO repositories VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", values
             )
@@ -806,6 +835,283 @@ class TransactionalEventStore:
             if updated != 1:
                 raise StaleWriteError("launch attempt projection is stale")
             return event
+
+    def consume_execution_key(
+        self,
+        *,
+        binding: Mapping[str, str],
+        backend_id: str,
+        envelope_digest: str,
+        idempotency_key: str,
+        writer_identity: str,
+        occurred_at: str | None = None,
+    ) -> TransitionResult:
+        """Permanently consume one complete backend execution key before launch.
+
+        This is intentionally not replayable as a second launch.  An event
+        replay proves that the key was already consumed; callers must inspect
+        or reconcile the existing execution rather than invoke a backend
+        again.
+        """
+
+        required = (
+            "repository_id",
+            "job_id",
+            "phase",
+            "attempt_token",
+            "dispatch_id",
+            "execution_unit_id",
+            "worktree_id",
+            "supervisor_fence",
+        )
+        if any(
+            not isinstance(binding.get(field), str) or not binding[field]
+            for field in required
+        ):
+            raise EventStoreError("execution backend binding is incomplete")
+        if (
+            not isinstance(backend_id, str)
+            or not backend_id.strip()
+            or not isinstance(envelope_digest, str)
+            or not envelope_digest.strip()
+        ):
+            raise EventStoreError(
+                "execution backend identity and envelope digest are required"
+            )
+        at = occurred_at or utc_now()
+        material = {field: binding[field] for field in required}
+        execution_key = _digest(canonical_json(material))
+        payload = {
+            "execution_key": execution_key,
+            "binding": material,
+            "backend_id": backend_id,
+            "envelope_digest": envelope_digest,
+            "state": "intended",
+        }
+        with self._transaction(writer_identity) as database:
+            existing = database.execute(
+                "SELECT state FROM execution_backends WHERE execution_key = ?",
+                (execution_key,),
+            ).fetchone()
+            if existing is not None:
+                raise StaleWriteError(
+                    "execution backend key was already consumed; reconcile the existing execution"
+                )
+            event = self._append_event(
+                database,
+                repository_id=material["repository_id"],
+                aggregate_type="execution_backend",
+                aggregate_id=execution_key,
+                aggregate_version=1,
+                event_type="execution_launch_intended",
+                idempotency_key=idempotency_key,
+                payload=payload,
+                occurred_at=at,
+            )
+            if event.replayed:
+                raise StaleWriteError(
+                    "execution backend key was already consumed; reconcile the existing execution"
+                )
+            database.execute(
+                """
+                INSERT INTO execution_backends(
+                    execution_key, repository_id, job_id, phase, attempt_token,
+                    dispatch_id, execution_unit_id, worktree_id, supervisor_fence,
+                    backend_id, envelope_digest, version, last_event_sequence,
+                    state, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 'intended', ?, ?)
+                """,
+                (
+                    execution_key,
+                    *(material[field] for field in required),
+                    backend_id,
+                    envelope_digest,
+                    event.sequence,
+                    at,
+                    at,
+                ),
+            )
+            return event
+
+    def record_execution_receipt(
+        self,
+        *,
+        binding: Mapping[str, str],
+        operation: str,
+        receipt: Mapping[str, Any],
+        target_state: str,
+        idempotency_key: str,
+        writer_identity: str,
+        occurred_at: str | None = None,
+    ) -> TransitionResult:
+        """Append one exact backend receipt to its consumed execution key."""
+
+        columns = {
+            "launch": "launch_receipt_json",
+            "attach": "attachment_receipt_json",
+            "heartbeat": "heartbeat_receipt_json",
+            "progress": "progress_receipt_json",
+            "cancel": "cancellation_receipt_json",
+            "inspect": "inspection_receipt_json",
+            "terminal": "terminal_receipt_json",
+            "fence": "fence_receipt_json",
+            "uncertain": "launch_receipt_json",
+        }
+        if operation not in columns:
+            raise EventStoreError(
+                f"unsupported execution backend operation: {operation}"
+            )
+        operation_states = {
+            "launch": {"launched"},
+            "uncertain": {"uncertain"},
+            "attach": {"attached"},
+            "heartbeat": {"attached", "cancelling"},
+            "progress": {"attached", "cancelling"},
+            "inspect": {"attached", "cancelling"},
+            "cancel": {"cancelling"},
+            "terminal": {"terminal"},
+            "fence": {"fenced"},
+        }
+        if target_state not in operation_states[operation]:
+            raise EventStoreError(
+                f"execution backend {operation} cannot record state {target_state}"
+            )
+        required = (
+            "repository_id",
+            "job_id",
+            "phase",
+            "attempt_token",
+            "dispatch_id",
+            "execution_unit_id",
+            "worktree_id",
+            "supervisor_fence",
+        )
+        material = {field: binding.get(field) for field in required}
+        if any(not isinstance(value, str) or not value for value in material.values()):
+            raise EventStoreError("execution backend binding is incomplete")
+        if not isinstance(receipt, Mapping):
+            raise EventStoreError("execution backend receipt must be an object")
+        execution_key = _digest(canonical_json(material))
+        at = occurred_at or utc_now()
+        allowed_from = {
+            "launch": {"intended"},
+            "uncertain": {"intended"},
+            "attach": {"launched", "attached"},
+            "heartbeat": {"launched", "attached", "cancelling"},
+            "progress": {"launched", "attached", "cancelling"},
+            "inspect": {"launched", "attached", "cancelling"},
+            "cancel": {"launched", "attached", "cancelling"},
+            "terminal": {"launched", "attached", "cancelling"},
+            "fence": {"launched", "attached", "cancelling"},
+        }
+        payload = {
+            "execution_key": execution_key,
+            "binding": material,
+            "operation": operation,
+            "receipt": dict(receipt),
+            "state": target_state,
+        }
+        with self._transaction(writer_identity) as database:
+            replay = self._existing_event(
+                database,
+                repository_id=material["repository_id"],
+                aggregate_type="execution_backend",
+                aggregate_id=execution_key,
+                event_type=f"execution_{operation}_recorded",
+                idempotency_key=idempotency_key,
+                payload=payload,
+            )
+            if replay is not None:
+                return replay
+            row = database.execute(
+                """
+                SELECT repository_id, job_id, phase, attempt_token, dispatch_id,
+                       execution_unit_id, worktree_id, supervisor_fence, version, state
+                FROM execution_backends WHERE execution_key = ?
+                """,
+                (execution_key,),
+            ).fetchone()
+            if row is None or tuple(map(str, row[:8])) != tuple(
+                material[field] for field in required
+            ):
+                raise StaleWriteError("execution backend receipt binding is stale")
+            if str(row[9]) not in allowed_from[operation]:
+                raise StaleWriteError(
+                    f"execution backend {operation} is stale from state {row[9]}"
+                )
+            version = int(row[8]) + 1
+            event = self._append_event(
+                database,
+                repository_id=material["repository_id"],
+                aggregate_type="execution_backend",
+                aggregate_id=execution_key,
+                aggregate_version=version,
+                event_type=f"execution_{operation}_recorded",
+                idempotency_key=idempotency_key,
+                payload=payload,
+                occurred_at=at,
+            )
+            column = columns[operation]
+            updated = database.execute(
+                f"""
+                UPDATE execution_backends
+                SET state = ?, version = ?, last_event_sequence = ?,
+                    {column} = ?, updated_at = ?
+                WHERE execution_key = ? AND version = ?
+                """,
+                (
+                    target_state,
+                    version,
+                    event.sequence,
+                    canonical_json(receipt),
+                    at,
+                    execution_key,
+                    version - 1,
+                ),
+            ).rowcount
+            if updated != 1:
+                raise StaleWriteError("execution backend record changed concurrently")
+            return event
+
+    def execution_record(self, binding: Mapping[str, str]) -> dict[str, Any] | None:
+        required = (
+            "repository_id",
+            "job_id",
+            "phase",
+            "attempt_token",
+            "dispatch_id",
+            "execution_unit_id",
+            "worktree_id",
+            "supervisor_fence",
+        )
+        material = {field: binding.get(field) for field in required}
+        if any(not isinstance(value, str) or not value for value in material.values()):
+            raise EventStoreError("execution backend binding is incomplete")
+        execution_key = _digest(canonical_json(material))
+        with self._write_lock:
+            row = self._database.execute(
+                "SELECT * FROM execution_backends WHERE execution_key = ?",
+                (execution_key,),
+            )
+            names = [item[0] for item in row.description or []]
+            value = row.fetchone()
+        if value is None:
+            return None
+        result = dict(zip(names, value))
+        for name in (
+            "launch_receipt_json",
+            "attachment_receipt_json",
+            "heartbeat_receipt_json",
+            "progress_receipt_json",
+            "cancellation_receipt_json",
+            "fence_receipt_json",
+            "inspection_receipt_json",
+            "terminal_receipt_json",
+        ):
+            result[name.removesuffix("_json")] = (
+                json.loads(str(result[name])) if result.get(name) else None
+            )
+        return result
 
     def complete_job(
         self,
@@ -1164,7 +1470,9 @@ class TransactionalEventStore:
             (str(item["document_type"]), str(item["document_id"])) for item in ordered
         ]
         if len(identities) != len(set(identities)):
-            raise IdempotencyConflict("cutover seed contains duplicate runtime documents")
+            raise IdempotencyConflict(
+                "cutover seed contains duplicate runtime documents"
+            )
         seed_manifest = []
         for item in ordered:
             payload_json = canonical_json(item["payload"])
@@ -1257,9 +1565,7 @@ class TransactionalEventStore:
                 raise IdempotencyConflict(
                     "cutover activation event exists without an active projection"
                 )
-            activation_generation = (
-                int(existing[5]) + 1 if existing is not None else 1
-            )
+            activation_generation = int(existing[5]) + 1 if existing is not None else 1
             database.execute(
                 "DELETE FROM runtime_documents WHERE repository_id = ?",
                 (repository_id,),
@@ -1342,7 +1648,9 @@ class TransactionalEventStore:
         """Commit one authoritative runtime generation under the active fence."""
 
         if not supervisor_fence:
-            raise WriterAuthorityError("runtime document write requires a supervisor fence")
+            raise WriterAuthorityError(
+                "runtime document write requires a supervisor fence"
+            )
         at = occurred_at or utc_now()
         payload_json = canonical_json(payload)
         payload_digest = _digest(payload_json)
@@ -1615,7 +1923,8 @@ class TransactionalEventStore:
 
         at = imported_at or utc_now()
         ordered = sorted(
-            (dict(source) for source in sources), key=lambda item: str(item["source_path"])
+            (dict(source) for source in sources),
+            key=lambda item: str(item["source_path"]),
         )
         manifest = {
             "repository_id": repository_id,
@@ -1633,7 +1942,9 @@ class TransactionalEventStore:
         }
         manifest_json = canonical_json(manifest)
         if _digest(manifest_json) != manifest_digest:
-            raise IdempotencyConflict("legacy import manifest digest does not match its sources")
+            raise IdempotencyConflict(
+                "legacy import manifest digest does not match its sources"
+            )
         with self._transaction(writer_identity) as database:
             existing = database.execute(
                 """
@@ -1741,6 +2052,7 @@ class TransactionalEventStore:
         allowed = {
             "attempts",
             "events",
+            "execution_backends",
             "external_operations",
             "jobs",
             "legacy_records",

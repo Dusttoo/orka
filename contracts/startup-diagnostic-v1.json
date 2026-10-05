@@ -13,7 +13,7 @@
     "cutover",
     "minimum_version"
   ],
-  "statuses": ["pass", "fail", "skipped"],
+  "statuses": ["pass", "fail", "skipped", "upgrade_required"],
   "reason_codes": [
     "ok",
     "legacy_not_applicable",
@@ -26,6 +26,7 @@
     "quick_check_failed",
     "foreign_key_violation",
     "schema_mismatch",
+    "schema_upgrade_required",
     "migration_ledger_mismatch",
     "repository_identity_invalid",
     "repository_binding_mismatch",
@@ -40,8 +41,8 @@
     "read_only": true,
     "receipt_is_deterministic": true,
     "receipt_omits_paths_credentials_and_repository_payloads": true,
-    "healthy_requires_no_failed_checks": true,
-    "admission_requires_healthy_receipt": true,
+    "healthy_requires_no_failed_or_upgrade_required_checks": true,
+    "workload_admission_requires_healthy_receipt": true,
     "full_integrity_check_is_not_a_startup_check": true
   }
 }

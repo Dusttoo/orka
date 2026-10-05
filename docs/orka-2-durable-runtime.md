@@ -137,14 +137,16 @@ concerns.
    migration, stable status categories, and restart/reclassification proof are
    complete in 1.8.17.**
 7. Specify the disposable phase-worker protocol and shared adapter fixtures.
-   **Complete in 1.8.18.**
+   **Complete in 1.8.18.
    Supervisor-managed launch, progress, cancellation, terminal attribution,
    replacement, and restart reconciliation are complete in 1.8.28. Codex
    desktop, Claude desktop, and API capability negotiation and contract
    integration are complete in 1.8.30. The provider-neutral replaceable
    execution-backend contract, compatibility map, and credential-free
-   conformance kit are complete in 1.8.32; routing the production launch and
-   inspection paths behind that accepted boundary remains tracked by #131.
+   conformance kit are complete in 1.8.32. Production Codex desktop, Claude
+   desktop, and API lifecycle routing, transactional execution tombstones,
+   restart-safe receipts, and fail-closed cancellation/terminal handling are
+   complete in 1.8.34 through #131.**
 8. Introduce a transactional event store with checkpoint import/export.
    **The architecture decision, schema prototype, and implementation slices are
    complete in 1.8.19. Repository identity and canonical policy authority are
@@ -160,7 +162,9 @@ concerns.
    startup diagnostics now fail closed before planning or admission when the
    store, migration ledger, repository/policy binding, cutover, version, or
    permissions are unhealthy; this first #119 operational-proof slice is
-   complete in 1.8.33 through #157.**
+   complete in 1.8.33 through #157. The additive execution-backend projection
+   and migration 0004 retain those admission and writer-lock guarantees while
+   adding exact launch-to-terminal receipt authority in 1.8.34.**
 9. Add supervisor lease takeover and crash recovery.
 10. Expose stable status, pause, resume, and decision CLI commands.
 11. Prove the design with restart, timeout, provider-loss, and malformed-output

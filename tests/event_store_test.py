@@ -229,8 +229,8 @@ class TransactionalEventStoreTests(unittest.TestCase):
                 "INSERT INTO metadata(key, value) VALUES ('schema_version', '1')"
             )
         self.store = TransactionalEventStore(self.path, writer_identity=WRITER)
-        self.assertEqual(self.store.status().schema_version, 3)
-        self.assertEqual(len(self.store.rows("schema_migrations")), 3)
+        self.assertEqual(self.store.status().schema_version, 4)
+        self.assertEqual(len(self.store.rows("schema_migrations")), 4)
         self.assertEqual(self.store.rows("migration_sources"), [])
         self.assertEqual(self.store.rows("runtime_cutovers"), [])
 
@@ -424,6 +424,76 @@ class TransactionalEventStoreTests(unittest.TestCase):
         self.assertTrue(launch_replay.replayed)
         self.assertTrue(completion_replay.replayed)
         self.assertEqual(len(self.store.rows("events")), 4)
+
+    def test_execution_key_is_consumed_before_launch_and_never_reused(self) -> None:
+        binding_value = {
+            "repository_id": REPOSITORY_ID,
+            "job_id": "phase-job:PROJ-1",
+            "phase": "implement",
+            "attempt_token": "attempt:PROJ-1:1",
+            "dispatch_id": "dispatch:PROJ-1:1",
+            "execution_unit_id": "unit:PROJ-1:1",
+            "worktree_id": "worktree:PROJ-1",
+            "supervisor_fence": "supervisor:1",
+        }
+        self.store.consume_execution_key(
+            binding=binding_value,
+            backend_id="orka-current-route/codex-desktop",
+            envelope_digest="envelope-digest",
+            idempotency_key="execution-intent:PROJ-1",
+            writer_identity=WRITER,
+            occurred_at=NOW,
+        )
+        with self.assertRaisesRegex(StaleWriteError, "already consumed"):
+            self.store.consume_execution_key(
+                binding=binding_value,
+                backend_id="orka-current-route/codex-desktop",
+                envelope_digest="envelope-digest",
+                idempotency_key="execution-intent:PROJ-1",
+                writer_identity=WRITER,
+                occurred_at=NOW,
+            )
+        launch_receipt = {
+            "binding": binding_value,
+            "status": "launched",
+            "launch_receipt": "receipt",
+        }
+        first_receipt = self.store.record_execution_receipt(
+            binding=binding_value,
+            operation="launch",
+            receipt=launch_receipt,
+            target_state="launched",
+            idempotency_key="execution-launch:PROJ-1",
+            writer_identity=WRITER,
+            occurred_at=NOW,
+        )
+        replayed_receipt = self.store.record_execution_receipt(
+            binding=binding_value,
+            operation="launch",
+            receipt=launch_receipt,
+            target_state="launched",
+            idempotency_key="execution-launch:PROJ-1",
+            writer_identity=WRITER,
+            occurred_at=NOW,
+        )
+        self.assertEqual(replayed_receipt.sequence, first_receipt.sequence)
+        self.assertTrue(replayed_receipt.replayed)
+        record = self.store.execution_record(binding_value)
+        self.assertEqual(record["state"], "launched")
+        self.assertEqual(record["version"], 2)
+        self.assertEqual(record["launch_receipt"], launch_receipt)
+
+        stale = {**binding_value, "execution_unit_id": "unit:PROJ-1:2"}
+        with self.assertRaisesRegex(StaleWriteError, "binding is stale"):
+            self.store.record_execution_receipt(
+                binding=stale,
+                operation="terminal",
+                receipt={"binding": stale, "status": "terminal"},
+                target_state="terminal",
+                idempotency_key="execution-terminal:stale",
+                writer_identity=WRITER,
+                occurred_at=NOW,
+            )
 
     def test_changed_idempotency_payload_fails_and_exact_replay_is_noop(self) -> None:
         first = self.store.create_job(
