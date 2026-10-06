@@ -37,7 +37,6 @@ from runtime_state import (
     shared_runtime_path,
     working_repository_root,
     repository_identity,
-    repository_layout,
 )
 from event_store import TransactionalEventStore, canonical_json
 from authoritative_supervisor_state import (
@@ -458,6 +457,7 @@ def runtime_fingerprint() -> str:
         + (PLUGIN_ROOT / "contracts/event-store-v1.sql").read_bytes()
         + (PLUGIN_ROOT / "contracts/event-store-v2-legacy-import.sql").read_bytes()
         + (PLUGIN_ROOT / "contracts/event-store-v3-runtime-cutover.sql").read_bytes()
+        + (PLUGIN_ROOT / "contracts/event-store-v4-execution-backends.sql").read_bytes()
         + (PLUGIN_ROOT / ".codex-plugin/plugin.json").read_bytes()
     )
 
@@ -698,6 +698,42 @@ def durable_state_snapshot(
             raise SupervisorError("supervisor state belongs to another repository")
         return value
     return state_snapshot(path, repository, migrate=migrate)
+
+
+def migrate_locked_authoritative_generation(
+    authority: AuthoritativeSupervisorState,
+    expected: dict[str, Any] | None,
+    *,
+    target_runtime_fingerprint: str,
+    target_contract_digest: str,
+) -> dict[str, Any] | None:
+    """Migrate only the exact generation read under the retained writer lock."""
+
+    locked, source_authority = authority.load_with_authority()
+    if locked != expected:
+        raise SupervisorError(
+            "authoritative supervisor generation changed during startup"
+        )
+    if locked is None:
+        return None
+    try:
+        migrated, changed = migrate_supervisor_state(
+            locked,
+            target_runtime_fingerprint=target_runtime_fingerprint,
+            target_contract_digest=target_contract_digest,
+            authoritative_source=source_authority,
+        )
+    except SupervisorStateError as exc:
+        raise SupervisorError(str(exc)) from exc
+    if changed:
+        try:
+            receipt = migrated.get("execution_backend_migration") or {}
+            authority.persist(
+                migrated, operation_digest=str(receipt.get("authority_receipt") or "")
+            )
+        except AuthoritativeStateError as exc:
+            raise SupervisorError(str(exc)) from exc
+    return migrated
 
 
 def verify_state_digest(state_path: Path, digest_path: Path, *, required: bool) -> str:
@@ -1169,39 +1205,7 @@ def run_daemon(repository: Path, handshake: Path) -> int:
             return 2
         cutover_active = startup_diagnostic["mode"] == "transactional"
 
-        previous = (
-            read_authoritative_state(repository)
-            if cutover_active
-            else state_snapshot(paths["state"], repository, migrate=False)
-        )
-        previous_lease = (previous or {}).get("lease") or {}
-        previous_clean = bool(
-            previous
-            and previous.get("lifecycle_state") == "stopped"
-            and previous_lease.get("released_at")
-            and previous_lease.get("release_count") == 1
-        )
-        if previous:
-            if not cutover_active:
-                verify_state_digest(
-                    paths["state"],
-                    paths["state_digest"],
-                    required=not previous_clean,
-                )
-            try:
-                previous, _migrated = migrate_supervisor_state(
-                    previous,
-                    target_runtime_fingerprint=runtime_fingerprint(),
-                    target_contract_digest=contract_digest,
-                )
-            except SupervisorStateError as exc:
-                write_handshake(handshake, {"status": "error", "error": str(exc)})
-                return 2
-        generation = int(previous_lease.get("generation") or 0) + 1
-        os.fchmod(lock_handle.fileno(), 0o600)
-        identity = process_identity(os.getpid())
-        lease = new_lease(lock_handle, paths, generation)
-        lease_id = lease["id"]
+        previous: dict[str, Any] | None
         if cutover_active:
             repository_binding = repository_identity(repository)
             writer_identity = f"supervisor:{repository_binding['repository_uuid']}"
@@ -1212,6 +1216,9 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                 raise SupervisorError(
                     "healthy transactional diagnostics did not bind a database"
                 )
+            # Acquire the one durable writer before reading the authoritative
+            # generation. The same store remains open through migration and
+            # the first migrated persist, closing the pre-lock snapshot race.
             event_store = TransactionalEventStore(
                 startup_admission.database_path,
                 writer_identity=writer_identity,
@@ -1230,12 +1237,61 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                 raise SupervisorError(
                     "event-store upgrade did not produce healthy startup authority"
                 )
+            startup_reader = AuthoritativeSupervisorState(
+                repository,
+                event_store,
+                writer_identity=writer_identity,
+                supervisor_fence="startup-authority-read",
+            )
+            previous = startup_reader.load()
+        else:
+            previous = state_snapshot(paths["state"], repository, migrate=False)
+        previous_lease = (previous or {}).get("lease") or {}
+        previous_clean = bool(
+            previous
+            and previous.get("lifecycle_state") == "stopped"
+            and previous_lease.get("released_at")
+            and previous_lease.get("release_count") == 1
+        )
+        if previous and not cutover_active:
+            verify_state_digest(
+                paths["state"],
+                paths["state_digest"],
+                required=not previous_clean,
+            )
+        generation = int(previous_lease.get("generation") or 0) + 1
+        os.fchmod(lock_handle.fileno(), 0o600)
+        identity = process_identity(os.getpid())
+        lease = new_lease(lock_handle, paths, generation)
+        lease_id = lease["id"]
+        if cutover_active:
+            if event_store is None:
+                raise SupervisorError("transactional writer authority is unavailable")
             authoritative_state = AuthoritativeSupervisorState(
                 repository,
                 event_store,
                 writer_identity=writer_identity,
                 supervisor_fence=f"{lease_id}:{generation}",
             )
+            previous = migrate_locked_authoritative_generation(
+                authoritative_state,
+                previous,
+                target_runtime_fingerprint=runtime_fingerprint(),
+                target_contract_digest=contract_digest,
+            )
+        if previous:
+            if authoritative_state is None:
+                try:
+                    previous, _migrated = migrate_supervisor_state(
+                        previous,
+                        target_runtime_fingerprint=runtime_fingerprint(),
+                        target_contract_digest=contract_digest,
+                    )
+                except SupervisorStateError as exc:
+                    write_handshake(
+                        handshake, {"status": "error", "error": str(exc)}
+                    )
+                    return 2
         try:
             config_path = (
                 materialize_policy_snapshot(repository, startup_admission.policy)
@@ -1423,6 +1479,16 @@ def run_daemon(repository: Path, handshake: Path) -> int:
                 authoritative_state.repository_id
                 if authoritative_state is not None
                 else None
+            ),
+        )
+        dispatcher.bind_execution_backend_migration(
+            state.get("execution_backend_migration"),
+            authenticated=(
+                authoritative_state.authenticate_migration_receipt(
+                    state.get("execution_backend_migration") or {}
+                )
+                if authoritative_state is not None
+                else False
             ),
         )
         while not should_stop:
