@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import re
 from typing import Any
 
 from breaker_runtime import BreakerRuntime, BreakerRuntimeError, canonical_digest
@@ -43,6 +44,83 @@ def _legacy_execution_digest(job: dict[str, Any]) -> str:
             )
         }
     )
+
+
+def _migration_receipt_digest(receipt: dict[str, Any]) -> str:
+    material = copy.deepcopy(receipt)
+    material.pop("authority_receipt", None)
+    return canonical_digest(material)
+
+
+def _validate_execution_backend_migration(value: dict[str, Any]) -> None:
+    receipt = value.get("execution_backend_migration")
+    jobs = ((value.get("dispatch") or {}).get("jobs") or {})
+    if receipt is None:
+        if any(
+            isinstance(job, dict) and job.get("legacy_execution_backend_provenance")
+            for job in jobs.values()
+        ):
+            raise SupervisorStateError(
+                "legacy execution provenance lacks its top-level migration receipt"
+            )
+        return
+    if not isinstance(receipt, dict):
+        raise SupervisorStateError("execution backend migration receipt must be an object")
+    imported = receipt.get("imported_jobs")
+    if (
+        receipt.get("schema_version") != 1
+        or receipt.get("source_schema_version") != 2
+        or not isinstance(imported, dict)
+        or receipt.get("migration_id")
+        != f"execution-backend-v1:{receipt.get('source_digest')}"
+    ):
+        raise SupervisorStateError("execution backend migration receipt is invalid")
+    authority_fields = (
+        "activation_id",
+        "source_payload_digest",
+        "source_event_id",
+    )
+    if imported:
+        if (
+            receipt.get("trust_boundary")
+            != "exclusive-event-store-writer/private-local-filesystem"
+            or any(not isinstance(receipt.get(field), str) or not receipt[field] for field in authority_fields)
+            or any(
+                not isinstance(receipt.get(field), int) or receipt[field] < 1
+                for field in ("source_generation", "source_event_sequence", "target_generation")
+            )
+            or receipt["target_generation"] != receipt["source_generation"] + 1
+            or not re.fullmatch(r"[0-9a-f]{64}", receipt["source_payload_digest"])
+            or not re.fullmatch(r"[0-9a-f]{64}", receipt["source_event_id"])
+            or receipt.get("authority_receipt") != _migration_receipt_digest(receipt)
+        ):
+            raise SupervisorStateError(
+                "execution backend migration lacks authenticated event-store provenance"
+            )
+    for run_ref, source_job_digest in imported.items():
+        job = jobs.get(run_ref)
+        expected = {
+            "schema_version": 1,
+            "migration_id": receipt["migration_id"],
+            "source_schema_version": 2,
+            "source_job_digest": source_job_digest,
+            "source_generation": receipt.get("source_generation"),
+            "activation_id": receipt.get("activation_id"),
+            "target_generation": receipt.get("target_generation"),
+        }
+        if not isinstance(job, dict) or job.get("legacy_execution_backend_provenance") != expected:
+            raise SupervisorStateError(
+                f"job {run_ref} migration provenance does not match top-level authority"
+            )
+    for run_ref, job in jobs.items():
+        if (
+            isinstance(job, dict)
+            and job.get("legacy_execution_backend_provenance")
+            and run_ref not in imported
+        ):
+            raise SupervisorStateError(
+                f"job {run_ref} has fabricated legacy execution provenance"
+            )
 
 
 def _legacy_time(state: dict[str, Any]) -> str:
@@ -140,6 +218,7 @@ def _validate_current_state(value: dict[str, Any]) -> None:
             raise SupervisorStateError(
                 "schema-v2 global breaker is not bound to its lifecycle and exact generation"
             )
+    _validate_execution_backend_migration(value)
 
 
 def _legacy_ticket_breakers(planning: dict[str, Any]) -> list[dict[str, Any]]:
@@ -315,6 +394,7 @@ def migrate_supervisor_state(
     *,
     target_runtime_fingerprint: str,
     target_contract_digest: str,
+    authoritative_source: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], bool]:
     """Upgrade durable state exactly once while retaining its complete payload."""
 
@@ -377,10 +457,11 @@ def migrate_supervisor_state(
 
     schema_two = copy.deepcopy(migrated)
     schema_two_digest = canonical_digest(schema_two)
+    execution_migration_id = f"execution-backend-v1:{schema_two_digest}"
     jobs = ((migrated.get("dispatch") or {}).get("jobs") or {})
     if not isinstance(jobs, dict):
         raise SupervisorStateError("supervisor dispatch jobs must be an object")
-    imported: list[str] = []
+    imported: dict[str, str] = {}
     for run_ref, job in sorted(jobs.items()):
         if not isinstance(job, dict):
             raise SupervisorStateError(f"job {run_ref} must be an object")
@@ -391,25 +472,41 @@ def migrate_supervisor_state(
             and isinstance(job.get("execution_identity"), dict)
         ):
             job_digest = _legacy_execution_digest(job)
-            job["legacy_execution_backend_provenance"] = {
-                "schema_version": 1,
-                "migration_id": f"execution-backend-v1:{job_digest}",
-                "source_schema_version": 2,
-                "source_job_digest": job_digest,
-            }
-            imported.append(str(run_ref))
+            imported[str(run_ref)] = job_digest
+    if imported and not authoritative_source:
+        raise SupervisorStateError(
+            "backendless running jobs require authenticated event-store migration authority"
+        )
+    authority = copy.deepcopy(authoritative_source or {})
+    if authority and authority.get("target_generation") != authority.get("source_generation", 0) + 1:
+        raise SupervisorStateError("event-store migration generation binding is invalid")
+    for run_ref, job_digest in imported.items():
+        jobs[run_ref]["legacy_execution_backend_provenance"] = {
+            "schema_version": 1,
+            "migration_id": execution_migration_id,
+            "source_schema_version": 2,
+            "source_job_digest": job_digest,
+            "source_generation": authority.get("source_generation"),
+            "activation_id": authority.get("activation_id"),
+            "target_generation": authority.get("target_generation"),
+        }
     migrated["schema_version"] = CURRENT_SCHEMA_VERSION
     migrated["execution_backend_migration"] = {
         "schema_version": 1,
-        "migration_id": f"execution-backend-v1:{schema_two_digest}",
+        "migration_id": execution_migration_id,
         "source_schema_version": 2,
         "source_digest": schema_two_digest,
         "prior_runtime_fingerprint": str(schema_two.get("runtime_fingerprint") or ""),
         "target_runtime_fingerprint": target_runtime_fingerprint,
         "prior_contract_digest": str(schema_two.get("contract_digest") or ""),
         "target_contract_digest": target_contract_digest,
-        "imported_runs": imported,
+        "imported_jobs": imported,
+        **authority,
     }
+    if authority:
+        migrated["execution_backend_migration"]["authority_receipt"] = (
+            _migration_receipt_digest(migrated["execution_backend_migration"])
+        )
     _validate_current_state(migrated)
     return migrated, True
 

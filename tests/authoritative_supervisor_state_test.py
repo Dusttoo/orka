@@ -9,6 +9,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import importlib.util
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,6 +28,13 @@ from event_store import (  # noqa: E402
 )
 from runtime_state import initialize_repository_identity, repository_identity  # noqa: E402
 from state_migration import activate_runtime_cutover, import_legacy_state  # noqa: E402
+
+SUPERVISOR_SPEC = importlib.util.spec_from_file_location(
+    "authority_test_sprint_supervisor", SUPERVISOR
+)
+sprint_supervisor = importlib.util.module_from_spec(SUPERVISOR_SPEC)
+assert SUPERVISOR_SPEC.loader is not None
+SUPERVISOR_SPEC.loader.exec_module(sprint_supervisor)
 
 
 class AuthoritativeSupervisorStateTests(unittest.TestCase):
@@ -163,6 +171,84 @@ class AuthoritativeSupervisorStateTests(unittest.TestCase):
         store.close()
         with self.assertRaisesRegex(EventStoreError, "closed"):
             authority.persist(self.state(2))
+
+    def test_execution_migration_is_bound_to_real_source_and_target_generations(self) -> None:
+        store, authority = self.open_authority("lease-1:1")
+        source = {
+            "schema_version": 2,
+            "repository": str(self.repo),
+            "runtime_fingerprint": "runtime-old",
+            "contract_digest": "contract-old",
+            "planning": {},
+            "dispatch": {
+                "jobs": {
+                    "run-old": {
+                        "ticket": "PNP-1",
+                        "sprint": "65",
+                        "run_ref": "run-old",
+                        "attempt_token": "attempt-old",
+                        "state": "running",
+                        "phase_execution": {
+                            "schema_version": "orka.phase-execution-state/v1"
+                        },
+                        "execution_identity": {"invocation_id": "invocation-old"},
+                    }
+                }
+            },
+        }
+        authority.persist(source)
+        expected = authority.load()
+
+        migrated = sprint_supervisor.migrate_locked_authoritative_generation(
+            authority,
+            expected,
+            target_runtime_fingerprint="runtime-new",
+            target_contract_digest="contract-new",
+        )
+
+        receipt = migrated["execution_backend_migration"]
+        self.assertTrue(authority.authenticate_migration_receipt(receipt))
+        self.assertEqual(receipt["target_generation"], receipt["source_generation"] + 1)
+        for field, changed in (
+            ("activation_id", "forged-activation"),
+            ("source_generation", receipt["source_generation"] + 3),
+            ("source_payload_digest", "f" * 64),
+            ("source_event_id", "e" * 64),
+        ):
+            with self.subTest(field=field):
+                tampered = dict(receipt)
+                tampered[field] = changed
+                self.assertFalse(authority.authenticate_migration_receipt(tampered))
+
+        store.close()
+
+    def test_real_writer_cas_rejects_stale_migration_source(self) -> None:
+        store, authority = self.open_authority("lease-1:1")
+        source = {
+            "schema_version": 2,
+            "repository": str(self.repo),
+            "runtime_fingerprint": "runtime-old",
+            "contract_digest": "contract-old",
+            "planning": {},
+            "dispatch": {"jobs": {}},
+        }
+        authority.persist(source)
+        stale = authority.load()
+        stale_generation = authority.generation
+        authority.persist({**source, "history": [{"event": "newer-generation"}]})
+
+        with self.assertRaisesRegex(
+            sprint_supervisor.SupervisorError, "generation changed"
+        ):
+            sprint_supervisor.migrate_locked_authoritative_generation(
+                authority,
+                stale,
+                target_runtime_fingerprint="runtime-new",
+                target_contract_digest="contract-new",
+            )
+
+        self.assertEqual(authority.generation, stale_generation + 1)
+        store.close()
 
     def test_cutover_supervisor_uses_database_for_control_and_restart(self) -> None:
         def run(command: str, *extra: str) -> dict:

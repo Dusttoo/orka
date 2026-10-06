@@ -42,10 +42,10 @@
         "attach",
         "heartbeat",
         "progress",
-        "cancel",
         "inspect",
         "terminal"
-      ]
+      ],
+      "optional": ["cancel"]
     },
     "containment": {
       "required_fields": [
@@ -73,7 +73,7 @@
     "statuses": ["live", "absent", "terminal", "unknown"],
     "timeout_status": "unknown",
     "permission_denied_status": "unknown",
-    "replacement_safe_statuses": ["absent", "terminal"],
+    "replacement_safe_statuses": ["absent"],
     "terminal_requires_canonical_phase_envelope": true,
     "absence_requires": [
       "backend_instance_id",
@@ -85,8 +85,10 @@
     "process_identity_reuse": "original_absent_with_receipt"
   },
   "cancellation": {
-    "safe_results": ["acknowledged"],
+    "safe_results": ["acknowledged_with_verified_absence"],
     "unsafe_results": ["requested", "timeout", "unknown"],
+    "acknowledgement_replacement_safe": false,
+    "replacement_requires_mechanical_absence": true,
     "acknowledgement_requires": [
       "canonical_cancellation_ack",
       "exact_launch_identity",

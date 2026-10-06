@@ -146,21 +146,35 @@ class AuthoritativeSupervisorState:
         document = self._snapshot_document()
         return int(document.get("generation") or 0) if document else 0
 
-    def load(self) -> dict[str, Any] | None:
+    def load_with_authority(
+        self,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         with self._lock:
             document = self._snapshot_document()
             if document is None:
                 self._generation = 0
-                return None
+                return None, None
             generation = int(document["generation"])
             if generation < self._generation:
                 raise AuthoritativeStateError(
                     "authoritative supervisor generation moved backwards"
                 )
             self._generation = generation
-            return dict(document["payload"])
+            return dict(document["payload"]), {
+                "trust_boundary": "exclusive-event-store-writer/private-local-filesystem",
+                "activation_id": self.activation_id,
+                "source_generation": generation,
+                "source_payload_digest": str(document["payload_digest"]),
+                "source_event_sequence": int(document.get("last_event_sequence") or 0),
+                "source_event_id": str(document.get("last_event_id") or ""),
+                "target_generation": generation + 1,
+            }
 
-    def persist(self, state: dict[str, Any]) -> str:
+    def load(self) -> dict[str, Any] | None:
+        state, _authority = self.load_with_authority()
+        return state
+
+    def persist(self, state: dict[str, Any], *, operation_digest: str = "") -> str:
         """Commit one complete supervisor generation and return its digest."""
 
         with self._lock:
@@ -179,10 +193,47 @@ class AuthoritativeSupervisorState:
                     f"{payload_digest}"
                 ),
                 writer_identity=self.writer_identity,
-                operation_digest=payload_digest,
+                operation_digest=operation_digest or payload_digest,
             )
             self._generation = result.generation
             return result.payload_digest
+
+    def authenticate_migration_receipt(self, receipt: dict[str, Any]) -> bool:
+        """Verify migration provenance against immutable source/target events."""
+
+        if not isinstance(receipt, dict):
+            return False
+        source_generation = receipt.get("source_generation")
+        target_generation = receipt.get("target_generation")
+        if not isinstance(source_generation, int) or target_generation != source_generation + 1:
+            return False
+        source = self.store.runtime_document_event(
+            repository_id=self.repository_id,
+            document_type=DOCUMENT_TYPE,
+            document_id=DOCUMENT_ID,
+            generation=source_generation,
+        )
+        target = self.store.runtime_document_event(
+            repository_id=self.repository_id,
+            document_type=DOCUMENT_TYPE,
+            document_id=DOCUMENT_ID,
+            generation=target_generation,
+        )
+        if source is None or target is None:
+            return False
+        target_payload = target.get("payload") or {}
+        return bool(
+            receipt.get("trust_boundary")
+            == "exclusive-event-store-writer/private-local-filesystem"
+            and receipt.get("activation_id") == self.activation_id
+            and receipt.get("source_event_sequence") == source["sequence"]
+            and receipt.get("source_event_id") == source["event_id"]
+            and receipt.get("source_payload_digest")
+            == (source.get("payload") or {}).get("payload_digest")
+            and target_payload.get("activation_id") == self.activation_id
+            and target_payload.get("operation_digest")
+            == receipt.get("authority_receipt")
+        )
 
     @property
     def generation(self) -> int:

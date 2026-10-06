@@ -807,7 +807,6 @@ class CurrentRouteExecutionBackend:
                 "attach",
                 "heartbeat",
                 "progress",
-                "cancel",
                 "inspect",
                 "terminal",
             ],
@@ -816,7 +815,7 @@ class CurrentRouteExecutionBackend:
                 "filesystem": "worktree",
                 "network": "unrestricted",
                 "credentials": "ambient",
-                "process_control": "inspect-cancel",
+                "process_control": "observe-only",
             },
             "provider_capabilities": [
                 "desktop-subscription" if desktop else "provider-receipts"
@@ -903,8 +902,11 @@ class CurrentRouteExecutionBackend:
     def validate_launch_receipt(self, launch: dict[str, Any]) -> None:
         self._identity(launch)
 
-    def bind_terminal_result(self, result: dict[str, Any]) -> None:
+    def bind_terminal_result(
+        self, result: dict[str, Any], *, source_result_digest: str
+    ) -> None:
         self.validated_terminal_result = copy.deepcopy(result)
+        self.material["source_result_digest"] = source_result_digest
 
     def attach(self, binding: dict[str, str], launch: dict[str, Any]) -> dict[str, Any]:
         return self._event(
@@ -985,6 +987,7 @@ class CurrentRouteExecutionBackend:
             "terminal",
             terminal_envelope=terminal,
             terminal_result=validated,
+            source_result_digest=str(self.material.get("source_result_digest") or ""),
         )
 
     def inspect(
@@ -1081,6 +1084,8 @@ class SupervisorDispatcher:
         self.retry_delay_seconds = float(retry_delay_seconds)
         self.last_errors: list[dict[str, str]] = []
         self.last_skips: list[dict[str, Any]] = []
+        self.execution_backend_migration: dict[str, Any] = {}
+        self.execution_backend_migration_authenticated = False
         try:
             self.contract = load_contract(contract_path)
             validate_contract(self.contract, CONTROLLER)
@@ -1123,6 +1128,14 @@ class SupervisorDispatcher:
             else None
         )
 
+    def bind_execution_backend_migration(
+        self, receipt: dict[str, Any] | None, *, authenticated: bool = False
+    ) -> None:
+        """Bind legacy compatibility to the authenticated supervisor migration."""
+
+        self.execution_backend_migration = copy.deepcopy(receipt or {})
+        self.execution_backend_migration_authenticated = authenticated is True
+
     def _execution_backend(
         self,
         *,
@@ -1156,7 +1169,6 @@ class SupervisorDispatcher:
                         "attach",
                         "heartbeat",
                         "progress",
-                        "cancel",
                         "inspect",
                         "terminal",
                     ],
@@ -1210,6 +1222,7 @@ class SupervisorDispatcher:
         provenance = job.get("legacy_execution_backend_provenance")
         if not isinstance(provenance, dict):
             return False
+        migration = self.execution_backend_migration
         source_digest = canonical_digest(
             {
                 field: job.get(field)
@@ -1223,11 +1236,25 @@ class SupervisorDispatcher:
                 )
             }
         )
+        imported_jobs = migration.get("imported_jobs")
+        if (
+            not self.execution_backend_migration_authenticated
+            or migration.get("schema_version") != 1
+            or migration.get("source_schema_version") != 2
+            or migration.get("migration_id")
+            != f"execution-backend-v1:{migration.get('source_digest')}"
+            or not isinstance(imported_jobs, dict)
+            or imported_jobs.get(job.get("run_ref")) != source_digest
+        ):
+            return False
         if provenance != {
             "schema_version": 1,
-            "migration_id": f"execution-backend-v1:{source_digest}",
+            "migration_id": migration["migration_id"],
             "source_schema_version": 2,
             "source_job_digest": source_digest,
+            "source_generation": migration.get("source_generation"),
+            "activation_id": migration.get("activation_id"),
+            "target_generation": migration.get("target_generation"),
         }:
             return False
         state = job.get("phase_execution")
@@ -1622,71 +1649,142 @@ class SupervisorDispatcher:
             if prior.get("result_digest") == raw_digest:
                 return {"applied": False, "duplicate": True, "terminal": prior}
             raise DispatchError("terminal result changed after it was applied")
-        raw_digest = hashlib.sha256(
-            _regular_private_file(result_path, "worker result")
-        ).hexdigest()
+        raw_digest = ""
+        if result_path.is_file():
+            raw_digest = hashlib.sha256(
+                _regular_private_file(result_path, "worker result")
+            ).hexdigest()
         identity = job.get("execution_identity") or {}
-        try:
-            value, digest = extract_terminal_result(result_path)
-            result = validate_terminal_result(
-                value,
-                ticket=job["ticket"],
-                sprint=job["sprint"],
-                attempt_token=job["attempt_token"],
-                invocation_id=str(identity.get("invocation_id") or ""),
-            )
-            work_identity = self.adapter.verify_work_identity(result)
-            if work_identity is not None:
-                result["evidence"]["preserved_work_identity"] = work_identity
-            if result["outcome"] == "completed":
-                result["evidence"]["merge_receipt"] = self.adapter.verify_completion(
-                    result
+        phase_state = job.get("phase_execution")
+        phase_candidate = copy.deepcopy(phase_state) if isinstance(phase_state, dict) else None
+        modern_phase = isinstance(phase_state, dict) and not self._legacy_phase_execution(
+            job
+        )
+        backend: CurrentRouteExecutionBackend | None = None
+        backend_coordinator: BackendCoordinator | None = None
+        binding: dict[str, str] | None = None
+        persisted_terminal: dict[str, Any] | None = None
+        if modern_phase:
+            try:
+                backend, backend_coordinator, binding = (
+                    self._restore_execution_backend(job)
                 )
-            phase_state = job.get("phase_execution")
-            if isinstance(phase_state, dict):
+                persisted_terminal = backend_coordinator.persisted_terminal(binding)
+            except (BackendContractError, DispatchError) as exc:
+                raise TerminalAuthorityError(
+                    f"persisted terminal authority rejected: {exc}"
+                ) from exc
+        try:
+            if persisted_terminal is not None:
+                persisted_result = persisted_terminal.get("terminal_result")
+                source_digest = persisted_terminal.get("source_result_digest")
+                receipt_material = copy.deepcopy(persisted_terminal)
+                receipt_digest = receipt_material.pop("evidence_receipt", None)
+                if (
+                    not isinstance(persisted_result, dict)
+                    or not isinstance(source_digest, str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", source_digest)
+                    or receipt_digest != backend_digest(receipt_material)
+                ):
+                    raise TerminalAuthorityError(
+                        "persisted terminal receipt lacks authenticated result authority"
+                    )
+                result = validate_terminal_result(
+                    persisted_result,
+                    ticket=job["ticket"],
+                    sprint=job["sprint"],
+                    attempt_token=job["attempt_token"],
+                    invocation_id=str(identity.get("invocation_id") or ""),
+                )
+                expected_envelope = self._phase_terminal_envelope(job, result)
+                if persisted_terminal.get("terminal_envelope") != expected_envelope:
+                    raise TerminalAuthorityError(
+                        "execution backend terminal envelope differs from persisted result"
+                    )
+                if raw_digest and raw_digest != source_digest:
+                    raise TerminalAuthorityError(
+                        "worker result file differs from persisted terminal authority"
+                    )
+                digest = source_digest
                 try:
-                    if self._legacy_phase_execution(job):
-                        self._phase_runtime_for_state(phase_state).ingest(
-                            phase_state,
-                            self._phase_terminal_envelope(job, result),
+                    self._phase_runtime_for_state(phase_candidate).ingest(
+                        phase_candidate, persisted_terminal["terminal_envelope"]
+                    )
+                except PhaseExecutionError as exc:
+                    raise TerminalAuthorityError(
+                        f"persisted terminal phase replay rejected: {exc}"
+                    ) from exc
+            else:
+                if not raw_digest:
+                    raise DispatchError("worker result is missing")
+                value, digest = extract_terminal_result(result_path)
+                result = validate_terminal_result(
+                    value,
+                    ticket=job["ticket"],
+                    sprint=job["sprint"],
+                    attempt_token=job["attempt_token"],
+                    invocation_id=str(identity.get("invocation_id") or ""),
+                )
+                work_identity = self.adapter.verify_work_identity(result)
+                if work_identity is not None:
+                    result["evidence"]["preserved_work_identity"] = work_identity
+                if result["outcome"] == "completed":
+                    result["evidence"]["merge_receipt"] = (
+                        self.adapter.verify_completion(result)
+                    )
+                if isinstance(phase_state, dict):
+                    if modern_phase:
+                        if (
+                            backend is None
+                            or backend_coordinator is None
+                            or binding is None
+                        ):
+                            raise TerminalAuthorityError(
+                                "execution backend authority was not restored"
+                            )
+                        backend.bind_terminal_result(
+                            result, source_result_digest=raw_digest
                         )
-                    else:
-                        backend, backend_coordinator, binding = (
-                            self._restore_execution_backend(job)
-                        )
-                        backend.bind_terminal_result(result)
-                        backend_terminal = backend_coordinator.terminal(binding)
-                        backend_result = backend_terminal.get("terminal_result")
-                        if not isinstance(backend_result, dict) or backend_result != result:
+                        try:
+                            backend_terminal = backend_coordinator.terminal(binding)
+                        except BackendContractError as exc:
+                            raise TerminalAuthorityError(
+                                f"terminal persistence rejected: {exc}"
+                            ) from exc
+                        if backend_terminal.get("terminal_result") != result:
                             raise TerminalAuthorityError(
                                 "execution backend terminal result differs from supervisor evidence"
                             )
-                        expected_envelope = self._phase_terminal_envelope(
-                            job, backend_result
-                        )
-                        if backend_terminal.get("terminal_envelope") != expected_envelope:
+                        expected_envelope = self._phase_terminal_envelope(job, result)
+                        if (
+                            backend_terminal.get("terminal_envelope")
+                            != expected_envelope
+                            or backend_terminal.get("source_result_digest")
+                            != raw_digest
+                        ):
                             raise TerminalAuthorityError(
-                                "execution backend terminal envelope differs from persisted result"
+                                "execution backend terminal receipt differs from supervisor evidence"
                             )
-                        result = copy.deepcopy(backend_result)
-                        self._phase_runtime_for_state(phase_state).ingest(
-                            phase_state,
-                            backend_terminal["terminal_envelope"],
+                        try:
+                            self._phase_runtime_for_state(phase_candidate).ingest(
+                                phase_candidate, backend_terminal["terminal_envelope"]
+                            )
+                        except PhaseExecutionError as exc:
+                            raise TerminalAuthorityError(
+                                f"persisted terminal phase replay rejected: {exc}"
+                            ) from exc
+                    else:
+                        self._phase_runtime_for_state(phase_candidate).ingest(
+                            phase_candidate,
+                            self._phase_terminal_envelope(job, result),
                         )
-                except TerminalAuthorityError:
-                    raise
-                except (PhaseExecutionError, BackendContractError, DispatchError) as exc:
-                    raise TerminalAuthorityError(
-                        f"persisted terminal authority rejected: {exc}"
-                    ) from exc
             event, target = self._worker_transition(result["outcome"])
             contract_evidence = self._contract_evidence(event, result, digest)
-            controller = self.adapter.finish(job["sprint"], job["ticket"], result)
             validation_error = ""
         except (StaleResultError, TerminalAuthorityError):
             raise
         except DispatchError as exc:
-            digest = raw_digest
+            digest = raw_digest or hashlib.sha256(b"").hexdigest()
             result = {
                 "outcome": "malformed_result",
                 "summary": f"worker result rejected: {exc}",
@@ -1703,12 +1801,15 @@ class SupervisorDispatcher:
             }
             phase_state = job.get("phase_execution")
             if isinstance(phase_state, dict) and phase_state.get("active") is not None:
+                phase_candidate = copy.deepcopy(phase_state)
                 try:
-                    self._phase_runtime_for_state(phase_state).reject_output(
-                        phase_state, str(exc)
+                    self._phase_runtime_for_state(phase_candidate).reject_output(
+                        phase_candidate, str(exc)
                     )
                 except PhaseExecutionError as phase_exc:
                     raise DispatchError(str(phase_exc)) from phase_exc
+            validation_error = str(exc)
+        if validation_error:
             controller = self.adapter.finish(
                 job["sprint"],
                 job["ticket"],
@@ -1716,7 +1817,11 @@ class SupervisorDispatcher:
                 outcome="recoverable",
                 summary=result["summary"],
             )
-            validation_error = str(exc)
+        else:
+            controller = self.adapter.finish(job["sprint"], job["ticket"], result)
+        if isinstance(phase_state, dict) and isinstance(phase_candidate, dict):
+            phase_state.clear()
+            phase_state.update(phase_candidate)
         terminal = {
             "event": event,
             "target_state": target,
@@ -1783,6 +1888,11 @@ class SupervisorDispatcher:
         phase_state = job.get("phase_execution")
         if not isinstance(phase_state, dict):
             raise DispatchError("job has no disposable phase execution")
+        if "cancel" not in (coordinator.offer.get("lifecycle") or []):
+            raise DispatchError(
+                "execution backend cannot mechanically cancel this route; "
+                "replacement remains unsafe"
+            )
         runtime = self._phase_runtime_for_state(phase_state)
         try:
             cancellation = runtime.request_cancel(
@@ -1792,8 +1902,13 @@ class SupervisorDispatcher:
             )
             requested = coordinator.cancel(binding, reason=reason)
             fenced = requested.get("supervisor_fence")
-            if not isinstance(fenced, dict):
-                fenced = coordinator.fence(binding, reason=reason)
+            if requested.get("replacement_safe") is not True or not isinstance(
+                fenced, dict
+            ):
+                raise DispatchError(
+                    "execution cancellation did not prove mechanical absence; "
+                    "replacement remains unsafe"
+                )
             runtime.fence_cancellation(
                 phase_state,
                 cancellation["cancellation_id"],
@@ -1931,15 +2046,27 @@ class SupervisorDispatcher:
         terminal, tombstone = self.execution_terminal(job)
         if not terminal:
             return None
-        if Path(job["paths"]["result"]).is_file():
-            if tombstone.get("status") == "absent" and not self._legacy_phase_execution(
-                job
-            ):
-                self._fence_exited_execution(
-                    job,
-                    reason="execution exited with an invalid structured terminal result",
-                )
-            return self.apply_terminal(job)
+        durable_terminal = False
+        if tombstone.get("status") == "absent" and self.backend_state is not None:
+            binding = (job.get("execution_backend") or {}).get("binding")
+            if isinstance(binding, dict):
+                record = self.backend_state.load(binding)
+                durable_terminal = bool(record and record.get("state") == "terminal")
+        if (
+            Path(job["paths"]["result"]).is_file()
+            or tombstone.get("status") == "terminal"
+            or durable_terminal
+        ):
+            applied = self.apply_terminal(job)
+            if tombstone.get("status") == "absent" and self.backend_state is not None:
+                binding = (job.get("execution_backend") or {}).get("binding")
+                record = self.backend_state.load(binding) if isinstance(binding, dict) else None
+                if not record or record.get("state") != "terminal":
+                    self._fence_exited_execution(
+                        job,
+                        reason="execution exited with an invalid structured terminal result",
+                    )
+            return applied
         if job.get("terminal"):
             return {"applied": False, "duplicate": True, "terminal": job["terminal"]}
         if not self._legacy_phase_execution(job):
