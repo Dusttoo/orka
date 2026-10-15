@@ -1,0 +1,173 @@
+{
+  "schema_version": 1,
+  "contract_id": "orka.external-service-adapter",
+  "protocol_version": 1,
+  "description": "Provider-neutral evidence and mutation protocol for external engineering services.",
+  "compatibility": {
+    "negotiation": "exact-major-additive-capabilities",
+    "supported_protocol_versions": [1],
+    "unknown_optional_capabilities": "ignore",
+    "unknown_required_capabilities": "reject-before-reservation",
+    "incompatible_protocol": "reject-before-reservation"
+  },
+  "capabilities": {
+    "issues.inventory.read": {"version": 1, "kind": "collection-read", "object_types": ["issue-collection"], "item_types": ["issue"]},
+    "issues.dependencies.read": {"version": 1, "kind": "collection-read", "object_types": ["issue-collection"], "item_types": ["dependency"]},
+    "issues.status.read": {"version": 1, "kind": "read", "object_types": ["issue"]},
+    "issues.status.transition": {"version": 1, "kind": "mutation", "object_types": ["issue"]},
+    "issues.comment.create": {"version": 1, "kind": "mutation", "object_types": ["issue"]},
+    "scm.pull-request.read": {"version": 1, "kind": "read", "object_types": ["pull-request"]},
+    "scm.pull-request.create": {"version": 1, "kind": "mutation", "object_types": ["repository"]},
+    "scm.pull-request.update": {"version": 1, "kind": "mutation", "object_types": ["pull-request"]},
+    "scm.ci.read": {"version": 1, "kind": "collection-read", "object_types": ["pull-request"], "item_types": ["ci-check"]},
+    "scm.approval.read": {"version": 1, "kind": "collection-read", "object_types": ["pull-request"], "item_types": ["approval"]},
+    "scm.comment.create": {"version": 1, "kind": "mutation", "object_types": ["pull-request"]},
+    "scm.merge.request": {"version": 1, "kind": "mutation", "object_types": ["pull-request"]},
+    "scm.merge-receipt.read": {"version": 1, "kind": "read", "object_types": ["merge-receipt"]}
+  },
+  "binding": {
+    "required": [
+      "repository_id",
+      "adapter_id",
+      "adapter_version",
+      "protocol_version",
+      "operation",
+      "operation_key",
+      "request_id",
+      "request_digest",
+      "external_object"
+    ],
+    "external_object_required": ["type", "id"],
+    "response_must_echo_exact_request_binding": true,
+    "repository_renames_preserve_immutable_id": true
+  },
+  "evidence": {
+    "normalized_only": true,
+    "vendor_payload_allowed": false,
+    "required": ["binding", "observed_at", "evidence_digest", "data"],
+    "data_must_be_object": true,
+    "unknown_fields": "reject"
+  },
+  "normalization": {
+    "schema_version": 1,
+    "unknown_fields": "reject-recursively",
+    "capabilities": {
+      "issues.inventory.read": {"request": {"required": ["project"], "min_properties": 1, "properties": {"project": {"type": "string", "min_length": 1}, "sprint": {"type": "string", "min_length": 1}}}, "evidence": {"required": [], "min_properties": 0, "properties": {}}, "item": {"required": ["key", "status", "summary"], "min_properties": 3, "properties": {"key": {"type": "string", "min_length": 1}, "status": {"type": "string", "min_length": 1}, "summary": {"type": "string", "min_length": 1}}}, "receipt": {"required": [], "min_properties": 0, "properties": {}}},
+      "issues.dependencies.read": {"request": {"required": ["issue_keys"], "min_properties": 1, "properties": {"issue_keys": {"type": "array", "item_type": "string", "min_items": 1}}}, "evidence": {"required": [], "min_properties": 0, "properties": {}}, "item": {"required": ["source", "relationship", "target"], "min_properties": 3, "properties": {"source": {"type": "string", "min_length": 1}, "relationship": {"type": "string", "min_length": 1}, "target": {"type": "string", "min_length": 1}}}, "receipt": {"required": [], "min_properties": 0, "properties": {}}},
+      "issues.status.read": {"request": {"required": ["fields"], "min_properties": 1, "properties": {"fields": {"type": "array", "item_type": "string", "min_items": 1}}}, "evidence": {"required": ["key", "status", "summary"], "min_properties": 3, "properties": {"key": {"type": "string", "min_length": 1}, "status": {"type": "string", "min_length": 1}, "summary": {"type": "string", "min_length": 1}}}, "item": {"required": [], "min_properties": 0, "properties": {}}, "receipt": {"required": [], "min_properties": 0, "properties": {}}},
+      "issues.status.transition": {"request": {"required": ["from", "to"], "min_properties": 2, "properties": {"from": {"type": "string", "min_length": 1}, "to": {"type": "string", "min_length": 1}}}, "evidence": {"required": [], "min_properties": 0, "properties": {}}, "item": {"required": [], "min_properties": 0, "properties": {}}, "receipt": {"required": ["provider_receipt_id"], "min_properties": 1, "properties": {"provider_receipt_id": {"type": "string", "min_length": 1}}}},
+      "issues.comment.create": {"request": {"required": ["body"], "min_properties": 1, "properties": {"body": {"type": "string", "min_length": 1}}}, "evidence": {"required": [], "min_properties": 0, "properties": {}}, "item": {"required": [], "min_properties": 0, "properties": {}}, "receipt": {"required": ["provider_receipt_id"], "min_properties": 1, "properties": {"provider_receipt_id": {"type": "string", "min_length": 1}}}},
+      "scm.pull-request.read": {"request": {"required": ["number"], "min_properties": 1, "properties": {"number": {"type": "integer", "minimum": 1}}}, "evidence": {"required": ["repository_id", "number", "head", "base", "state"], "min_properties": 5, "properties": {"repository_id": {"type": "integer", "minimum": 1}, "number": {"type": "integer", "minimum": 1}, "head": {"type": "string", "min_length": 1}, "base": {"type": "string", "min_length": 1}, "state": {"type": "string", "min_length": 1}}}, "item": {"required": [], "min_properties": 0, "properties": {}}, "receipt": {"required": [], "min_properties": 0, "properties": {}}},
+      "scm.pull-request.create": {"request": {"required": ["title", "body", "head", "base"], "min_properties": 4, "properties": {"title": {"type": "string", "min_length": 1}, "body": {"type": "string"}, "head": {"type": "string", "min_length": 1}, "base": {"type": "string", "min_length": 1}}}, "evidence": {"required": [], "min_properties": 0, "properties": {}}, "item": {"required": [], "min_properties": 0, "properties": {}}, "receipt": {"required": ["provider_receipt_id"], "min_properties": 1, "properties": {"provider_receipt_id": {"type": "string", "min_length": 1}}}},
+      "scm.pull-request.update": {"request": {"required": [], "min_properties": 1, "properties": {"title": {"type": "string", "min_length": 1}, "body": {"type": "string"}, "head": {"type": "string", "min_length": 1}, "base": {"type": "string", "min_length": 1}, "state": {"type": "string", "min_length": 1}}}, "evidence": {"required": [], "min_properties": 0, "properties": {}}, "item": {"required": [], "min_properties": 0, "properties": {}}, "receipt": {"required": ["provider_receipt_id"], "min_properties": 1, "properties": {"provider_receipt_id": {"type": "string", "min_length": 1}}}},
+      "scm.ci.read": {"request": {"required": ["head"], "min_properties": 1, "properties": {"head": {"type": "string", "min_length": 1}}}, "evidence": {"required": [], "min_properties": 0, "properties": {}}, "item": {"required": ["name", "status", "conclusion"], "min_properties": 3, "properties": {"name": {"type": "string", "min_length": 1}, "status": {"type": "string", "min_length": 1}, "conclusion": {"type": "string", "min_length": 1}}}, "receipt": {"required": [], "min_properties": 0, "properties": {}}},
+      "scm.approval.read": {"request": {"required": ["head"], "min_properties": 1, "properties": {"head": {"type": "string", "min_length": 1}}}, "evidence": {"required": [], "min_properties": 0, "properties": {}}, "item": {"required": ["reviewer", "state"], "min_properties": 2, "properties": {"reviewer": {"type": "string", "min_length": 1}, "state": {"type": "string", "min_length": 1}}}, "receipt": {"required": [], "min_properties": 0, "properties": {}}},
+      "scm.comment.create": {"request": {"required": ["body"], "min_properties": 1, "properties": {"body": {"type": "string", "min_length": 1}}}, "evidence": {"required": [], "min_properties": 0, "properties": {}}, "item": {"required": [], "min_properties": 0, "properties": {}}, "receipt": {"required": ["provider_receipt_id"], "min_properties": 1, "properties": {"provider_receipt_id": {"type": "string", "min_length": 1}}}},
+      "scm.merge.request": {"request": {"required": ["head", "method"], "min_properties": 2, "properties": {"head": {"type": "string", "min_length": 1}, "method": {"type": "string", "enum": ["merge", "squash", "rebase"]}}}, "evidence": {"required": [], "min_properties": 0, "properties": {}}, "item": {"required": [], "min_properties": 0, "properties": {}}, "receipt": {"required": ["provider_receipt_id"], "min_properties": 1, "properties": {"provider_receipt_id": {"type": "string", "min_length": 1}}}},
+      "scm.merge-receipt.read": {"request": {"required": ["number"], "min_properties": 1, "properties": {"number": {"type": "integer", "minimum": 1}}}, "evidence": {"required": ["head", "merge_commit", "merged"], "min_properties": 3, "properties": {"head": {"type": "string", "min_length": 1}, "merge_commit": {"type": "string", "min_length": 1}, "merged": {"type": "boolean"}}}, "item": {"required": [], "min_properties": 0, "properties": {}}, "receipt": {"required": [], "min_properties": 0, "properties": {}}}
+    }
+  },
+  "pagination": {
+    "required_for": ["collection-read"],
+    "max_pages": 10000,
+    "page_required": ["page_index", "cursor", "request_digest", "items", "next_cursor", "complete"],
+    "item_required": ["object_identity", "data"],
+    "item_identity_required": ["type", "id"],
+    "final_proof_required": ["page_count", "item_count", "item_identities_digest", "completion_basis", "provider_total"],
+    "completion_bases": ["provider-total", "terminal-cursor"],
+    "duplicate_item_identity": "reject",
+    "repeated_cursor": "reject",
+    "incomplete_terminal_page": "reject"
+  },
+  "mutations": {
+    "intent_required": ["binding", "idempotency_key", "input_digest", "input"],
+    "acknowledgement_required": ["binding", "status", "acknowledgement_digest"],
+    "statuses": ["completed", "rejected", "rate_limited", "ambiguous"],
+    "completed_requires": ["external_object", "receipt"],
+    "ambiguous_requires": ["reconciliation_key", "intent_digest"],
+    "blind_retry_after_ambiguous": false,
+    "reconciliation_operation": "reconcile",
+    "reconciliation_must_bind_original_intent": true,
+    "intent_store_requires_atomic_claim": true,
+    "pre_ack_reconciliation_key": "durable-host-generated",
+    "reconciliation_key_collision": "reject",
+    "file_store_commit": "file-and-parent-directory-fsync",
+    "rate_limited_retry": "same-exact-intent-after-retry-after",
+    "uncertain_submission": "reconcile-only"
+  },
+  "redaction": {
+    "forbidden_keys": [
+      "authorization",
+      "cookie",
+      "credentials",
+      "password",
+      "raw_payload",
+      "secret",
+      "token"
+    ],
+    "case_insensitive": true,
+    "applies_recursively": true,
+    "credentials_may_cross_adapter_boundary": false
+  },
+  "retry_and_rate_limits": {
+    "classifications": ["success", "permanent", "transient", "rate_limited", "ambiguous"],
+    "rate_limit_required": ["scope", "remaining", "reset_at", "retry_after_seconds"],
+    "rate_limited_retry_requires_reset_or_retry_after": true,
+    "ambiguous_is_retryable": false,
+    "unknown_error_before_claim_is": "permanent",
+    "unknown_error_after_claim_is": "reconcile-only"
+  },
+  "unsupported": {
+    "status": "unsupported",
+    "required": ["capability", "requested_version", "supported_versions"],
+    "must_not_mutate": true
+  },
+  "authority_boundary": {
+    "allowed": [
+      "advertise_capabilities",
+      "return_normalized_evidence",
+      "execute_bound_mutation_intent",
+      "reconcile_bound_ambiguous_intent"
+    ],
+    "forbidden": [
+      "schedule_work",
+      "reserve_budget",
+      "choose_dependencies",
+      "change_controller_state",
+      "authorize_merge",
+      "retry_ambiguous_mutation",
+      "weaken_repository_policy"
+    ]
+  },
+  "compatibility_map": {
+    "jira": {
+      "current_components": ["scripts/jira_inventory_fetch.py", "scripts/jira_decomposition.py"],
+      "capabilities": [
+        "issues.inventory.read",
+        "issues.dependencies.read",
+        "issues.status.read",
+        "issues.status.transition"
+      ],
+      "pending_integration": ["issues.comment.create"]
+    },
+    "github": {
+      "current_components": ["scripts/github_progress.py", "scripts/merge-on-green.sh", "scripts/merge-guard.sh"],
+      "capabilities": [
+        "scm.pull-request.read",
+        "scm.pull-request.create",
+        "scm.pull-request.update",
+        "scm.ci.read",
+        "scm.approval.read",
+        "scm.comment.create",
+        "scm.merge.request",
+        "scm.merge-receipt.read"
+      ],
+      "pending_integration": []
+    }
+  },
+  "test_adapters": {
+    "explicit_conformance_mode_required": true,
+    "production_selection_allowed": false,
+    "credentials_allowed": false
+  }
+}

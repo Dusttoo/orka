@@ -231,9 +231,44 @@ def atomic_json(path: Path, value: dict[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
+        fsync_directory(path.parent)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
+
+
+def fsync_directory(directory: Path) -> None:
+    """Persist a metadata transition after an atomic replace or unlink.
+
+    Capability state is an authorization boundary.  fsyncing only the new file
+    is insufficient: a crash can otherwise lose the directory entry which
+    records consumption or revocation.  The helper only supports local
+    POSIX-style durable storage; an unsupported directory fsync is a hard
+    failure rather than a claim of durability.
+    """
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    descriptor = os.open(directory, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def replace_record(source: Path, target: Path) -> None:
+    os.replace(source, target)
+    fsync_directory(source.parent)
+    if target.parent != source.parent:
+        fsync_directory(target.parent)
+
+
+def unlink_record(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    fsync_directory(path.parent)
 
 
 def load_record(path: Path) -> dict[str, Any]:
@@ -299,6 +334,30 @@ def locked(root: Path):
     return Lock()
 
 
+def revoke_scope_records(root: Path, kind: str, scope: str) -> None:
+    """Durably remove every unconsumed grant for one exact scope.
+
+    Revocation is not merely removal of an activated projection.  A capability
+    issued moments earlier remains pending and must be made unusable before a
+    later runtime activation can consume it.  ``consumed`` is intentionally
+    untouched: revocation never turns a used capability back into an unused
+    one, and does not rewrite the audit history.
+    """
+    for directory in (root / "pending", root / "active"):
+        for candidate in directory.glob("*.json"):
+            try:
+                record = load_record(candidate)
+            except (OSError, ValueError, json.JSONDecodeError, PermissionError):
+                # A malformed private record is not authority.  Leave it for a
+                # root operator to investigate rather than deleting unrelated
+                # evidence based on an untrusted parse.
+                continue
+            if record.get("kind") == kind and hmac.compare_digest(
+                str(record.get("scope") or ""), scope
+            ):
+                unlink_record(candidate)
+
+
 RESTART_COUNTS = {"attempts", "model_runs", "review_runs", "design_rounds", "code_rounds", "security_rounds", "repair_cycles"}
 RESTART_DOLLARS = {"ticket_usd", "design_usd", "implementation_usd", "code_review_usd", "security_review_usd", "progress_baseline_usd"}
 
@@ -336,7 +395,7 @@ def restart_grant(args, activate=False):
         restart_allowances(record["allowances"])
         if activate:
             atomic_json(target, record)
-            os.replace(source, root / "consumed" / f"{token}.json")
+            replace_record(source, root / "consumed" / f"{token}.json")
     print(json.dumps({key: record[key] for key in ("grant_id", "allowances", "reason", "expires_at")}))
     return 0
 
@@ -347,7 +406,7 @@ def revoke_restart(args):
     root = state_root()
     ensure_layout(root)
     with locked(root):
-        (root / "active" / (hashlib.sha256(scope.encode()).hexdigest() + ".json")).unlink(missing_ok=True)
+        revoke_scope_records(root, "restart", scope)
     return 0
 
 
@@ -409,7 +468,17 @@ def consume_recovery(args: argparse.Namespace) -> int:
             return fail("recovery capability is invalid or expired")
         if not hmac.compare_digest(str(record.get("scope") or ""), scope):
             return fail("recovery capability scope mismatch")
-        os.replace(source, root / "consumed" / f"{token}.json")
+        replace_record(source, root / "consumed" / f"{token}.json")
+    return 0
+
+
+def revoke_recovery(args: argparse.Namespace) -> int:
+    require_real_root()
+    scope = build_scope("recovery", args.repository, args.ticket, args.attempt)
+    root = state_root()
+    ensure_layout(root)
+    with locked(root):
+        revoke_scope_records(root, "recovery", scope)
     return 0
 
 
@@ -471,7 +540,7 @@ def review_repair_grant(args: argparse.Namespace, activate: bool = False) -> int
                 ):
                     record = current
             atomic_json(target, record)
-            os.replace(source, root / "consumed" / f"{token}.json")
+            replace_record(source, root / "consumed" / f"{token}.json")
     print(
         json.dumps(
             {
@@ -496,9 +565,8 @@ def revoke_review_repair(args: argparse.Namespace) -> int:
     scope = build_review_repair_scope(args.repository, args.pr)
     root = state_root()
     ensure_layout(root)
-    key = hashlib.sha256(scope.encode("utf-8")).hexdigest()
     with locked(root):
-        (root / "active" / f"{key}.json").unlink(missing_ok=True)
+        revoke_scope_records(root, "review-repair", scope)
     return 0
 
 
@@ -524,7 +592,7 @@ def activate_budget(args: argparse.Namespace) -> int:
                 record = current
         record_ceiling(record)
         atomic_json(target, record)
-        os.replace(source, root / "consumed" / f"{token}.json")
+        replace_record(source, root / "consumed" / f"{token}.json")
     print(record["ceiling_usd"])
     return 0
 
@@ -575,7 +643,7 @@ def activate_relaunch(args: argparse.Namespace) -> int:
                 record = current
         record_attempt_ceiling(record)
         atomic_json(target, record)
-        os.replace(source, root / "consumed" / f"{token}.json")
+        replace_record(source, root / "consumed" / f"{token}.json")
     print(record["ceiling_attempts"])
     return 0
 
@@ -634,7 +702,7 @@ def clear_budget_policy(args: argparse.Namespace) -> int:
     root = state_root()
     ensure_layout(root)
     with locked(root):
-        policy_path(root, scope).unlink(missing_ok=True)
+        unlink_record(policy_path(root, scope))
     return 0
 
 
@@ -687,9 +755,8 @@ def revoke_budget(args: argparse.Namespace) -> int:
     scope = build_scope("budget", args.repository, args.ticket, None)
     root = state_root()
     ensure_layout(root)
-    key = hashlib.sha256(scope.encode("utf-8")).hexdigest()
     with locked(root):
-        (root / "active" / f"{key}.json").unlink(missing_ok=True)
+        revoke_scope_records(root, "budget", scope)
     return 0
 
 
@@ -698,9 +765,8 @@ def revoke_relaunch(args: argparse.Namespace) -> int:
     scope = build_scope("relaunch", args.repository, args.ticket, None)
     root = state_root()
     ensure_layout(root)
-    key = hashlib.sha256(scope.encode("utf-8")).hexdigest()
     with locked(root):
-        (root / "active" / f"{key}.json").unlink(missing_ok=True)
+        revoke_scope_records(root, "relaunch", scope)
     return 0
 
 
@@ -735,6 +801,10 @@ def parser() -> argparse.ArgumentParser:
     recovery.add_argument("--ticket", required=True)
     recovery.add_argument("--attempt", required=True, type=int)
     recovery.add_argument("--expires-hours", type=float, default=24)
+    revoke_recovery_parser = commands.add_parser("revoke-recovery")
+    revoke_recovery_parser.add_argument("--repository", required=True)
+    revoke_recovery_parser.add_argument("--ticket", required=True)
+    revoke_recovery_parser.add_argument("--attempt", required=True, type=int)
     review_repair = commands.add_parser("issue-review-repair")
     review_repair.add_argument("--repository", required=True)
     review_repair.add_argument("--pr", required=True)
@@ -801,6 +871,8 @@ def main() -> int:
             return issue(args, "relaunch")
         if args.command == "consume-recovery":
             return consume_recovery(args)
+        if args.command == "revoke-recovery":
+            return revoke_recovery(args)
         if args.command == "activate-review-repair":
             return review_repair_grant(args, activate=True)
         if args.command == "review-repair-grant":

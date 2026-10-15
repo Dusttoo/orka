@@ -174,6 +174,13 @@ concerns.
    nonterminal state has a supported exit; production supervisor integration
    remains tracked by #129.
 
+The provider-neutral
+[external-service adapter contract](external-service-adapter-contract.md),
+Jira/GitHub compatibility map, sanitized fixtures, and credential-free
+conformance boundary are defined independently under #130. Production client
+routing and third-party adapter implementations remain later integration work;
+adapters never inherit scheduling, controller-state, budget, or merge authority.
+
 Each step must be independently releasable and keep existing Orka 1.x
 configuration working until a documented migration is available.
 
