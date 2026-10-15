@@ -436,6 +436,11 @@ supervisor runtime. Start with [CONTRIBUTING.md](CONTRIBUTING.md), search the
 [issue tracker](https://github.com/Dusttoo/orka/issues), and comment before
 starting an issue so work is not duplicated.
 
+The versioned
+[external-service adapter contract](docs/external-service-adapter-contract.md)
+defines a provider-neutral Jira/GitHub evidence and mutation boundary without
+moving scheduler, budget, controller-state, or merge authority into adapters.
+
 Issues labelled `status: ready` have an accepted implementation boundary.
 Cross-cutting state-machine, persistence, recovery-authority, spending, and
 merge-policy changes begin with an architecture proposal. The accepted Orka 2

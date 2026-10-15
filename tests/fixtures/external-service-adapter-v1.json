@@ -1,0 +1,86 @@
+{
+  "contract_id": "orka.external-service-adapter",
+  "protocol_version": 1,
+  "repository_id": "repository:fixture-1042",
+  "capability_profiles": {
+    "jira": {
+      "issues.inventory.read": 1,
+      "issues.dependencies.read": 1,
+      "issues.status.read": 1,
+      "issues.status.transition": 1,
+      "issues.comment.create": 1
+    },
+    "github": {
+      "scm.pull-request.read": 1,
+      "scm.pull-request.create": 1,
+      "scm.pull-request.update": 1,
+      "scm.ci.read": 1,
+      "scm.approval.read": 1,
+      "scm.comment.create": 1,
+      "scm.merge.request": 1,
+      "scm.merge-receipt.read": 1
+    }
+  },
+  "capability_coverage": {
+    "issues.inventory.read": {"profile": "jira", "object": {"type": "issue-collection", "id": "fixture-7"}, "query": {"project": "FIX", "sprint": "fixture-7"}, "item": {"type": "issue", "id": "FIX-1", "data": {"key": "FIX-1", "status": "Ready", "summary": "Fixture"}}},
+    "issues.dependencies.read": {"profile": "jira", "object": {"type": "issue-collection", "id": "fixture-7"}, "query": {"issue_keys": ["FIX-1"]}, "item": {"type": "dependency", "id": "FIX-1:blocks:FIX-2", "data": {"source": "FIX-1", "relationship": "blocks", "target": "FIX-2"}}},
+    "issues.status.read": {"profile": "jira", "object": {"type": "issue", "id": "FIX-1"}, "query": {"fields": ["status"]}, "data": {"key": "FIX-1", "status": "Ready", "summary": "Fixture"}},
+    "issues.status.transition": {"profile": "jira", "object": {"type": "issue", "id": "FIX-1"}, "input": {"from": "To Do", "to": "Ready"}},
+    "issues.comment.create": {"profile": "jira", "object": {"type": "issue", "id": "FIX-1"}, "input": {"body": "Sanitized fixture"}},
+    "scm.pull-request.read": {"profile": "github", "object": {"type": "pull-request", "id": "17"}, "query": {"number": 17}, "data": {"repository_id": 1042, "number": 17, "head": "1111111111111111111111111111111111111111", "base": "main", "state": "open"}},
+    "scm.pull-request.create": {"profile": "github", "object": {"type": "repository", "id": "1042"}, "input": {"title": "Fixture", "body": "Sanitized", "head": "topic", "base": "main"}},
+    "scm.pull-request.update": {"profile": "github", "object": {"type": "pull-request", "id": "17"}, "input": {"title": "Fixture"}},
+    "scm.ci.read": {"profile": "github", "object": {"type": "pull-request", "id": "17"}, "query": {"head": "1111111111111111111111111111111111111111"}, "item": {"type": "ci-check", "id": "17:unit", "data": {"name": "unit", "status": "completed", "conclusion": "success"}}},
+    "scm.approval.read": {"profile": "github", "object": {"type": "pull-request", "id": "17"}, "query": {"head": "1111111111111111111111111111111111111111"}, "item": {"type": "approval", "id": "17:reviewer", "data": {"reviewer": "maintainer", "state": "approved"}}},
+    "scm.comment.create": {"profile": "github", "object": {"type": "pull-request", "id": "17"}, "input": {"body": "Sanitized fixture"}},
+    "scm.merge.request": {"profile": "github", "object": {"type": "pull-request", "id": "17"}, "input": {"head": "1111111111111111111111111111111111111111", "method": "merge"}},
+    "scm.merge-receipt.read": {"profile": "github", "object": {"type": "merge-receipt", "id": "17"}, "query": {"number": 17}, "data": {"head": "1111111111111111111111111111111111111111", "merge_commit": "2222222222222222222222222222222222222222", "merged": true}}
+  },
+  "positive": {
+    "jira_inventory_pages": [
+      [
+        {
+          "object_identity": {"type": "issue", "id": "FIX-1"},
+          "data": {"key": "FIX-1", "status": "Ready", "summary": "Fixture parent"}
+        }
+      ],
+      [
+        {
+          "object_identity": {"type": "issue", "id": "FIX-2"},
+          "data": {"key": "FIX-2", "status": "To Do", "summary": "Fixture child"}
+        }
+      ]
+    ],
+    "jira_dependencies": [
+      {
+        "object_identity": {"type": "dependency", "id": "FIX-1:blocks:FIX-2"},
+        "data": {"source": "FIX-1", "relationship": "blocks", "target": "FIX-2"}
+      }
+    ],
+    "github_pull_request": {
+      "repository_id": 1042,
+      "number": 17,
+      "head": "1111111111111111111111111111111111111111",
+      "base": "main",
+      "state": "open"
+    },
+    "github_ci": [
+      {
+        "object_identity": {"type": "ci-check", "id": "17:checks:unit"},
+        "data": {"name": "unit", "status": "completed", "conclusion": "success"}
+      },
+      {
+        "object_identity": {"type": "ci-check", "id": "17:checks:security"},
+        "data": {"name": "security", "status": "completed", "conclusion": "success"}
+      }
+    ]
+  },
+  "negative": [
+    {"name": "vendor payload rejected", "forbidden_key": "raw_payload"},
+    {"name": "credential field rejected", "forbidden_key": "Authorization"},
+    {"name": "duplicate inventory identity rejected", "failure": "duplicate-item-identity"},
+    {"name": "incomplete pagination rejected", "failure": "invalid-final-proof"},
+    {"name": "ambiguous mutation cannot retry", "failure": "blind-retry"},
+    {"name": "mismatched repository binding rejected", "failure": "binding-mismatch"}
+  ]
+}
