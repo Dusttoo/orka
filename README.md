@@ -477,6 +477,14 @@ contains the documented reset fix; otherwise the store reports its rollback
 journal fallback. This API is not yet the production controller authority. See
 [Transactional event-store core](docs/transactional-event-store.md).
 
+The transactional runtime also exposes a stable local observability boundary.
+`sprint-supervisor.py events` returns deterministic, cursor-paged redacted
+events as JSON or JSONL, and `sprint-supervisor.py metrics` returns versioned
+queue, lane, transition, recovery, provider-hold, cost, and completion metrics.
+Observers never need database or checkpoint access, and desktop subscription
+usage is explicitly unmetered rather than reported as zero. See
+[Runtime observability](docs/runtime-observability.md).
+
 Orka 1.8.23 adds the offline, content-addressed legacy state importer and
 deterministic redacted JSON export used to prove a shadow migration before
 cutover. See [Legacy state migration](docs/legacy-state-migration.md). The
