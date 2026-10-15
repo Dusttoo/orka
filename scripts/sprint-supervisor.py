@@ -45,6 +45,12 @@ from authoritative_supervisor_state import (
     AuthoritativeSupervisorState,
     read_authoritative_state,
 )
+from runtime_observability import (
+    ObservabilityError,
+    event_page,
+    jsonl_records,
+    metrics_snapshot,
+)
 from api_agent import AgentError, load_yaml
 from breaker_runtime import BreakerRuntime
 from supervisor_planning import (
@@ -2386,6 +2392,21 @@ def resolve_decision_command(args: argparse.Namespace) -> None:
     emit(response)
 
 
+def events_command(args: argparse.Namespace) -> None:
+    repository = resolve_repository(args.repo)
+    page = event_page(repository, cursor=args.cursor, limit=args.limit)
+    if args.format == "jsonl":
+        for record in jsonl_records(page):
+            emit(record)
+        return
+    emit(page)
+
+
+def metrics_command(args: argparse.Namespace) -> None:
+    repository = resolve_repository(args.repo)
+    emit(metrics_snapshot(repository))
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     commands = result.add_subparsers(dest="command", required=True)
@@ -2400,6 +2421,21 @@ def parser() -> argparse.ArgumentParser:
     )
     status_parser.add_argument("--repo")
     status_parser.set_defaults(func=status)
+
+    events_parser = commands.add_parser(
+        "events", help="read a redacted page from the authoritative event stream"
+    )
+    events_parser.add_argument("--repo")
+    events_parser.add_argument("--cursor")
+    events_parser.add_argument("--limit", type=int, default=100)
+    events_parser.add_argument("--format", choices=("json", "jsonl"), default="json")
+    events_parser.set_defaults(func=events_command)
+
+    metrics_parser = commands.add_parser(
+        "metrics", help="read redacted metrics from authoritative runtime state"
+    )
+    metrics_parser.add_argument("--repo")
+    metrics_parser.set_defaults(func=metrics_command)
 
     diagnose_parser = commands.add_parser(
         "diagnose", help="run the read-only startup admission diagnostic"
@@ -2446,7 +2482,7 @@ def main() -> int:
     try:
         args.func(args)
         return 0
-    except SupervisorError as exc:
+    except (SupervisorError, ObservabilityError) as exc:
         print(f"sprint-supervisor: {exc}", file=sys.stderr)
         return 2
 

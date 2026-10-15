@@ -166,6 +166,17 @@ class NoDualWriterCutoverTests(unittest.TestCase):
         resumed = self.value("resume", "--request-id", "cutover-resume")
         self.assertEqual(resumed["lifecycle_state"], "active")
 
+        event_page = self.value("events", "--limit", "2")
+        self.assertEqual(event_page["schema"], "orka.runtime-event-page/v1")
+        self.assertLessEqual(len(event_page["events"]), 2)
+        self.assertNotIn(str(self.repo), json.dumps(event_page, sort_keys=True))
+        metrics = self.value("metrics")
+        self.assertEqual(metrics["schema"], "orka.runtime-metrics/v1")
+        self.assertEqual(
+            metrics["cost"]["desktop_subscription"]["measurement"],
+            "unmetered",
+        )
+
         pid = int(resumed["process"]["pid"])
         os.kill(pid, signal.SIGKILL)
         deadline = time.monotonic() + 5

@@ -1,0 +1,93 @@
+{
+  "contract": "orka.runtime-observability",
+  "version": 1,
+  "authority": {
+    "source": "authoritative transactional event store",
+    "access": "read-only SQLite snapshot",
+    "mutations": false,
+    "direct_consumer_database_access": false
+  },
+  "events": {
+    "schema": "orka.runtime-event/v1",
+    "ordering": "ascending immutable event sequence",
+    "identity": "event_id",
+    "repository_binding": "sha256 digest of the repository UUID",
+    "subject_binding": "sha256 digest of repository UUID, aggregate class, and aggregate identifier",
+    "payload_policy": "deny all source payload fields; expose only the envelope allowlist",
+    "envelope": [
+      "schema",
+      "sequence",
+      "event_id",
+      "repository_binding",
+      "occurred_at",
+      "transition.class",
+      "transition.name",
+      "transition.version",
+      "subject"
+    ]
+  },
+  "cursor": {
+    "schema": "orka.runtime-event-cursor/v1",
+    "position": "next event sequence",
+    "binding": "repository binding and event schema",
+    "integrity": "canonical payload SHA-256 checksum",
+    "retention": "event-store lifetime in version 1",
+    "expiry": "a cursor before the earliest retained sequence is rejected"
+  },
+  "metrics": {
+    "schema": "orka.runtime-metrics/v1",
+    "work_categories": [
+      "running",
+      "queued",
+      "waiting",
+      "parked",
+      "blocked",
+      "recovered",
+      "completed"
+    ],
+    "work_semantics": {
+      "running": "current reserved, launch-uncertain, or running jobs",
+      "queued": "current new, repair-ready, recovery-ready, or decomposition-ready jobs",
+      "waiting": "current retry-wait jobs",
+      "parked": "current operator-decision jobs",
+      "blocked": "current internal or external blocked jobs",
+      "recovered": "cumulative recovery-ready transitions followed by a later reservation of the same job",
+      "completed": "current completed, decomposed, or cancelled jobs"
+    },
+    "stable_groups": [
+      "work",
+      "lanes",
+      "transitions",
+      "retries",
+      "recovery",
+      "provider_holds",
+      "cost",
+      "completion"
+    ],
+    "desktop_subscription_usage": "unmetered"
+  },
+  "redaction": {
+    "forbidden": [
+      "event payloads",
+      "aggregate identifiers",
+      "idempotency keys",
+      "repository paths",
+      "ticket identifiers",
+      "prompts",
+      "credentials",
+      "source content",
+      "external response bodies",
+      "private provider payloads"
+    ],
+    "rule": "unknown fields are omitted, never passed through"
+  },
+  "observer_isolation": {
+    "database_transaction": "bounded read snapshot copied before output",
+    "output": "performed only after transaction and connection close",
+    "writer_blocking": "observers never acquire writer authority or hold a transaction while writing output"
+  },
+  "compatibility": {
+    "changes": "additive fields within a version or a new versioned schema",
+    "unknown_event_types": "preserved as transition names without payload exposure"
+  }
+}
