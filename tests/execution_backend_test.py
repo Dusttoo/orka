@@ -244,7 +244,7 @@ class ExecutionBackendContractTests(unittest.TestCase):
             launch["process_identity"],
         )
 
-    def test_cancel_requires_authenticated_acknowledgement_or_supervisor_fence(self) -> None:
+    def test_cancel_requires_authenticated_acknowledgement_and_mechanical_absence(self) -> None:
         coordinator, backend = self.coordinator(cancel_mode="unknown")
         coordinator.launch(self.binding, self.envelope)
         uncertain = coordinator.cancel(self.binding, reason="operator drain")
@@ -253,7 +253,7 @@ class ExecutionBackendContractTests(unittest.TestCase):
 
         fenced = coordinator.fence(self.binding, reason="cancel acknowledgement absent")
         self.assertEqual(fenced["status"], "fenced")
-        self.assertTrue(fenced["replacement_safe"])
+        self.assertFalse(fenced["replacement_safe"])
 
         second_binding = {
             **self.binding,
@@ -261,11 +261,30 @@ class ExecutionBackendContractTests(unittest.TestCase):
             "execution_unit_id": "execution-2",
         }
         backend.cancel_mode = "acknowledged"
-        coordinator.launch(second_binding, {**self.envelope, **second_binding})
+        second_launch = coordinator.launch(
+            second_binding, {**self.envelope, **second_binding}
+        )
         acknowledged = coordinator.cancel(second_binding, reason="operator drain")
         self.assertEqual(acknowledged["status"], "acknowledged")
-        self.assertTrue(acknowledged["replacement_safe"])
+        self.assertFalse(acknowledged["replacement_safe"])
         self.assertIn("cancellation_receipt", acknowledged)
+
+        backend.reuse_process(second_launch["backend_handle"])
+        absent_coordinator, absent_backend = self.coordinator(
+            cancel_mode="acknowledged"
+        )
+        absent_binding = {
+            **self.binding,
+            "dispatch_id": "dispatch-3",
+            "execution_unit_id": "execution-3",
+        }
+        absent_launch = absent_coordinator.launch(
+            absent_binding, {**self.envelope, **absent_binding}
+        )
+        absent_backend.reuse_process(absent_launch["backend_handle"])
+        stopped = absent_coordinator.cancel(absent_binding, reason="operator drain")
+        self.assertTrue(stopped["replacement_safe"])
+        self.assertEqual(stopped["mechanical_observation"]["status"], "absent")
 
     def test_false_or_mismatched_cancellation_acknowledgement_is_rejected(self) -> None:
         for mode in ("mismatched", "false-verification"):
@@ -279,6 +298,39 @@ class ExecutionBackendContractTests(unittest.TestCase):
                 self.assertEqual(
                     coordinator.inspect(self.binding)["status"], "live"
                 )
+
+    def test_stale_acknowledgement_cannot_cancel_a_newer_launch(self) -> None:
+        class StaleAckBackend(DeterministicFakeBackend):
+            stale: dict | None = None
+
+            def cancel(self, binding, launch, request):
+                if self.stale is not None:
+                    return copy.deepcopy(self.stale)
+                result = super().cancel(binding, launch, request)
+                self.stale = copy.deepcopy(result)
+                return result
+
+        backend = StaleAckBackend(cancel_mode="acknowledged")
+        coordinator = BackendCoordinator(
+            self.contract, backend, allow_test_backend=True
+        )
+        coordinator.negotiate()
+        first = coordinator.launch(self.binding, self.envelope)
+        backend.reuse_process(first["backend_handle"])
+        self.assertTrue(
+            coordinator.cancel(self.binding, reason="operator drain")[
+                "replacement_safe"
+            ]
+        )
+        newer = {
+            **self.binding,
+            "dispatch_id": "dispatch-newer",
+            "execution_unit_id": "execution-newer",
+        }
+        coordinator.launch(newer, {**self.envelope, **newer})
+
+        with self.assertRaisesRegex(BackendContractError, "stale binding"):
+            coordinator.cancel(newer, reason="operator drain")
 
     def test_backend_cannot_assert_a_supervisor_fence(self) -> None:
         coordinator, _backend = self.coordinator(cancel_mode="fenced")
@@ -302,7 +354,22 @@ class ExecutionBackendContractTests(unittest.TestCase):
         backend.inspect_status = "terminal"
         observed = coordinator.inspect(self.binding)
         self.assertEqual(observed["status"], "terminal")
-        self.assertTrue(observed["replacement_safe"])
+        self.assertFalse(observed["replacement_safe"])
+
+    def test_terminal_receipt_does_not_hide_a_live_exact_process(self) -> None:
+        coordinator, backend = self.coordinator(inspect_status="live")
+        launch = coordinator.launch(self.binding, self.envelope)
+        coordinator.terminal(self.binding)
+
+        live = coordinator.inspect(self.binding)
+
+        self.assertEqual(live["status"], "live")
+        self.assertFalse(live["replacement_safe"])
+        self.assertEqual(backend.inspect_count, 1)
+        backend.reuse_process(launch["backend_handle"])
+        absent = coordinator.inspect(self.binding)
+        self.assertEqual(absent["status"], "absent")
+        self.assertTrue(absent["replacement_safe"])
 
     def test_terminal_inspection_without_valid_evidence_fails_closed(self) -> None:
         coordinator, backend = self.coordinator(inspect_status="terminal")
@@ -406,7 +473,7 @@ class ExecutionBackendContractTests(unittest.TestCase):
         with self.assertRaisesRegex(BackendContractError, "already consumed"):
             replacement.launch(self.binding, self.envelope)
 
-    def test_transactional_cancellation_acknowledgement_is_fenced(self) -> None:
+    def test_transactional_cancellation_acknowledgement_waits_for_absence(self) -> None:
         temporary, store, state = self.transactional_state()
         self.addCleanup(temporary.cleanup)
         self.addCleanup(store.close)
@@ -415,19 +482,23 @@ class ExecutionBackendContractTests(unittest.TestCase):
             self.contract, backend, allow_test_backend=True, state_store=state
         )
         coordinator.negotiate()
-        coordinator.launch(self.binding, self.envelope)
+        launch = coordinator.launch(self.binding, self.envelope)
         coordinator.attach(self.binding)
         result = coordinator.cancel(self.binding, reason="operator drain")
-        self.assertTrue(result["replacement_safe"])
-        self.assertEqual(result["supervisor_fence"]["status"], "fenced")
+        self.assertFalse(result["replacement_safe"])
         record = store.execution_record(self.binding)
-        self.assertEqual(record["state"], "fenced")
+        self.assertEqual(record["state"], "cancelling")
         self.assertEqual(
             record["cancellation_receipt"]["status"], "acknowledged"
         )
-        self.assertEqual(record["fence_receipt"]["status"], "fenced")
-        with self.assertRaisesRegex(BackendContractError, "stale or fenced"):
-            coordinator.progress(self.binding)
+        self.assertIsNone(record["fence_receipt"])
+
+        backend.reuse_process(launch["backend_handle"])
+        second = coordinator.cancel(self.binding, reason="operator drain")
+        self.assertTrue(second["replacement_safe"])
+        self.assertEqual(second["supervisor_fence"]["status"], "fenced")
+        self.assertFalse(second["supervisor_fence"]["replacement_safe"])
+        self.assertEqual(store.execution_record(self.binding)["state"], "fenced")
 
     def test_transactional_activity_does_not_clear_pending_cancellation(self) -> None:
         temporary, store, state = self.transactional_state()

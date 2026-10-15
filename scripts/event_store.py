@@ -967,7 +967,7 @@ class TransactionalEventStore:
             "attach": {"attached"},
             "heartbeat": {"attached", "cancelling"},
             "progress": {"attached", "cancelling"},
-            "inspect": {"attached", "cancelling"},
+            "inspect": {"attached", "cancelling", "terminal"},
             "cancel": {"cancelling"},
             "terminal": {"terminal"},
             "fence": {"fenced"},
@@ -999,7 +999,7 @@ class TransactionalEventStore:
             "attach": {"launched", "attached"},
             "heartbeat": {"launched", "attached", "cancelling"},
             "progress": {"launched", "attached", "cancelling"},
-            "inspect": {"launched", "attached", "cancelling"},
+            "inspect": {"launched", "attached", "cancelling", "terminal"},
             "cancel": {"launched", "attached", "cancelling"},
             "terminal": {"launched", "attached", "cancelling"},
             "fence": {"launched", "attached", "cancelling"},
@@ -1873,11 +1873,13 @@ class TransactionalEventStore:
                 ]
                 document_rows = self._database.execute(
                     """
-                    SELECT document_type, document_id, generation, payload_json,
-                           payload_digest, supervisor_fence,
-                           last_event_sequence, updated_at
-                    FROM runtime_documents WHERE repository_id = ?
-                    ORDER BY document_type, document_id
+                    SELECT d.document_type, d.document_id, d.generation,
+                           d.payload_json, d.payload_digest, d.supervisor_fence,
+                           d.last_event_sequence, d.updated_at, e.event_id
+                    FROM runtime_documents AS d
+                    LEFT JOIN events AS e ON e.sequence = d.last_event_sequence
+                    WHERE d.repository_id = ?
+                    ORDER BY d.document_type, d.document_id
                     """,
                     (repository_id,),
                 ).fetchall()
@@ -1893,6 +1895,7 @@ class TransactionalEventStore:
                             "supervisor_fence": row[5],
                             "last_event_sequence": row[6],
                             "updated_at": row[7],
+                            "last_event_id": row[8],
                         }
                         for row in document_rows
                     ],
@@ -1902,6 +1905,36 @@ class TransactionalEventStore:
             except BaseException:
                 self._database.rollback()
                 raise
+
+    def runtime_document_event(
+        self,
+        *,
+        repository_id: str,
+        document_type: str,
+        document_id: str,
+        generation: int,
+    ) -> dict[str, Any] | None:
+        """Return immutable event identity for one committed document generation."""
+
+        aggregate_id = f"{document_type}:{document_id}"
+        with self._write_lock:
+            row = self._database.execute(
+                """
+                SELECT sequence, event_id, payload_json
+                FROM events
+                WHERE repository_id = ? AND aggregate_type = 'runtime_document'
+                  AND aggregate_id = ? AND aggregate_version = ?
+                  AND event_type = 'runtime_document_written'
+                """,
+                (repository_id, aggregate_id, generation),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "sequence": int(row[0]),
+            "event_id": str(row[1]),
+            "payload": json.loads(str(row[2])),
+        }
 
     def import_legacy_snapshot(
         self,

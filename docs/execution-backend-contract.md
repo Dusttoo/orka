@@ -56,9 +56,11 @@ Claude, API, PID, shell, container, or remote-process behavior.
    uncertain launch and its execution identity cannot be reused.
 5. **Heartbeat and progress.** Observations retain the full binding. They prove
    neither completion nor authority to extend budgets or bypass gates.
-6. **Cancel.** Replacement is safe only after an authenticated acknowledgement
-   or a supervisor-owned fence. A request, timeout, or unknown result is not an
-   acknowledgement.
+6. **Cancel.** An authenticated acknowledgement proves that the exact request
+   reached the exact execution, but does not prove the execution stopped.
+   Replacement is safe only after a subsequent authenticated mechanical absence
+   observation. A request, timeout, acknowledgement alone, or logical
+   supervisor fence remains replacement-unsafe.
 7. **Inspect.** The backend reports `live`, `absent`, `terminal`, or `unknown`.
    Timeout and permission failure normalize to `unknown` and remain unsafe for
    replacement.
@@ -136,22 +138,43 @@ process and does not authorize the backend to launch another worker.
 
 ## Cancellation
 
-There are two replacement-safe cancellation outcomes:
+Cancellation has two separate receipts, neither of which alone proves absence:
 
 - `acknowledged`: the exact execution returns a cancellation identifier and an
   authenticated cancellation receipt. The acknowledgement must be a canonical
   phase-worker envelope bound to the exact cancellation request, launch
   receipt, backend handle, process identity, and execution identity. The
   backend adapter must mechanically verify it using its trusted host primitive
-  (for example, an exact process wait receipt or a verified remote signature);
-- **supervisor fence**: separately, the supervisor may record a new fence that
-  makes all later evidence from the old execution stale. A backend cannot
-  claim or return this outcome itself.
+  (for example, an exact process signal/wait receipt or a verified remote
+  acknowledgement); and
+- **supervisor fence**: separately, the supervisor may record a logical fence
+  that makes later evidence from the old execution stale. A backend cannot
+  claim or return this outcome itself, and the fence does not kill or prove the
+  absence of a process, process group/cgroup, gateway request, or provider job.
+
+Only a later `absent` inspection with the exact bound mechanical absence receipt
+makes cancellation replacement-safe. A terminal result is outcome authority,
+not death authority: a valid terminal receipt while the exact execution remains
+live still blocks replacement.
 
 `requested`, `timeout`, `unknown`, and a backend-asserted `fenced` result remain
 unsafe. The scheduler may wait,
-inspect again, or fence according to its own policy, but the backend cannot
-convert uncertainty into acknowledgement.
+inspect again, or record a logical fence according to its own policy, but it
+cannot convert uncertainty, acknowledgement, or fencing into mechanical absence.
+
+## Authentication and migration trust boundary
+
+Here, **authenticated** means integrity-bound inside Orka's exclusive
+event-store sole-writer and private-local-filesystem trust boundary. Adjacent
+release migration receipts bind the cutover activation, exact committed source
+document generation, payload digest and immutable event identity, plus the
+single CAS-committed target generation. Each imported job receipt repeats that
+binding and its pre-migration job digest. A structurally valid receipt supplied
+outside that event-store history is not authority.
+
+This design does not claim resistance to an actor who can rewrite the SQLite
+database and recompute all unkeyed digests. Keyed or isolated authority against
+that stronger attacker is future work and is outside this contract.
 
 ## Current compatibility map
 

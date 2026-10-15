@@ -69,9 +69,9 @@ class TransactionalBackendState:
             if (
                 operation in {"heartbeat", "progress", "inspect"}
                 and isinstance(current, dict)
-                and current.get("state") == "cancelling"
+                and current.get("state") in {"cancelling", "terminal"}
             ):
-                target_state = "cancelling"
+                target_state = str(current["state"])
             self.store.record_execution_receipt(
                 binding=binding,
                 operation=operation,
@@ -414,7 +414,12 @@ class BackendCoordinator:
                 raise BackendContractError(
                     "execution backend identity changed after launch"
                 )
-            launch_receipt = persisted.get("launch_receipt")
+            persisted_launch = persisted.get("launch_receipt")
+            if launch_receipt is not None and launch_receipt != persisted_launch:
+                raise BackendContractError(
+                    "execution launch evidence differs from durable authority"
+                )
+            launch_receipt = persisted_launch
             if persisted.get("state") == "terminal":
                 persisted_terminal = persisted.get("terminal_receipt")
                 if not isinstance(persisted_terminal, dict):
@@ -504,6 +509,24 @@ class BackendCoordinator:
         self._terminal.add(self._execution_key(binding))
         return copy.deepcopy(result)
 
+    def persisted_terminal(
+        self, binding_value: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Return only already-durable terminal authority; never query a backend."""
+
+        binding = self._binding(binding_value)
+        key = self._execution_key(binding)
+        record = self._active.get(key)
+        if record is None or key not in self._terminal:
+            return None
+        persisted = record.get("persisted_terminal")
+        if not isinstance(persisted, dict):
+            raise BackendContractError(
+                "terminal execution is missing its persisted receipt"
+            )
+        self._validate_terminal_evidence(persisted, record)
+        return copy.deepcopy(persisted)
+
     def _validate_terminal_evidence(
         self, result: dict[str, Any], record: dict[str, Any]
     ) -> None:
@@ -527,14 +550,6 @@ class BackendCoordinator:
 
     def inspect(self, binding_value: dict[str, Any]) -> dict[str, Any]:
         binding, record = self._record(binding_value, allow_terminal=True)
-        persisted_terminal = record.get("persisted_terminal")
-        if isinstance(persisted_terminal, dict):
-            # Terminal evidence is immutable authority. A restart must replay
-            # it directly rather than asking the process adapter to observe a
-            # state that can no longer transition back to attached.
-            result = copy.deepcopy(persisted_terminal)
-            result["replacement_safe"] = True
-            return result
         result = self._validate_receipt(
             self.backend.inspect(binding, record["launch"]), binding, "inspection"
         )
@@ -589,11 +604,17 @@ class BackendCoordinator:
         elif status == "unknown":
             result.pop("absence_receipt", None)
             result["replacement_safe"] = False
-        if self.state_store is not None:
+        if self.state_store is not None and not isinstance(
+            record.get("persisted_terminal"), dict
+        ):
             self.state_store.record(binding, "inspect", result, "attached")
         return copy.deepcopy(result)
 
     def cancel(self, binding_value: dict[str, Any], *, reason: str) -> dict[str, Any]:
+        if "cancel" not in (self.offer.get("lifecycle") or []):
+            raise BackendContractError(
+                "execution backend does not advertise mechanical cancellation"
+            )
         if not isinstance(reason, str) or not reason.strip():
             raise BackendContractError("cancellation reason is required")
         binding, record = self._record(binding_value)
@@ -663,14 +684,24 @@ class BackendCoordinator:
                 )
             if self.state_store is not None:
                 self.state_store.record(binding, "cancel", result, "cancelling")
-            result["supervisor_fence"] = self.fence(
-                binding, reason="backend acknowledged cancellation"
-            )
+            observation = self.inspect(binding)
+            result["mechanical_observation"] = observation
+            if observation.get("status") == "absent" and observation.get(
+                "replacement_safe"
+            ) is True:
+                result["supervisor_fence"] = self.fence(
+                    binding, reason="backend cancellation followed by verified absence"
+                )
         elif status not in self.contract["cancellation"]["unsafe_results"]:
             raise BackendContractError(
                 "backend cancellation returned an unsupported status"
             )
-        result["replacement_safe"] = status == "acknowledged"
+        result["replacement_safe"] = bool(
+            status == "acknowledged"
+            and (result.get("mechanical_observation") or {}).get("status") == "absent"
+            and (result.get("mechanical_observation") or {}).get("replacement_safe")
+            is True
+        )
         if self.state_store is not None and status != "acknowledged":
             self.state_store.record(binding, "cancel", result, "cancelling")
         return copy.deepcopy(result)
@@ -687,7 +718,7 @@ class BackendCoordinator:
         self._fenced.add(key)
         receipt = {
             "status": "fenced",
-            "replacement_safe": True,
+            "replacement_safe": False,
             "binding": copy.deepcopy(binding),
             "fence_receipt": _digest(
                 {

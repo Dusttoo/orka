@@ -587,7 +587,20 @@ class BreakerStateMigrationTests(unittest.TestCase):
             }
         }
 
-        migrated, changed = self.migrate(schema_two)
+        migrated, changed = migrate_supervisor_state(
+            schema_two,
+            target_runtime_fingerprint="new-runtime",
+            target_contract_digest="new-contract",
+            authoritative_source={
+                "trust_boundary": "exclusive-event-store-writer/private-local-filesystem",
+                "activation_id": "activation-1",
+                "source_generation": 4,
+                "source_payload_digest": "a" * 64,
+                "source_event_sequence": 14,
+                "source_event_id": "b" * 64,
+                "target_generation": 5,
+            },
+        )
 
         self.assertTrue(changed)
         provenance = migrated["dispatch"]["jobs"]["run-old"][
@@ -595,8 +608,49 @@ class BreakerStateMigrationTests(unittest.TestCase):
         ]
         self.assertEqual(provenance["source_schema_version"], 2)
         self.assertEqual(
-            migrated["execution_backend_migration"]["imported_runs"], ["run-old"]
+            list(migrated["execution_backend_migration"]["imported_jobs"]),
+            ["run-old"],
         )
+
+    def test_locked_migration_rejects_a_concurrent_generation(self) -> None:
+        class ChangedAuthority:
+            def __init__(self) -> None:
+                self.persisted: list[dict] = []
+
+            def load_with_authority(self) -> tuple[dict, dict]:
+                return {"schema_version": 2, "generation": "newer"}, {
+                    "source_generation": 2,
+                    "target_generation": 3,
+                }
+
+            def persist(self, value: dict) -> None:
+                self.persisted.append(value)
+
+        authority = ChangedAuthority()
+        with self.assertRaisesRegex(
+            sprint_supervisor.SupervisorError, "generation changed"
+        ):
+            sprint_supervisor.migrate_locked_authoritative_generation(
+                authority,
+                {"schema_version": 2, "generation": "older"},
+                target_runtime_fingerprint="new-runtime",
+                target_contract_digest="new-contract",
+            )
+        self.assertEqual(authority.persisted, [])
+
+    def test_runtime_fingerprint_binds_execution_backend_migration_sql(self) -> None:
+        baseline = sprint_supervisor.runtime_fingerprint()
+        target = (ROOT / "contracts/event-store-v4-execution-backends.sql").resolve()
+        original = Path.read_bytes
+
+        def changed(path: Path) -> bytes:
+            value = original(path)
+            return value + b"\n-- fingerprint probe" if path.resolve() == target else value
+
+        with patch.object(Path, "read_bytes", changed):
+            observed = sprint_supervisor.runtime_fingerprint()
+
+        self.assertNotEqual(observed, baseline)
 
     def test_unknown_or_ambiguous_legacy_stop_fails_closed(self) -> None:
         unknown = self.legacy()

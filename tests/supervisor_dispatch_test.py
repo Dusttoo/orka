@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import copy
+import hashlib
 import os
 import shutil
 import tempfile
@@ -22,7 +23,7 @@ from supervisor_dispatch import (  # noqa: E402
     SupervisorDispatcher,
     TerminalAuthorityError,
 )
-from supervisor_planning import canonical_digest  # noqa: E402
+from supervisor_state import migrate_supervisor_state  # noqa: E402
 from event_store import RepositoryBinding, TransactionalEventStore  # noqa: E402
 
 
@@ -34,6 +35,9 @@ class FakeAdapter:
         self.finished: list[dict] = []
         self.requeued: list[dict] = []
         self.identity_pid = 99999999
+        self.verifiers_available = True
+        self.completion_verifications = 0
+        self.work_identity_verifications = 0
 
     def phase_capability_offer(self, contract: dict) -> dict:
         profile = (
@@ -97,6 +101,9 @@ class FakeAdapter:
         return {"ticket": job["ticket"], "state": "pending"}
 
     def verify_completion(self, result: dict) -> dict:
+        self.completion_verifications += 1
+        if not self.verifiers_available:
+            raise DispatchError("GitHub verifier unavailable")
         return {
             "url": result["pr"],
             "merged_at": "2026-09-30T00:00:00Z",
@@ -106,6 +113,9 @@ class FakeAdapter:
         }
 
     def verify_work_identity(self, result: dict) -> dict | None:
+        self.work_identity_verifications += 1
+        if not self.verifiers_available:
+            raise DispatchError("worktree verifier unavailable")
         if not result.get("worktree"):
             return None
         return {
@@ -121,6 +131,20 @@ class SelectiveFailureAdapter(FakeAdapter):
         if ticket == "PNP-1":
             raise DispatchError("ticket-local reservation rejection")
         return super().reserve(sprint, ticket, run_ref)
+
+
+class TransientFinishAdapter(FakeAdapter):
+    def __init__(self, root: Path) -> None:
+        super().__init__(root)
+        self.fail_finish_once = True
+
+    def finish(self, sprint, ticket, result, *, outcome=None, summary=None):
+        if self.fail_finish_once:
+            self.fail_finish_once = False
+            raise DispatchError("transient controller apply failure")
+        return super().finish(
+            sprint, ticket, result, outcome=outcome, summary=summary
+        )
 
 
 class UnsupportedBackendAdapter(FakeAdapter):
@@ -333,25 +357,28 @@ class DispatchTests(unittest.TestCase):
     ) -> None:
         job = self.dispatcher.launch("99", "PNP-1", phase="implement")
         job.pop("execution_backend")
-        source_digest = canonical_digest(
+        migrated, changed = migrate_supervisor_state(
             {
-                field: job.get(field)
-                for field in (
-                    "ticket",
-                    "sprint",
-                    "run_ref",
-                    "attempt_token",
-                    "phase_execution",
-                    "execution_identity",
-                )
-            }
+                "schema_version": 2,
+                "runtime_fingerprint": "orka-1.8.33",
+                "contract_digest": "contract-1.8.33",
+                "planning": {},
+                "dispatch": {"jobs": {job["run_ref"]: job}},
+            },
+            target_runtime_fingerprint="orka-1.8.34",
+            target_contract_digest="contract-1.8.34",
+            authoritative_source={
+                "trust_boundary": "exclusive-event-store-writer/private-local-filesystem",
+                "activation_id": "activation-dispatch",
+                "source_generation": 7,
+                "source_payload_digest": "a" * 64,
+                "source_event_sequence": 21,
+                "source_event_id": "b" * 64,
+                "target_generation": 8,
+            },
         )
-        job["legacy_execution_backend_provenance"] = {
-            "schema_version": 1,
-            "migration_id": f"execution-backend-v1:{source_digest}",
-            "source_schema_version": 2,
-            "source_job_digest": source_digest,
-        }
+        self.assertTrue(changed)
+        job = migrated["dispatch"]["jobs"][job["run_ref"]]
         self.write_result(job, self.envelope(job))
 
         restarted = SupervisorDispatcher(
@@ -359,6 +386,9 @@ class DispatchTests(unittest.TestCase):
             self.runtime,
             ROOT / "contracts/supervisor-lifecycle-v1.json",
             self.adapter,
+        )
+        restarted.bind_execution_backend_migration(
+            migrated["execution_backend_migration"], authenticated=True
         )
         first = restarted.apply_terminal(job)
         second = restarted.apply_terminal(job)
@@ -376,6 +406,12 @@ class DispatchTests(unittest.TestCase):
     def test_missing_backend_without_migration_provenance_fails_closed(self) -> None:
         job = self.dispatcher.launch("99", "PNP-1", phase="implement")
         job.pop("execution_backend")
+        job["legacy_execution_backend_provenance"] = {
+            "schema_version": 1,
+            "migration_id": "execution-backend-v1:fabricated",
+            "source_schema_version": 2,
+            "source_job_digest": "fabricated",
+        }
         self.write_result(job, self.envelope(job))
 
         with self.assertRaisesRegex(DispatchError, "binding"):
@@ -383,6 +419,43 @@ class DispatchTests(unittest.TestCase):
 
         self.assertEqual(self.adapter.finished, [])
         self.assertEqual(job["terminal"], {})
+
+    def test_internally_consistent_migration_receipt_is_not_self_authenticating(
+        self,
+    ) -> None:
+        job = self.dispatcher.launch("99", "PNP-1", phase="implement")
+        job.pop("execution_backend")
+        state, _changed = migrate_supervisor_state(
+            {
+                "schema_version": 2,
+                "runtime_fingerprint": "runtime-old",
+                "contract_digest": "contract-old",
+                "planning": {},
+                "dispatch": {"jobs": {job["run_ref"]: job}},
+            },
+            target_runtime_fingerprint="runtime-new",
+            target_contract_digest="contract-new",
+            authoritative_source={
+                "trust_boundary": "exclusive-event-store-writer/private-local-filesystem",
+                "activation_id": "fabricated-activation",
+                "source_generation": 9,
+                "source_payload_digest": "a" * 64,
+                "source_event_sequence": 99,
+                "source_event_id": "b" * 64,
+                "target_generation": 10,
+            },
+        )
+        migrated_job = state["dispatch"]["jobs"][job["run_ref"]]
+        self.write_result(migrated_job, self.envelope(migrated_job))
+        self.dispatcher.bind_execution_backend_migration(
+            state["execution_backend_migration"]
+        )
+
+        with self.assertRaisesRegex(DispatchError, "binding"):
+            self.dispatcher.apply_terminal(migrated_job)
+
+        self.assertEqual(self.adapter.finished, [])
+        self.assertEqual(migrated_job["terminal"], {})
 
     def test_persisted_backend_terminal_replays_after_controller_finish_crash(
         self,
@@ -427,11 +500,18 @@ class DispatchTests(unittest.TestCase):
             self.adapter.verify_work_identity(verified)
         )
         verified["evidence"]["merge_receipt"] = self.adapter.verify_completion(verified)
-        backend.bind_terminal_result(verified)
+        backend.bind_terminal_result(
+            verified,
+            source_result_digest=hashlib.sha256(
+                Path(job["paths"]["result"]).read_bytes()
+            ).hexdigest(),
+        )
         persisted_terminal = coordinator.terminal(binding)
         self.assertEqual(persisted_terminal["status"], "terminal")
         self.assertEqual(store.execution_record(binding_value)["state"], "terminal")
         self.assertEqual(self.adapter.finished, [])
+        Path(job["paths"]["result"]).unlink()
+        self.adapter.verifiers_available = False
 
         restarted = SupervisorDispatcher(
             self.repo,
@@ -449,6 +529,142 @@ class DispatchTests(unittest.TestCase):
         self.assertTrue(duplicate["duplicate"])
         self.assertEqual(len(self.adapter.finished), 1)
         self.assertEqual(store.execution_record(binding_value)["state"], "terminal")
+
+    def test_persisted_terminal_retries_transient_controller_apply_exactly_once(
+        self,
+    ) -> None:
+        repository_id = "repository:terminal-controller-retry"
+        store = TransactionalEventStore(
+            self.temp / "orka-controller-retry.sqlite3",
+            writer_identity="supervisor:test",
+        )
+        self.addCleanup(store.close)
+        store.bind_repository(
+            RepositoryBinding(
+                repository_id=repository_id,
+                common_directory=str(self.repo / ".git"),
+                object_directory_id="objects",
+                policy_ref="refs/heads/main",
+                policy_path="orchestration.yml",
+                policy_commit="a" * 40,
+                policy_blob="b" * 40,
+                policy_digest="policy",
+                created_at="2026-10-02T00:00:00Z",
+            ),
+            writer_identity="supervisor:test",
+        )
+        adapter = TransientFinishAdapter(self.temp)
+        dispatcher = SupervisorDispatcher(
+            self.repo,
+            self.runtime,
+            ROOT / "contracts/supervisor-lifecycle-v1.json",
+            adapter,
+            event_store=store,
+            writer_identity="supervisor:test",
+            repository_id=repository_id,
+        )
+        job = dispatcher.launch("99", "PNP-1", phase="implement")
+        original = self.envelope(job)
+        self.write_result(job, original)
+
+        with self.assertRaisesRegex(DispatchError, "transient controller apply"):
+            dispatcher.apply_terminal(job)
+
+        durable = copy.deepcopy(
+            store.execution_record(job["execution_backend"]["binding"])[
+                "terminal_receipt"
+            ]
+        )
+        self.assertEqual(job["phase_execution"]["status"], "running")
+        self.assertEqual(job["terminal"], {})
+        self.assertEqual(adapter.finished, [])
+        self.assertEqual(adapter.completion_verifications, 1)
+        self.assertEqual(adapter.work_identity_verifications, 1)
+        Path(job["paths"]["result"]).unlink()
+        adapter.verifiers_available = False
+
+        applied = dispatcher.apply_terminal(job)
+        duplicate = dispatcher.apply_terminal(job)
+
+        self.assertTrue(applied["applied"])
+        self.assertTrue(duplicate["duplicate"])
+        self.assertEqual(len(adapter.finished), 1)
+        self.assertEqual(adapter.completion_verifications, 1)
+        self.assertEqual(adapter.work_identity_verifications, 1)
+        self.assertEqual(
+            store.execution_record(job["execution_backend"]["binding"])[
+                "terminal_receipt"
+            ],
+            durable,
+        )
+
+    def test_terminal_replay_rejects_mutated_launch_metadata_after_crash(self) -> None:
+        repository_id = "repository:terminal-metadata-crash"
+        store = TransactionalEventStore(
+            self.temp / "orka-terminal-metadata.sqlite3",
+            writer_identity="supervisor:test",
+        )
+        self.addCleanup(store.close)
+        store.bind_repository(
+            RepositoryBinding(
+                repository_id=repository_id,
+                common_directory=str(self.repo / ".git"),
+                object_directory_id="objects",
+                policy_ref="refs/heads/main",
+                policy_path="orchestration.yml",
+                policy_commit="a" * 40,
+                policy_blob="b" * 40,
+                policy_digest="policy",
+                created_at="2026-10-02T00:00:00Z",
+            ),
+            writer_identity="supervisor:test",
+        )
+        dispatcher = SupervisorDispatcher(
+            self.repo,
+            self.runtime,
+            ROOT / "contracts/supervisor-lifecycle-v1.json",
+            self.adapter,
+            event_store=store,
+            writer_identity="supervisor:test",
+            repository_id=repository_id,
+        )
+        job = dispatcher.launch("99", "PNP-1", phase="implement")
+        original = self.envelope(job)
+        self.write_result(job, original)
+        backend, coordinator, binding = dispatcher._restore_execution_backend(job)
+        verified = copy.deepcopy(original)
+        verified["evidence"]["preserved_work_identity"] = (
+            self.adapter.verify_work_identity(verified)
+        )
+        verified["evidence"]["merge_receipt"] = self.adapter.verify_completion(verified)
+        backend.bind_terminal_result(
+            verified,
+            source_result_digest=hashlib.sha256(
+                Path(job["paths"]["result"]).read_bytes()
+            ).hexdigest(),
+        )
+        coordinator.terminal(binding)
+        receipt_before = copy.deepcopy(store.execution_record(binding))
+        Path(job["paths"]["result"]).unlink()
+        job["execution_backend"]["launch_receipt"]["backend_metadata"][
+            "worker_identity"
+        ]["invocation_id"] = "mutated-after-crash"
+
+        restarted = SupervisorDispatcher(
+            self.repo,
+            self.runtime,
+            ROOT / "contracts/supervisor-lifecycle-v1.json",
+            self.adapter,
+            event_store=store,
+            writer_identity="supervisor:test",
+            repository_id=repository_id,
+        )
+        with self.assertRaisesRegex(DispatchError, "durable authority"):
+            restarted.apply_process_exit(job)
+
+        self.assertEqual(self.adapter.finished, [])
+        self.assertEqual(job["terminal"], {})
+        self.assertEqual(store.execution_record(binding), receipt_before)
 
     def test_terminal_replay_rejects_changed_material_without_controller_mutation(
         self,
@@ -496,7 +712,12 @@ class DispatchTests(unittest.TestCase):
                 verified["evidence"]["merge_receipt"] = (
                     self.adapter.verify_completion(verified)
                 )
-                backend.bind_terminal_result(verified)
+                backend.bind_terminal_result(
+                    verified,
+                    source_result_digest=hashlib.sha256(
+                        Path(job["paths"]["result"]).read_bytes()
+                    ).hexdigest(),
+                )
                 coordinator.terminal(binding)
                 receipt_before = copy.deepcopy(store.execution_record(binding))
 
@@ -517,7 +738,7 @@ class DispatchTests(unittest.TestCase):
                 )
 
                 with self.assertRaisesRegex(
-                    TerminalAuthorityError, "differs from supervisor evidence"
+                    TerminalAuthorityError, "differs from persisted terminal authority"
                 ):
                     restarted.apply_process_exit(job)
 
@@ -598,7 +819,7 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(malformed_result["terminal"]["event"], "worker_result_invalid")
         self.assertEqual(store.execution_record(malformed_binding)["state"], "fenced")
 
-    def test_transactional_current_route_cancellation_persists_request_and_fence(
+    def test_current_route_cancellation_fails_closed_without_mechanical_support(
         self,
     ) -> None:
         repository_id = "repository:dispatch-cancel-fixture"
@@ -632,13 +853,13 @@ class DispatchTests(unittest.TestCase):
         job = dispatcher.launch("99", "PNP-1", phase="implement")
         binding_value = job["execution_backend"]["binding"]
 
-        result = dispatcher.cancel_execution(job, reason="operator drain")
+        with self.assertRaisesRegex(DispatchError, "cannot mechanically cancel"):
+            dispatcher.cancel_execution(job, reason="operator drain")
 
-        self.assertTrue(result["replacement_safe"])
         record = store.execution_record(binding_value)
-        self.assertEqual(record["state"], "fenced")
-        self.assertEqual(record["cancellation_receipt"]["status"], "requested")
-        self.assertEqual(record["fence_receipt"]["status"], "fenced")
+        self.assertEqual(record["state"], "attached")
+        self.assertIsNone(record["cancellation_receipt"])
+        self.assertIsNone(record["fence_receipt"])
 
     def test_legacy_terminal_is_attributed_to_protocol_execution(self) -> None:
         job = self.dispatcher.launch("99", "PNP-1", phase="implement")

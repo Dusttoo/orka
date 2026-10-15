@@ -80,7 +80,13 @@ def validate_contract(contract: dict[str, Any]) -> dict[str, Any]:
     lifecycle = set(
         _unique_strings(domains["lifecycle"].get("required"), "lifecycle.required")
     )
-    if lifecycle != expected_operations - {"discover"}:
+    optional_lifecycle = set(
+        _unique_strings(domains["lifecycle"].get("optional"), "lifecycle.optional")
+    )
+    if (
+        lifecycle != expected_operations - {"discover", "cancel"}
+        or optional_lifecycle != {"cancel"}
+    ):
         raise ContractError("lifecycle capabilities are incomplete")
     containment = domains["containment"]
     containment_fields = set(
@@ -119,12 +125,19 @@ def validate_contract(contract: dict[str, Any]) -> dict[str, Any]:
         raise ContractError("process identity reuse needs an explicit receipt")
     if inspection.get("terminal_requires_canonical_phase_envelope") is not True:
         raise ContractError("terminal inspection must require canonical terminal evidence")
+    if set(inspection.get("replacement_safe_statuses") or []) != {"absent"}:
+        raise ContractError("only authenticated mechanical absence permits replacement")
 
     cancellation = contract.get("cancellation")
     if not isinstance(cancellation, dict):
         raise ContractError("cancellation policy is required")
-    if set(_unique_strings(cancellation.get("safe_results"), "cancellation.safe_results")) != {"acknowledged"}:
-        raise ContractError("only mechanically acknowledged cancellation is backend-safe")
+    if set(_unique_strings(cancellation.get("safe_results"), "cancellation.safe_results")) != {"acknowledged_with_verified_absence"}:
+        raise ContractError("cancellation safety requires acknowledgement and absence")
+    if (
+        cancellation.get("acknowledgement_replacement_safe") is not False
+        or cancellation.get("replacement_requires_mechanical_absence") is not True
+    ):
+        raise ContractError("cancellation acknowledgement alone cannot permit replacement")
     if cancellation.get("backend_may_assert_fence") is not False:
         raise ContractError("only the supervisor may assert an execution fence")
     if cancellation.get("unacknowledged_requires_supervisor_fence") is not True:
