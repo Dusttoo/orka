@@ -8,12 +8,19 @@ import json
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from durable_liveness import LivenessError, load_json, verify  # noqa: E402
+import durable_liveness  # noqa: E402
+from durable_liveness import (  # noqa: E402
+    LivenessError,
+    load_json,
+    validate_state_invariants,
+    verify,
+)
 
 
 CONTRACT = ROOT / "contracts/durable-liveness-v1.json"
@@ -25,11 +32,33 @@ class DurableLivenessTests(unittest.TestCase):
         return load_json(CONTRACT, "test contract")
 
     def verify(self, contract: dict, *, fixtures: bool = True) -> dict:
-        return verify(
-            contract,
-            root=ROOT,
-            fixtures_path=FIXTURES if fixtures else None,
-        )
+        supervisor_path = ROOT / "contracts/supervisor-lifecycle-v1.json"
+        supervisor = load_json(supervisor_path, "supervisor contract")
+        transition_ids = {item["id"] for item in contract["transitions"]}
+        ownership = supervisor["liveness_model"]
+        ownership["job_event_bindings"] = {
+            key: value
+            for key, value in ownership["job_event_bindings"].items()
+            if key in transition_ids
+        }
+        ownership["extension_transitions"] = [
+            key
+            for key in ownership["extension_transitions"]
+            if key in transition_ids
+        ]
+        original_loader = durable_liveness.load_json
+
+        def load_owned(path: Path, label: str) -> dict:
+            if path.resolve() == supervisor_path.resolve():
+                return copy.deepcopy(supervisor)
+            return original_loader(path, label)
+
+        with mock.patch.object(durable_liveness, "load_json", side_effect=load_owned):
+            return verify(
+                contract,
+                root=ROOT,
+                fixtures_path=FIXTURES if fixtures else None,
+            )
 
     def transition(self, contract: dict, identifier: str) -> dict:
         return next(item for item in contract["transitions"] if item["id"] == identifier)
@@ -157,6 +186,102 @@ class DurableLivenessTests(unittest.TestCase):
         self.assertTrue(
             all(case["expected_transition"] in transition_ids for case in historical)
         )
+
+    def test_each_historical_fixture_requires_its_designated_exit(self) -> None:
+        """No generic edge may mask a regression's named recovery path."""
+
+        fixtures = load_json(FIXTURES, "fixtures")["cases"]
+        historical = [case for case in fixtures if case["name"].startswith("historical-")]
+        for fixture in historical:
+            with self.subTest(fixture=fixture["name"]):
+                contract = self.contract()
+                contract["initial_states"] = [
+                    {"name": fixture["name"], "state": fixture["state"]}
+                ]
+                contract["transitions"] = [
+                    transition
+                    for transition in contract["transitions"]
+                    if transition["id"] != fixture["expected_transition"]
+                ]
+                with self.assertRaises(LivenessError) as raised:
+                    self.verify(contract, fixtures=False)
+                self.assertEqual(
+                    raised.exception.report["error"],
+                    "reachable nonterminal state has no supported exit",
+                )
+                self.assertEqual(raised.exception.report["seed"], fixture["name"])
+                self.assertEqual(raised.exception.report["trace"], [])
+
+    def test_historical_fixture_restorations_are_positive_conformance_cases(self) -> None:
+        fixtures = load_json(FIXTURES, "fixtures")["cases"]
+        for fixture in (case for case in fixtures if case["name"].startswith("historical-")):
+            with self.subTest(fixture=fixture["name"]):
+                contract = self.contract()
+                contract["initial_states"] = [
+                    {"name": fixture["name"], "state": fixture["state"]}
+                ]
+                self.verify(contract, fixtures=True)
+
+    def test_source_semantics_detect_same_name_authoritative_change(self) -> None:
+        contract = self.contract()
+        supervisor_path = ROOT / "contracts/supervisor-lifecycle-v1.json"
+        supervisor = load_json(supervisor_path, "supervisor contract")
+        changed = copy.deepcopy(supervisor)
+        transition = next(
+            item
+            for item in changed["transitions"]
+            if item.get("entity") == "job"
+            and item.get("event") == "worker_completed"
+        )
+        transition["to"] = "repair_ready"
+        original_loader = durable_liveness.load_json
+
+        def load_changed(path: Path, label: str) -> dict:
+            if path.resolve() == supervisor_path.resolve():
+                return copy.deepcopy(changed)
+            return original_loader(path, label)
+
+        with self.assertRaisesRegex(
+            LivenessError, "disagrees with supervisor event worker_completed"
+        ), mock.patch.object(durable_liveness, "load_json", side_effect=load_changed):
+            verify(contract, root=ROOT, fixtures_path=FIXTURES)
+
+    def test_supervisor_must_own_every_liveness_transition(self) -> None:
+        contract = self.contract()
+        transition = self.transition(contract, "admit-ticket")
+        transition["derived_event"] = "worker_completed"
+        with self.assertRaisesRegex(LivenessError, "wrong derived event"):
+            self.verify(contract)
+
+    def test_decision_and_scheduler_invariants_reject_unactionable_or_contradictory_states(self) -> None:
+        contract = self.contract()
+        fixture = next(
+            case
+            for case in load_json(FIXTURES, "fixtures")["cases"]
+            if case["name"] == "independent-ticket-progress"
+        )
+        fixture["state"]["decision_state"] = "undefined"
+        contract["initial_states"] = [{"name": fixture["name"], "state": fixture["state"]}]
+        with self.assertRaisesRegex(LivenessError, "undefined decision state"):
+            self.verify(contract, fixtures=False)
+
+        contract = self.contract()
+        fixture["state"]["decision_state"] = "actionable"
+        fixture["state"]["peer_relationship"] = "depends_on_current"
+        contract["initial_states"] = [{"name": fixture["name"], "state": fixture["state"]}]
+        with self.assertRaisesRegex(LivenessError, "admits a peer that depends"):
+            self.verify(contract, fixtures=False)
+
+    def test_dependent_blocked_peer_is_not_an_independent_progress_failure(self) -> None:
+        fixture = next(
+            case
+            for case in load_json(FIXTURES, "fixtures")["cases"]
+            if case["name"] == "independent-ticket-progress"
+        )
+        fixture["state"]["peer_relationship"] = "depends_on_current"
+        fixture["state"]["scheduler_admission"] = "blocked"
+        state = {**self.contract()["state_defaults"], **fixture["state"]}
+        validate_state_invariants(state, label=fixture["name"])
 
     def test_stale_attempt_recovery_cannot_settle_ambiguous_provider_usage(self) -> None:
         contract = self.contract()

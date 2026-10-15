@@ -39,7 +39,30 @@
       "active", "paused_budget", "paused_budget_policy_raised",
       "paused_budget_resolved", "stopped_integrity"
     ],
-    "peer_ticket": ["none", "queued", "running", "completed"]
+    "peer_ticket": ["none", "queued", "running", "completed"],
+    "decision_state": ["none", "actionable", "undefined", "contradictory"],
+    "decision_authority": [
+      "none", "ticket_scoped_operator", "root_capability", "unavailable"
+    ],
+    "command_availability": ["available", "unavailable"],
+    "peer_relationship": ["none", "independent", "depends_on_current", "unknown"],
+    "scheduler_admission": ["not_applicable", "admitted", "blocked"]
+  },
+  "state_defaults": {
+    "ticket_state": "queued",
+    "attempt_identity": "none",
+    "execution_state": "none",
+    "pr_state": "none",
+    "review_state": "not_required",
+    "reservation_state": "none",
+    "route_breaker": "healthy",
+    "sprint_breaker": "active",
+    "peer_ticket": "none",
+    "decision_state": "none",
+    "decision_authority": "none",
+    "command_availability": "available",
+    "peer_relationship": "none",
+    "scheduler_admission": "not_applicable"
   },
   "terminal": {
     "ticket_state": ["completed", "decomposed", "cancelled"],
@@ -83,6 +106,7 @@
   "transitions": [
     {
       "id": "admit-ticket",
+      "derived_event": "job_admitted",
       "exit_class": "automatic",
       "operation": "controller:reserve",
       "source_refs": ["supervisor:event:job_admitted", "controller:command:reserve"],
@@ -98,6 +122,7 @@
     },
     {
       "id": "attach-worker",
+      "derived_event": "worker_attached",
       "exit_class": "authenticated_external_evidence",
       "operation": "controller:attach",
       "source_refs": ["supervisor:event:worker_attached", "controller:command:attach"],
@@ -109,6 +134,7 @@
     },
     {
       "id": "record-completed-worker",
+      "derived_event": "worker_completed",
       "exit_class": "authenticated_external_evidence",
       "operation": "controller:finish",
       "source_refs": [
@@ -128,10 +154,11 @@
     },
     {
       "id": "record-retry-wait",
+      "derived_event": "worker_timed_out_without_progress",
       "exit_class": "authenticated_external_evidence",
       "operation": "controller:finish",
       "source_refs": [
-        "supervisor:event:launch_rejected_transient",
+        "supervisor:event:worker_timed_out_without_progress",
         "phase_worker:terminal:timeout_without_progress",
         "breaker:class:ticket_retry_wait",
         "controller:command:finish"
@@ -147,9 +174,13 @@
     },
     {
       "id": "wake-retry-deadline",
+      "derived_event": "cooldown_elapsed",
       "exit_class": "timer_driven",
       "operation": "supervisor:retry-deadline",
-      "source_refs": ["breaker:class:ticket_retry_wait"],
+      "source_refs": [
+        "supervisor:event:cooldown_elapsed",
+        "breaker:class:ticket_retry_wait"
+      ],
       "when": {
         "ticket_state": "retry_wait", "execution_state": "absent",
         "reservation_state": "settled"
@@ -162,6 +193,7 @@
     },
     {
       "id": "admit-repair",
+      "derived_event": "repair_admitted",
       "exit_class": "automatic",
       "operation": "controller:reserve",
       "source_refs": ["supervisor:event:repair_admitted", "controller:command:reserve"],
@@ -302,6 +334,7 @@
     },
     {
       "id": "admit-recovered-attempt",
+      "derived_event": "recovery_admitted",
       "exit_class": "automatic",
       "operation": "controller:reserve",
       "source_refs": ["supervisor:event:recovery_admitted", "controller:command:reserve"],
@@ -316,35 +349,50 @@
     },
     {
       "id": "dependency-receipt-wakes-ticket",
+      "derived_event": "external_dependency_resolved",
       "exit_class": "authenticated_external_evidence",
       "operation": "controller:sync",
-      "source_refs": ["breaker:class:ticket_external_wait", "controller:command:sync"],
+      "source_refs": [
+        "supervisor:event:external_dependency_resolved",
+        "breaker:class:ticket_external_wait",
+        "controller:command:sync"
+      ],
       "when": {"ticket_state": "parked_external", "sprint_breaker": "active"},
       "set": {
         "ticket_state": "queued", "attempt_identity": "none",
-        "execution_state": "none", "reservation_state": "none"
+        "execution_state": "none", "reservation_state": "none",
+        "decision_state": "none", "decision_authority": "none"
       }
     },
     {
       "id": "resolve-ticket-decision",
+      "derived_event": "decision_resolved",
       "exit_class": "operator_authorized",
       "operation": "controller:resolve-decision",
       "authority": "ticket_scoped_operator",
       "source_refs": [
+        "supervisor:event:decision_resolved",
         "breaker:class:ticket_hard_decision",
         "controller:command:resolve-decision"
       ],
-      "when": {"ticket_state": "parked_decision", "sprint_breaker": "active"},
+      "when": {
+        "ticket_state": "parked_decision", "decision_state": "actionable",
+        "decision_authority": "ticket_scoped_operator",
+        "command_availability": "available", "sprint_breaker": "active"
+      },
       "set": {
         "ticket_state": "queued", "attempt_identity": "none",
-        "execution_state": "none", "reservation_state": "none"
+        "execution_state": "none", "reservation_state": "none",
+        "decision_state": "none", "decision_authority": "none"
       }
     },
     {
       "id": "terminalize-irrecoverable-ticket",
+      "derived_event": "ticket_cancelled",
       "exit_class": "terminal_failure",
       "operation": "controller:finish",
       "source_refs": [
+        "supervisor:event:ticket_cancelled",
         "breaker:class:ticket_irrecoverable",
         "phase_worker:terminal:cancelled_attempt",
         "controller:command:finish"
@@ -438,7 +486,8 @@
       "operation": "controller:reserve",
       "source_refs": ["supervisor:event:job_admitted", "controller:command:reserve"],
       "when": {
-        "peer_ticket": "queued", "route_breaker": "healthy",
+        "peer_ticket": "queued", "peer_relationship": "independent",
+        "scheduler_admission": "admitted", "route_breaker": "healthy",
         "sprint_breaker": "active"
       },
       "set": {"peer_ticket": "running"}
@@ -453,7 +502,10 @@
         "controller:command:finish"
       ],
       "when": {"peer_ticket": "running"},
-      "set": {"peer_ticket": "completed"}
+      "set": {
+        "peer_ticket": "completed", "peer_relationship": "none",
+        "scheduler_admission": "not_applicable"
+      }
     }
   ]
 }

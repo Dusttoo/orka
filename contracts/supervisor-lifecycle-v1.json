@@ -457,5 +457,44 @@
     "skipped_jobs_remain_queued": true,
     "ticket_local_events_never_stop_supervisor": true,
     "worker_context_reuse_across_tickets": false
+  },
+  "liveness_model": {
+    "schema": "orka.supervisor-owned-liveness/v1",
+    "contract": "contracts/durable-liveness-v1.json",
+    "runtime_required": true,
+    "job_state_dimension": "ticket_state",
+    "semantic_source": "transitions",
+    "job_event_bindings": {
+      "admit-ticket": "job_admitted",
+      "attach-worker": "worker_attached",
+      "record-completed-worker": "worker_completed",
+      "record-retry-wait": "worker_timed_out_without_progress",
+      "wake-retry-deadline": "cooldown_elapsed",
+      "admit-repair": "repair_admitted",
+      "admit-recovered-attempt": "recovery_admitted",
+      "dependency-receipt-wakes-ticket": "external_dependency_resolved",
+      "resolve-ticket-decision": "decision_resolved",
+      "terminalize-irrecoverable-ticket": "ticket_cancelled"
+    },
+    "extension_transitions": [
+      "recover-tokenless-repair",
+      "review-recorded-repair",
+      "rebind-moved-pr-head",
+      "complete-review-generation",
+      "merge-reviewed-pr",
+      "authorize-escalated-repair",
+      "recover-preserved-pr",
+      "reconcile-ambiguous-reservation",
+      "recover-stale-attempt",
+      "restart-cancelled-ticket",
+      "probe-transient-route",
+      "repair-hard-route",
+      "raise-sprint-budget-policy",
+      "observe-sprint-budget-resolution",
+      "resume-after-sprint-budget",
+      "restart-after-integrity-preflight",
+      "dispatch-independent-ticket",
+      "complete-independent-ticket"
+    ]
   }
 }

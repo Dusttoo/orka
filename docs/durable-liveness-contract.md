@@ -11,8 +11,9 @@ check behaved correctly. It proves that each modeled reachable nonterminal
 state has at least one supported exit without weakening review, security,
 spending, merge, or destructive-action gates.
 
-This is a design and conformance boundary. It does not yet authorize production
-supervisor decisions. Production integration remains part of issue #129.
+This is a design and conformance boundary. It does not invent production
+supervisor decisions or replace the controller's runtime gate checks; it proves
+that the supported decisions and exits form a live bounded system.
 
 ## What is modeled
 
@@ -24,8 +25,11 @@ The model deliberately includes only state needed to distinguish liveness:
 - review generation state;
 - usage reservation settlement;
 - provider-route and sprint breakers; and
-- one independent peer ticket, used to prove that a ticket-local hold does not
-  become a sprint-global stop.
+- decision identity, whether its command is actionable, and its authority;
+- one peer ticket with an explicit dependency relationship and scheduler
+  admission result. This proves that a ticket-local hold does not become a
+  sprint-global stop only when the scheduler has actually admitted independent
+  peer work.
 
 Each transition has one of five exit classes:
 
@@ -45,11 +49,22 @@ marked `explicit_recovery`.
 
 `scripts/durable_liveness.py` builds a source-symbol registry directly from the
 existing supervisor lifecycle, breaker, recovery, and phase-worker contracts.
-It also reads the declared review actions and literal CLI commands from the
-review ledger, sprint controller, API usage reconciler, and supervisor parsers.
-Every liveness transition cites those source symbols. Removing or renaming an authoritative
-event, breaker class, outcome, action, or command therefore breaks conformance
-instead of leaving a second copy of policy silently stale.
+It also reads declared review actions and literal CLI commands from the review
+ledger, sprint controller, API usage reconciler, and supervisor parsers. Every
+liveness transition cites those source symbols.
+
+The production supervisor contract owns the liveness model through its
+`liveness_model` section. That section partitions every modeled transition into
+either an exact job-event binding or an explicit cross-domain extension. For an
+exact binding, conformance compares the modeled `ticket_state` guard and effect
+to the supervisor's real job transition. Renaming nothing while changing a
+source transition's behavior therefore still fails closed.
+
+The supervisor loads and validates the pointed liveness contract at startup.
+Every cross-domain extension is enumerated by identifier in that same runtime
+contract, while its commands, actions, evidence classes, and authorities remain
+checked against their structured owning sources. This is semantic ownership,
+not a file-integrity checksum and not inference from arbitrary prose.
 
 The liveness model does not replace those sources. They continue to define
 evidence schemas, gate behavior, transition mechanics, and authority checks.
@@ -62,7 +77,8 @@ checks:
 
 - a nonterminal state has at least one exit;
 - terminal mutations are explicit recovery transitions;
-- a queued peer can advance around a ticket-local hold;
+- an explicitly independent, scheduler-admitted queued peer can advance around
+  a ticket-local hold;
 - every transition and every exit class is exercised; and
 - the exploration remains below its declared finite bound.
 
@@ -109,7 +125,8 @@ When a production change adds a durable state or exit:
 1. add the value to the smallest applicable dimension;
 2. add transitions that cite the existing authoritative source symbols;
 3. use a named operator command and authority for every human-authorized exit;
-4. add a sanitized fixture for the new boundary or historical failure;
+4. add a sanitized fixture for the new boundary or historical failure, including
+   a negative case that removes its designated exit and reproduces a sink;
 5. run the verifier and inspect any shortest counterexample; and
 6. only then wire the accepted transition into the production supervisor.
 

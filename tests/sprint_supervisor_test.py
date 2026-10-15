@@ -387,6 +387,18 @@ class PlanningLoopTests(unittest.TestCase):
 
 
 class GlobalBreakerTests(unittest.TestCase):
+    def test_contract_load_fails_closed_when_liveness_validation_fails(self) -> None:
+        failure = sprint_supervisor.durable_liveness.LivenessError("reachable sink")
+        with patch.object(
+            sprint_supervisor.durable_liveness,
+            "validate_contract",
+            side_effect=failure,
+        ), self.assertRaisesRegex(
+            sprint_supervisor.SupervisorError,
+            "durable liveness validation failed: reachable sink",
+        ):
+            sprint_supervisor.contract()
+
     def state(self) -> dict:
         return {
             "repository": "/tmp/orka-global-breaker-test",

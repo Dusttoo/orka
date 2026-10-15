@@ -213,6 +213,47 @@ def validate(contract: dict[str, Any], controller: Path) -> dict[str, Any]:
     if queue_policy != required_policy:
         raise ContractError("queue_policy does not preserve the accepted durable-runtime invariants")
 
+    liveness = contract.get("liveness_model")
+    liveness_fields = {
+        "schema",
+        "contract",
+        "runtime_required",
+        "job_state_dimension",
+        "semantic_source",
+        "job_event_bindings",
+        "extension_transitions",
+    }
+    if not isinstance(liveness, dict) or set(liveness) != liveness_fields:
+        raise ContractError("liveness_model has an invalid field set")
+    if liveness.get("schema") != "orka.supervisor-owned-liveness/v1":
+        raise ContractError("liveness_model has an unsupported schema")
+    if liveness.get("contract") != "contracts/durable-liveness-v1.json":
+        raise ContractError("liveness_model must name the canonical liveness contract")
+    if liveness.get("runtime_required") is not True:
+        raise ContractError("liveness_model must be required at runtime")
+    if liveness.get("job_state_dimension") != "ticket_state":
+        raise ContractError("liveness_model must bind the ticket_state dimension")
+    if liveness.get("semantic_source") != "transitions":
+        raise ContractError("liveness_model must derive semantics from transitions")
+    bindings = liveness.get("job_event_bindings")
+    if not isinstance(bindings, dict) or not bindings or any(
+        not isinstance(identifier, str)
+        or not identifier
+        or not isinstance(event, str)
+        or event not in events
+        or events[event].get("entity") != "job"
+        for identifier, event in bindings.items()
+    ):
+        raise ContractError("liveness_model job_event_bindings must name job events")
+    extensions = set(
+        require_string_list(
+            liveness.get("extension_transitions"),
+            "liveness_model.extension_transitions",
+        )
+    )
+    if set(bindings) & extensions:
+        raise ContractError("liveness_model ownership classes must not overlap")
+
     return {
         "contract_id": contract["contract_id"],
         "schema_version": contract["schema_version"],

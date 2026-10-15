@@ -28,6 +28,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import durable_liveness
 from runtime_state import (
     RuntimeStateError,
     canonical_config_path,
@@ -353,6 +354,21 @@ def contract() -> tuple[dict[str, Any], Lifecycle, str]:
         "orka.supervisor-lifecycle"
     ):
         raise SupervisorError("unsupported supervisor lifecycle contract")
+    liveness = value.get("liveness_model")
+    if not isinstance(liveness, dict) or liveness.get("runtime_required") is not True:
+        raise SupervisorError("supervisor contract does not require durable liveness")
+    relative = liveness.get("contract")
+    if not isinstance(relative, str) or not relative:
+        raise SupervisorError("supervisor contract has no durable liveness path")
+    liveness_path = (PLUGIN_ROOT / relative).resolve()
+    try:
+        liveness_path.relative_to(PLUGIN_ROOT.resolve())
+        liveness_value = durable_liveness.load_json(
+            liveness_path, "durable liveness contract"
+        )
+        durable_liveness.validate_contract(liveness_value, root=PLUGIN_ROOT)
+    except (ValueError, durable_liveness.LivenessError) as exc:
+        raise SupervisorError(f"durable liveness validation failed: {exc}") from exc
     return value, Lifecycle(value), digest_bytes(CONTRACT_PATH.read_bytes())
 
 

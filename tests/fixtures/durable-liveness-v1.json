@@ -46,7 +46,9 @@
         "execution_state": "absent", "pr_state": "none",
         "review_state": "not_required", "reservation_state": "settled",
         "route_breaker": "healthy", "sprint_breaker": "active",
-        "peer_ticket": "none"
+        "peer_ticket": "none",
+        "decision_state": "actionable",
+        "decision_authority": "ticket_scoped_operator"
       }
     },
     {
@@ -130,7 +132,11 @@
         "execution_state": "absent", "pr_state": "none",
         "review_state": "not_required", "reservation_state": "settled",
         "route_breaker": "healthy", "sprint_breaker": "active",
-        "peer_ticket": "queued"
+        "peer_ticket": "queued",
+        "decision_state": "actionable",
+        "decision_authority": "ticket_scoped_operator",
+        "peer_relationship": "independent",
+        "scheduler_admission": "admitted"
       }
     },
     {

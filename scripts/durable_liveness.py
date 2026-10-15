@@ -178,18 +178,60 @@ def state_key(state: dict[str, str], dimensions: list[str]) -> tuple[str, ...]:
     return tuple(state[name] for name in dimensions)
 
 
+def validate_state_invariants(state: dict[str, str], *, label: str) -> None:
+    """Reject impossible or unactionable bounded-model states before BFS."""
+
+    decision = state["decision_state"]
+    authority = state["decision_authority"]
+    command = state["command_availability"]
+    if decision in {"undefined", "contradictory"}:
+        raise LivenessError(f"{label} has an {decision} decision state")
+    if state["ticket_state"] == "parked_decision":
+        if decision != "actionable":
+            raise LivenessError(f"{label} parks a ticket without an actionable decision")
+        if authority != "ticket_scoped_operator":
+            raise LivenessError(f"{label} parks a decision without authority")
+        if command != "available":
+            raise LivenessError(f"{label} parks a decision without an available command")
+    elif decision != "none" or authority != "none":
+        raise LivenessError(f"{label} assigns decision authority outside parked_decision")
+
+    peer = state["peer_ticket"]
+    relation = state["peer_relationship"]
+    admission = state["scheduler_admission"]
+    if peer in {"none", "completed"}:
+        if relation != "none" or admission != "not_applicable":
+            raise LivenessError(f"{label} has peer scheduler state without a live peer")
+    elif peer == "queued":
+        if relation not in {"independent", "depends_on_current"}:
+            raise LivenessError(f"{label} has a queued peer without dependency semantics")
+        if admission not in {"admitted", "blocked"}:
+            raise LivenessError(f"{label} has a queued peer without scheduler admission")
+        if relation == "depends_on_current" and admission == "admitted":
+            raise LivenessError(f"{label} admits a peer that depends on current work")
+    elif peer == "running" and (relation != "independent" or admission != "admitted"):
+        raise LivenessError(f"{label} has an invalid running peer scheduler state")
+
+
 def normalize_state(
-    raw: Any, domains: dict[str, set[str]], *, label: str
+    raw: Any,
+    domains: dict[str, set[str]],
+    *,
+    label: str,
+    defaults: dict[str, str],
 ) -> dict[str, str]:
-    if not isinstance(raw, dict) or set(raw) != set(domains):
+    if not isinstance(raw, dict) or not set(raw) <= set(domains):
         raise LivenessError(
-            f"{label} must define exactly these dimensions: {', '.join(domains)}"
+            f"{label} may define only these dimensions: {', '.join(domains)}"
         )
-    state: dict[str, str] = {}
-    for dimension, value in raw.items():
+    state = dict(defaults)
+    state.update(raw)
+    if set(state) != set(domains):
+        raise LivenessError(f"{label} has no complete state projection")
+    for dimension, value in state.items():
         if not isinstance(value, str) or value not in domains[dimension]:
             raise LivenessError(f"{label}.{dimension} has an undefined value {value!r}")
-        state[dimension] = value
+    validate_state_invariants(state, label=label)
     return state
 
 
@@ -227,6 +269,91 @@ def is_terminal(state: dict[str, str], terminal: dict[str, set[str]]) -> bool:
     )
 
 
+def validate_source_owned_model(
+    contract: dict[str, Any], *, root: Path, transitions: list[dict[str, Any]]
+) -> None:
+    """Prove the model is owned by runtime-enforced supervisor semantics."""
+
+    raw_sources = contract.get("source_contracts")
+    if not isinstance(raw_sources, dict) or not isinstance(raw_sources.get("supervisor"), str):
+        raise LivenessError("source_contracts.supervisor must name the owning contract")
+    supervisor_path = (root / raw_sources["supervisor"]).resolve()
+    supervisor = load_json(supervisor_path, "supervisor lifecycle contract")
+    ownership = supervisor.get("liveness_model")
+    required = {
+        "schema",
+        "contract",
+        "runtime_required",
+        "job_state_dimension",
+        "semantic_source",
+        "job_event_bindings",
+        "extension_transitions",
+    }
+    if not isinstance(ownership, dict) or set(ownership) != required:
+        raise LivenessError("supervisor liveness_model has an invalid field set")
+    if ownership.get("schema") != "orka.supervisor-owned-liveness/v1":
+        raise LivenessError("supervisor liveness_model has an unsupported schema")
+    if ownership.get("contract") != "contracts/durable-liveness-v1.json":
+        raise LivenessError("supervisor liveness_model points to the wrong contract")
+    if ownership.get("runtime_required") is not True:
+        raise LivenessError("supervisor must require liveness validation at runtime")
+    if ownership.get("job_state_dimension") != "ticket_state":
+        raise LivenessError("supervisor liveness_model has the wrong state dimension")
+    if ownership.get("semantic_source") != "transitions":
+        raise LivenessError("supervisor liveness_model has the wrong semantic source")
+
+    bindings = ownership.get("job_event_bindings")
+    extensions = ownership.get("extension_transitions")
+    if not isinstance(bindings, dict) or any(
+        not isinstance(key, str) or not isinstance(value, str)
+        for key, value in bindings.items()
+    ):
+        raise LivenessError("supervisor job_event_bindings must map transition ids to events")
+    extension_ids = set(_string_list(extensions, "liveness_model.extension_transitions"))
+    if set(bindings) & extension_ids:
+        raise LivenessError("supervisor liveness ownership classes overlap")
+    model = {item["id"]: item for item in transitions}
+    if set(bindings) | extension_ids != set(model):
+        raise LivenessError("supervisor liveness ownership does not cover the bounded model")
+
+    source_transitions: dict[str, set[tuple[str, str]]] = {}
+    for item in supervisor.get("transitions") or []:
+        if not isinstance(item, dict) or item.get("entity") != "job":
+            continue
+        event = item.get("event")
+        source = item.get("from")
+        target = item.get("to")
+        if not all(isinstance(value, str) and value for value in (event, source, target)):
+            raise LivenessError("supervisor job transition is malformed")
+        source_transitions.setdefault(event, set()).add((source, target))
+
+    for identifier, event in bindings.items():
+        item = model.get(identifier)
+        if item is None:
+            raise LivenessError(f"supervisor binds unknown liveness transition {identifier}")
+        if item.get("derived_event") != event:
+            raise LivenessError(f"liveness transition {identifier} has the wrong derived event")
+        if f"supervisor:event:{event}" not in item["source_refs"]:
+            raise LivenessError(f"liveness transition {identifier} does not cite {event}")
+        if event not in source_transitions:
+            raise LivenessError(f"liveness transition {identifier} binds an unknown job event")
+        modeled_sources = item["when"].get("ticket_state")
+        accepted = set(modeled_sources) if isinstance(modeled_sources, list) else {modeled_sources}
+        modeled_edges = {
+            (source, item["set"].get("ticket_state")) for source in accepted
+        }
+        if not modeled_edges or not modeled_edges <= source_transitions[event]:
+            raise LivenessError(
+                f"liveness transition {identifier} disagrees with supervisor event {event}"
+            )
+
+    for identifier in extension_ids:
+        if "derived_event" in model[identifier]:
+            raise LivenessError(
+                f"extension transition {identifier} cannot claim a derived job event"
+            )
+
+
 @dataclass(frozen=True)
 class Seed:
     name: str
@@ -253,6 +380,14 @@ def validate_contract(
     }
     if len(domains) != len(raw_dimensions):
         raise LivenessError("dimension names must be nonempty strings")
+    raw_defaults = contract.get("state_defaults")
+    if not isinstance(raw_defaults, dict) or set(raw_defaults) != set(domains):
+        raise LivenessError("state_defaults must define every state dimension")
+    defaults: dict[str, str] = {}
+    for dimension, value in raw_defaults.items():
+        if not isinstance(value, str) or value not in domains[dimension]:
+            raise LivenessError(f"state_defaults.{dimension} has an undefined value")
+        defaults[dimension] = value
 
     raw_terminal = contract.get("terminal")
     if not isinstance(raw_terminal, dict) or set(raw_terminal) != {
@@ -307,7 +442,7 @@ def validate_contract(
         if not isinstance(raw, dict):
             raise LivenessError(f"transition {index} must be an object")
         required = {"id", "exit_class", "operation", "source_refs", "when", "set"}
-        allowed = required | {"authority", "explicit_recovery"}
+        allowed = required | {"authority", "explicit_recovery", "derived_event"}
         if not required <= set(raw) or set(raw) - allowed:
             raise LivenessError(f"transition {index} has an invalid field set")
         identifier = raw.get("id")
@@ -382,11 +517,16 @@ def validate_contract(
         if not isinstance(name, str) or not name or name in names:
             raise LivenessError(f"initial state {index} has a missing or duplicate name")
         names.add(name)
-        seeds.append(Seed(name, normalize_state(item["state"], domains, label=name)))
+        seeds.append(
+            Seed(name, normalize_state(item["state"], domains, label=name, defaults=defaults))
+        )
+    validate_source_owned_model(contract, root=root, transitions=transitions)
     return domains, transitions, terminal, seeds
 
 
-def load_fixtures(path: Path, domains: dict[str, set[str]]) -> list[tuple[Seed, str, str]]:
+def load_fixtures(
+    path: Path, domains: dict[str, set[str]], defaults: dict[str, str]
+) -> list[tuple[Seed, str, str]]:
     value = load_json(path, "liveness fixtures")
     if value.get("schema") != "orka.durable-liveness-fixtures/v1":
         raise LivenessError("fixtures use an unsupported schema")
@@ -406,7 +546,12 @@ def load_fixtures(path: Path, domains: dict[str, set[str]]) -> list[tuple[Seed, 
         names.add(name)
         result.append(
             (
-                Seed(name, normalize_state(case["state"], domains, label=name)),
+                Seed(
+                    name,
+                    normalize_state(
+                        case["state"], domains, label=name, defaults=defaults
+                    ),
+                ),
                 str(case["expected_transition"]),
                 str(case["expected_exit_class"]),
             )
@@ -433,9 +578,10 @@ def verify(
     contract: dict[str, Any], *, root: Path, fixtures_path: Path | None = None
 ) -> dict[str, Any]:
     domains, transitions, terminal, initial = validate_contract(contract, root=root)
+    defaults = contract["state_defaults"]
     fixture_cases: list[tuple[Seed, str, str]] = []
     if fixtures_path is not None:
-        fixture_cases = load_fixtures(fixtures_path, domains)
+        fixture_cases = load_fixtures(fixtures_path, domains, defaults)
     by_id = {transition["id"]: transition for transition in transitions}
     for seed, expected_transition, expected_class in fixture_cases:
         matching = [transition for transition in transitions if enabled(seed.state, transition)]
@@ -508,6 +654,8 @@ def verify(
 
         if (
             state["peer_ticket"] == "queued"
+            and state["peer_relationship"] == "independent"
+            and state["scheduler_admission"] == "admitted"
             and state["ticket_state"] in {
                 "parked_decision", "parked_external", "blocked"
             }
@@ -536,6 +684,7 @@ def verify(
             transition_hits[transition["id"]] += 1
             exit_hits[transition["exit_class"]] += 1
             target = apply_transition(state, transition)
+            validate_state_invariants(target, label=f"transition {transition['id']} target")
             if target == state:
                 raise LivenessError(f"transition {transition['id']} does not change state")
             target_key = state_key(target, dimensions)
