@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "contract_id": "orka.operator-authority-provider",
+  "protocol_version": 1,
+  "description": "A provider-neutral, fail-closed boundary for narrowly scoped operator authority.",
+  "operations": ["discover", "issue", "verify", "consume", "revoke"],
+  "authority_classes": {
+    "budget-extension": ["raise-ticket-budget"],
+    "relaunch-extension": ["raise-ticket-attempt-limit"],
+    "terminal-recovery": ["recover-exact-terminal-attempt"],
+    "review-repair": ["extend-pr-repair-cycles"],
+    "restart": ["restart-ticket-with-absolute-ceilings"]
+  },
+  "capability": {
+    "required_fields": [
+      "provider_id", "capability_id", "authority_class", "repository_id",
+      "scope", "issuer_id", "issued_at", "expires_at", "one_use",
+      "authorized_actions", "receipt_id"
+    ],
+    "one_use": true,
+    "repository_bound": true,
+    "target_scope_fields": ["ticket", "pr"],
+    "terminal_recovery_requires_attempt": true,
+    "class_specific_scope_schemas": true,
+    "scope_binds_absolute_ceilings": true,
+    "absolute_ceilings_only": true,
+    "tokens_are_opaque": true
+  },
+  "verification": {
+    "required_matches": ["provider_id", "authority_class", "repository_id", "scope"],
+    "expired": "deny",
+    "revoked": "deny",
+    "replayed": "deny",
+    "incompatible_provider": "deny",
+    "unavailable_provider": "unknown-fail-closed"
+  },
+  "consumption": {
+    "durable_before_success": true,
+    "replay_safe": true,
+    "success_receipt_fields": ["provider_id", "capability_id", "receipt_id", "consumed_at"],
+    "failure_preserves_state": true
+  },
+  "revocation": {
+    "durable": true,
+    "takes_effect_before_future_verification": true,
+    "does_not_restore_consumed_capabilities": true
+  },
+  "discovery": {
+    "provider_id_required": true,
+    "protocol_versions": [1],
+    "authority_classes_required": true,
+    "repository_configuration_may_select_provider": false,
+    "worker_configuration_may_select_provider": false,
+    "scheduler_state_machine_dependency": false
+  },
+  "trust_boundary": {
+    "issuance_must_be_outside_repository_and_worker_control": true,
+    "provider_may_not_authorize_unrequested_actions": true,
+    "provider_may_not_bypass": ["review", "security", "merge", "destructive-action"],
+    "outage_preserves_existing_state": true
+  },
+  "compatibility_profiles": {
+    "local-root-helper-v1": {
+      "provider_id": "orka.local-root-helper",
+      "issuer_identity": "host-root",
+      "storage": "root-owned private files",
+      "issue_commands": ["issue-budget", "issue-relaunch", "issue-recovery", "issue-review-repair", "issue-restart"],
+      "runtime_commands": ["activate-budget", "activate-relaunch", "consume-recovery", "activate-review-repair", "activate-restart"],
+      "revoke_commands": ["revoke-budget", "revoke-relaunch", "revoke-recovery", "revoke-review-repair", "revoke-restart"],
+      "compatibility_adapter_required": true
+    }
+  }
+}

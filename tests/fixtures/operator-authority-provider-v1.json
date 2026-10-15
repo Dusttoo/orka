@@ -1,0 +1,41 @@
+{
+  "provider": {
+    "provider_id": "orka.local-root-helper",
+    "protocol_versions": [1],
+    "authority_classes": ["budget-extension", "relaunch-extension", "terminal-recovery", "review-repair", "restart"],
+    "issuer_identity": "host-root"
+  },
+  "issuance": {
+    "authority_class": "budget-extension",
+    "repository_id": "/srv/example",
+    "scope": {"ticket": "PROJ-17", "ticket_usd": "35.00"},
+    "reason": "operator approved a bounded continuation"
+  },
+  "capability_receipt": {
+    "provider_id": "orka.local-root-helper",
+    "capability_id": "capability-17",
+    "authority_class": "budget-extension",
+    "repository_id": "/srv/example",
+    "scope": {"ticket": "PROJ-17", "ticket_usd": "35.00"},
+    "issuer_id": "host-root",
+    "issued_at": 100,
+    "expires_at": 200,
+    "one_use": true,
+    "authorized_actions": ["raise-ticket-budget"],
+    "receipt_id": "receipt-17"
+  },
+  "invalid": {
+    "worker_selected_provider": "worker-controlled-provider",
+    "forbidden_action": "authorize-merge",
+    "expired": {"expires_at": 0},
+    "replayed_receipt": {"capability_id": "already-consumed"}
+  },
+  "scenarios": {
+    "issuance": "host issuer returns an opaque one-use capability",
+    "verification": "provider, repository, class, and exact scope must match",
+    "consumption": "durable consume precedes a success receipt",
+    "revocation": "revoked capability is unavailable for future verification",
+    "replay": "a consumed capability cannot be consumed again",
+    "outage": "unavailable provider changes no authority state and fails closed"
+  }
+}
